@@ -40,3 +40,9 @@ gitupdate.bat
 # Swift Package Manager
 ClashFX.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 build_output/
+
+# Windows build outputs & caches
+windows/build/
+windows/dist/
+windows/ui-qt/build*/
+

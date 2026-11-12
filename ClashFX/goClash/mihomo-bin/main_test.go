@@ -546,3 +546,89 @@ func TestMissingGVisorRejectsBeforeStartupOrValidationSuccess(t *testing.T) {
 		}
 	}
 }
+
+func TestWatchStdinGracefulShutdownReleasesListenersAndServesExtUI(t *testing.T) {
+	home := t.TempDir()
+	uiDir := filepath.Join(home, "ui")
+	if err := os.MkdirAll(uiDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("<!doctype html><title>ClashFX UI</title>"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mixedPort := unusedTCPPort(t)
+	apiPort := unusedTCPPort(t)
+	for apiPort == mixedPort {
+		apiPort = unusedTCPPort(t)
+	}
+	configPath := filepath.Join(home, "config.yaml")
+	cfg := fmt.Sprintf(`mixed-port: %d
+allow-lan: false
+external-controller: 127.0.0.1:%d
+dns:
+  enable: false
+tun:
+  enable: false
+rules:
+  - MATCH,DIRECT
+`, mixedPort, apiPort)
+	if err := os.WriteFile(configPath, []byte(cfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdinReader, stdinWriter := io.Pipe()
+	defer stdinReader.Close()
+
+	var stdout, stderr lockedBuffer
+	exitCh := make(chan int, 1)
+	go func() {
+		exitCh <- runWithStdin(
+			[]string{"-d", home, "-f", configPath, "-ext-ui", uiDir, "-watch-stdin"},
+			stdinReader,
+			&stdout,
+			&stderr,
+		)
+	}()
+
+	uiURL := fmt.Sprintf("http://127.0.0.1:%d/ui/", apiPort)
+	deadline := time.Now().Add(5 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(uiURL)
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK && strings.Contains(string(body), "ClashFX UI") {
+				ready = true
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !ready {
+		_ = stdinWriter.Close()
+		t.Fatalf("core did not serve -ext-ui before deadline; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+
+	// Closing stdin must trigger graceful shutdown and release ports cleanly.
+	if err := stdinWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-exitCh:
+		if code != 0 {
+			t.Fatalf("expected clean exit 0 on stdin EOF, got %d; stderr=%q", code, stderr.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("core did not exit within 3s after stdin EOF; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+
+	for _, port := range []int{mixedPort, apiPort} {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatalf("port %d was not released after graceful shutdown: %v", port, err)
+		}
+		_ = ln.Close()
+	}
+}

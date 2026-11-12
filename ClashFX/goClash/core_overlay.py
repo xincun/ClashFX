@@ -35,11 +35,66 @@ ORIGINAL_IS_CLOSED = (
     "return IsMulti(err, io.EOF, net.ErrClosed, io.ErrClosedPipe, os.ErrClosed, "
     "syscall.EPIPE, syscall.ECONNRESET, syscall.ENOTCONN)"
 )
-PATCHED_IS_CLOSED = (
-    "return IsMulti(err, io.EOF, net.ErrClosed, io.ErrClosedPipe, os.ErrClosed, "
-    "syscall.EPIPE, syscall.ECONNRESET, syscall.ENOTCONN, syscall.ENOTSOCK, "
-    "syscall.EBADF)"
+PATCHED_IS_CLOSED = "return IsMulti(err, closedErrors...)"
+SING_CLOSED_UNIX_SOURCE = """//go:build !windows
+
+package exceptions
+
+import (
+\t"io"
+\t"net"
+\t"os"
+\t"syscall"
 )
+
+var closedErrors = []error{
+\tio.EOF,
+\tnet.ErrClosed,
+\tio.ErrClosedPipe,
+\tos.ErrClosed,
+\tsyscall.EPIPE,
+\tsyscall.ECONNRESET,
+\tsyscall.ENOTCONN,
+\tsyscall.ENOTSOCK,
+\tsyscall.EBADF,
+}
+"""
+SING_CLOSED_WINDOWS_SOURCE = """//go:build windows
+
+package exceptions
+
+import (
+\t"io"
+\t"net"
+\t"os"
+\t"syscall"
+)
+
+const (
+\twsaENotSock  syscall.Errno = 10038
+\twsaENotConn  syscall.Errno = 10057
+\twsaEShutdown syscall.Errno = 10058
+)
+
+var closedErrors = []error{
+\tio.EOF,
+\tnet.ErrClosed,
+\tio.ErrClosedPipe,
+\tos.ErrClosed,
+\tsyscall.EPIPE,
+\tsyscall.ECONNRESET,
+\tsyscall.ENOTCONN,
+\tsyscall.ENOTSOCK,
+\tsyscall.EBADF,
+\tsyscall.WSAECONNRESET,
+\tsyscall.WSAECONNABORTED,
+\twsaENotSock,
+\twsaENotConn,
+\twsaEShutdown,
+\tsyscall.ERROR_BROKEN_PIPE,
+\tsyscall.ERROR_NETNAME_DELETED,
+}
+"""
 ORIGINAL_URL_TEST = """func (u *URLTest) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
 	return u.GroupBase.URLTest(ctx, u.testUrl, expectedStatus)
 }"""
@@ -1430,11 +1485,33 @@ def core_modfile() -> Iterator[str]:
         workaround_root.mkdir()
         sing_replacement_module = workaround_root / "sing"
         shutil.copytree(sing_source_module, sing_replacement_module)
-        sing_replacement = sing_replacement_module / "common" / "exceptions" / "error.go"
+        sing_exceptions_dir = sing_replacement_module / "common" / "exceptions"
+        os.chmod(
+            sing_exceptions_dir,
+            sing_exceptions_dir.stat().st_mode | stat.S_IWUSR | stat.S_IXUSR,
+        )
+        sing_replacement = sing_exceptions_dir / "error.go"
         os.chmod(sing_replacement, sing_replacement.stat().st_mode | stat.S_IWUSR)
-        sing_replacement.write_text(
-            sing_original.replace(ORIGINAL_IS_CLOSED, PATCHED_IS_CLOSED),
-            encoding="utf-8",
+        # error.go no longer directly references io/net/os/syscall in IsClosed;
+        # remove those unused imports cleanly before gofmt.
+        patched_sing_error = sing_original.replace(ORIGINAL_IS_CLOSED, PATCHED_IS_CLOSED)
+        for unused_import in ('\t"io"\n', '\t"net"\n', '\t"os"\n', '\t"syscall"\n'):
+            patched_sing_error = patched_sing_error.replace(unused_import, "", 1)
+        sing_replacement.write_text(patched_sing_error, encoding="utf-8")
+        (sing_exceptions_dir / "closed_unix.go").write_text(
+            SING_CLOSED_UNIX_SOURCE, encoding="utf-8"
+        )
+        (sing_exceptions_dir / "closed_windows.go").write_text(
+            SING_CLOSED_WINDOWS_SOURCE, encoding="utf-8"
+        )
+        subprocess.check_call(
+            [
+                "gofmt",
+                "-w",
+                str(sing_replacement),
+                str(sing_exceptions_dir / "closed_unix.go"),
+                str(sing_exceptions_dir / "closed_windows.go"),
+            ]
         )
 
         mihomo_replacement_module = workaround_root / "mihomo"

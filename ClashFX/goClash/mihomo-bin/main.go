@@ -8,27 +8,37 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 
 	"github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/hub"
 	"github.com/metacubex/mihomo/hub/executor"
+	"github.com/metacubex/mihomo/hub/route"
+	"github.com/metacubex/mihomo/listener"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/tunnel"
 	"gopkg.in/yaml.v3"
 )
 
 const recoverySelectionsConfigKey = "x-clashfx-recovery-selections"
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(runWithStdin(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithStdin(args, os.Stdin, stdout, stderr)
+}
+
+func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("mihomo-bin", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configFile := flags.String("f", "", "config file path")
 	homeDir := flags.String("d", "", "config home directory")
+	extUI := flags.String("ext-ui", "", "override external UI directory")
+	watchStdin := flags.Bool("watch-stdin", false, "shut down cleanly when stdin reaches EOF")
 	validateOnly := flags.Bool("t", false, "check configuration and exit")
 	showFeatures := flags.Bool("features", false, "print compiled core capabilities and exit")
 	if err := flags.Parse(args); err != nil {
@@ -43,6 +53,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if *homeDir != "" {
+		if !filepath.IsAbs(*homeDir) {
+			currentDir, _ := os.Getwd()
+			*homeDir = filepath.Join(currentDir, *homeDir)
+		}
 		constant.SetHomeDir(*homeDir)
 	}
 
@@ -66,6 +80,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return 1
 	}
+	if *extUI != "" {
+		uiDir := *extUI
+		if !filepath.IsAbs(uiDir) {
+			currentDir, _ := os.Getwd()
+			uiDir = filepath.Join(currentDir, uiDir)
+		}
+		cfg.Controller.ExternalUI = uiDir
+	}
 	if err := validateTUNBuildCapability(cfg.General.Tun.Enable, cfg.General.Tun.Stack, features.WithGVisor); err != nil {
 		fmt.Fprintf(stderr, "Core capability error: %s\n", err)
 		return 1
@@ -85,7 +107,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	fmt.Fprintf(stdout, "mihomo-bin euid=%d uid=%d pid=%d\n", os.Geteuid(), os.Getuid(), os.Getpid())
+	if runtime.GOOS == "windows" {
+		fmt.Fprintf(stdout, "mihomo-bin pid=%d\n", os.Getpid())
+	} else {
+		fmt.Fprintf(stdout, "mihomo-bin euid=%d uid=%d pid=%d\n", os.Geteuid(), os.Getuid(), os.Getpid())
+	}
 
 	if len(recoverySelections) > 0 {
 		executor.SetStartupRecoverySelections(recoverySelections)
@@ -94,13 +120,42 @@ func run(args []string, stdout, stderr io.Writer) int {
 		log.Errorln("Startup validation error: %s", err.Error())
 		return 1
 	}
+	defer shutdownCore()
+
+	var stdinClosedCh <-chan struct{}
+	if *watchStdin && stdin != nil {
+		ch := make(chan struct{})
+		stdinClosedCh = ch
+		go func() {
+			_, _ = io.Copy(io.Discard, stdin)
+			close(ch)
+		}()
+	}
 
 	fmt.Fprintf(stdout, "mihomo-bin started, config: %s\n", constant.Path.Config())
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	defer signal.Stop(sigCh)
+
+	select {
+	case <-sigCh:
+	case <-stdinClosedCh:
+	}
 	return 0
+}
+
+func shutdownCore() {
+	executor.WithRuntimeConfigLock(func() {
+		listener.ReCreateHTTP(0, tunnel.Tunnel)
+		listener.ReCreateSocks(0, tunnel.Tunnel)
+		listener.ReCreateMixed(0, tunnel.Tunnel)
+		listener.ReCreateRedir(0, tunnel.Tunnel)
+		listener.ReCreateTProxy(0, tunnel.Tunnel)
+		listener.PatchInboundListeners(nil, tunnel.Tunnel, true)
+		route.ReCreateServer(&route.Config{})
+		executor.Shutdown()
+	})
 }
 
 func validateTUNBuildCapability(enabled bool, stack constant.TUNStack, withGVisor bool) error {
