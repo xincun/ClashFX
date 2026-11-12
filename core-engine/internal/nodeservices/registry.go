@@ -429,7 +429,7 @@ func ApplyListeners(root map[string]any, bindings []NodePortBinding, directPort 
 			*directPort,
 			"DIRECT",
 			false,
-			false,
+			true,
 		))
 	}
 
