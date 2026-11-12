@@ -632,3 +632,25 @@ rules:
 		_ = ln.Close()
 	}
 }
+
+func TestConvertShareLinksFlagProducesValidConfig(t *testing.T) {
+	links := "socks5://127.0.0.1:1080#TestNode1\nsocks5://example.com:1081#剩余流量：99GB\nsocks5://node2.example.com:1082#TestNode2\n"
+	var stdout, stderr bytes.Buffer
+	code := runWithStdin([]string{"-convert-share-links"}, strings.NewReader(links), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("-convert-share-links failed (%d): %s", code, stderr.String())
+	}
+	rendered := stdout.String()
+	if !strings.Contains(rendered, "TestNode1") || !strings.Contains(rendered, "TestNode2") || strings.Contains(rendered, "剩余流量") {
+		t.Fatalf("unexpected converted output:\n%s", rendered)
+	}
+	home := t.TempDir()
+	cfgPath := filepath.Join(home, "converted.yaml")
+	if err := os.WriteFile(cfgPath, stdout.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var valOut, valErr bytes.Buffer
+	if valCode := run([]string{"-t", "-d", home, "-f", cfgPath}, &valOut, &valErr); valCode != 0 {
+		t.Fatalf("converted YAML failed -t validation (%d): %s", valCode, valErr.String())
+	}
+}
