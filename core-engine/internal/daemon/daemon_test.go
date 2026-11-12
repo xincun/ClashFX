@@ -51,9 +51,14 @@ rules:
 	}
 
 	appData := t.TempDir()
+	extDashboardDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(extDashboardDir, "index.html"), []byte("<html>ClashFX Dashboard Ready</html>"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	srv, err := NewServer(endpoint, Config{
-		AppDataDir: appData,
-		BinDir:     filepath.Dir(coreExe),
+		AppDataDir:     appData,
+		DashboardUIDir: extDashboardDir,
+		BinDir:         filepath.Dir(coreExe),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -136,6 +141,16 @@ rules:
 	}
 	if !foundGroup {
 		t.Fatalf("expected Proxy group Now=Seattle-02 HasManualOverride=true, got %+v", snap.ProxyGroups)
+	}
+
+	// Verify external DashboardUIDir outside AppDataDir is allowed via SAFE_PATHS after hot reload
+	uiResp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/ui/", snap.Runtime.APIPort))
+	if err != nil {
+		t.Fatalf("GET /ui/ failed: %v", err)
+	}
+	defer uiResp.Body.Close()
+	if uiResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200 on /ui/, got %d", uiResp.StatusCode)
 	}
 
 	// 4. Single-node diagnostic probe (Seattle-02 points to closed 10802 -> structured error!)

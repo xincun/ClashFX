@@ -110,7 +110,17 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 		coreExeName = "mihomo_core.exe"
 	}
 	coreExePath := filepath.Join(cfg.BinDir, coreExeName)
-	helper := subscription.BinaryCoreHelper{CoreBinaryPath: coreExePath}
+	var safePaths []string
+	if strings.TrimSpace(cfg.DashboardUIDir) != "" {
+		safePaths = append(safePaths, cfg.DashboardUIDir)
+	}
+	if strings.TrimSpace(cfg.BundledResourceDir) != "" {
+		safePaths = append(safePaths, cfg.BundledResourceDir)
+	}
+	helper := subscription.BinaryCoreHelper{
+		CoreBinaryPath: coreExePath,
+		SafePaths:      safePaths,
+	}
 
 	subMgr, err := subscription.NewManager(store, helper)
 	if err != nil {

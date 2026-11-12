@@ -1,0 +1,11 @@
+<RCC>
+    <qresource prefix="/clashfx">
+        <file>icons/app-icon-256.png</file>
+        <file>icons/menu-cat-filled-face.png</file>
+        <file>icons/menu-cat-outline-face.png</file>
+        <file>icons/menu-cat-lightning-solid.png</file>
+        <file>icons/menu-cat-lightning-outline.png</file>
+        <file>icons/menu-cat-network.png</file>
+        <file>icons/menu-cat-shield.png</file>
+    </qresource>
+</RCC>

@@ -176,6 +176,21 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 
 	cmd := exec.Command(corePath, args...)
 	cmd.Dir = r.trustedDir
+	if cleanUI != "" {
+		env := make([]string, 0, len(os.Environ())+1)
+		safeList := []string{cleanUI}
+		if existing := strings.TrimSpace(os.Getenv("SAFE_PATHS")); existing != "" {
+			safeList = append([]string{existing}, safeList...)
+		}
+		for _, kv := range os.Environ() {
+			if strings.HasPrefix(strings.ToUpper(kv), "SAFE_PATHS=") {
+				continue
+			}
+			env = append(env, kv)
+		}
+		env = append(env, "SAFE_PATHS="+strings.Join(safeList, string(os.PathListSeparator)))
+		cmd.Env = env
+	}
 	configureChildProcess(cmd)
 
 	stdinPipe, err := cmd.StdinPipe()

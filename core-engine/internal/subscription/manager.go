@@ -49,6 +49,34 @@ type CoreHelper interface {
 
 type BinaryCoreHelper struct {
 	CoreBinaryPath string
+	SafePaths      []string
+}
+
+func appendSafePathsEnv(baseEnv []string, extraPaths ...string) []string {
+	var cleaned []string
+	if existing := strings.TrimSpace(os.Getenv("SAFE_PATHS")); existing != "" {
+		cleaned = append(cleaned, existing)
+	}
+	for _, p := range extraPaths {
+		if t := strings.TrimSpace(p); t != "" {
+			cleaned = append(cleaned, filepath.Clean(t))
+		}
+	}
+	if len(cleaned) == 0 {
+		return baseEnv
+	}
+	if len(baseEnv) == 0 {
+		baseEnv = os.Environ()
+	}
+	out := make([]string, 0, len(baseEnv)+1)
+	for _, kv := range baseEnv {
+		if strings.HasPrefix(strings.ToUpper(kv), "SAFE_PATHS=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	out = append(out, "SAFE_PATHS="+strings.Join(cleaned, string(os.PathListSeparator)))
+	return out
 }
 
 func (b BinaryCoreHelper) ConvertShareLinks(raw []byte) ([]byte, error) {
@@ -65,6 +93,9 @@ func (b BinaryCoreHelper) ConvertShareLinks(raw []byte) ([]byte, error) {
 
 func (b BinaryCoreHelper) ValidateConfig(homeDir, configPath string) error {
 	cmd := exec.Command(b.CoreBinaryPath, "-t", "-d", homeDir, "-f", configPath)
+	if len(b.SafePaths) > 0 {
+		cmd.Env = appendSafePathsEnv(os.Environ(), b.SafePaths...)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
