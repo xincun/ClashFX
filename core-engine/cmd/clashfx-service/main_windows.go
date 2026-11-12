@@ -108,7 +108,13 @@ func installAndStartService() error {
 	if err == nil {
 		defer s.Close()
 		stopAndWait(s, 8*time.Second)
+		if existingCfg, cfgErr := s.Config(); cfgErr == nil {
+			cfg = existingCfg
+		}
+		cfg.StartType = mgr.StartAutomatic
 		cfg.BinaryPathName = exe
+		cfg.DisplayName = "ClashFX Privileged Tunnel Service"
+		cfg.Description = "Manages ClashFX Mihomo TUN adapter lifecycle without daily UAC prompts."
 		if err := s.UpdateConfig(cfg); err != nil {
 			return fmt.Errorf("update service config: %w", err)
 		}
@@ -126,9 +132,17 @@ func installAndStartService() error {
 	}
 	if err := s.Start(); err != nil {
 		st, qErr := s.Query()
-		if qErr != nil || st.State != svc.Running {
+		if qErr != nil || (st.State != svc.Running && st.State != svc.StartPending) {
 			return fmt.Errorf("start service: %w", err)
 		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st, qErr := s.Query()
+		if qErr == nil && st.State == svc.Running {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	return nil
 }
