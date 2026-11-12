@@ -339,6 +339,7 @@ enum Settings {
     @UserDefault("bypassChineseApps", defaultValue: false)
     static var bypassChineseApps: Bool
 
+    // AI lock retains legacy keys so existing locked-node settings survive upgrades.
     @UserDefault("claudeProxyLockEnabled", defaultValue: false)
     static var claudeProxyLockEnabled: Bool
 

@@ -157,11 +157,14 @@ class RemoteConfigManager {
     /// those providers expose to compatible clients.
     private static let subscriptionUserAgent = "clash.meta/v1.19.24"
 
+    private static var directRecoverySessions = [Int: Session]()
+
     @discardableResult
-    static func getRemoteConfigData(config: RemoteConfigModel, complete: @escaping ((String?, String?, [AnyHashable: Any]?) -> Void)) -> DataRequest? {
+    static func getRemoteConfigData(config: RemoteConfigModel, forceDirect: Bool = false,
+                                    complete: @escaping ((String?, String?, [AnyHashable: Any]?) -> Void)) -> DataRequest? {
         guard var urlRequest = try? URLRequest(url: config.url, method: .get) else {
             assertionFailure()
-            Logger.log("[getRemoteConfigData] url incorrect,\(config.name) \(config.url)")
+            Logger.log("[getRemoteConfigData] Invalid URL for \(config.name)", level: .warning)
             complete(nil, nil, nil)
             return nil
         }
@@ -171,7 +174,26 @@ class RemoteConfigManager {
         urlRequest.setValue(userAgent?.isEmpty == false ? userAgent : subscriptionUserAgent,
                             forHTTPHeaderField: "User-Agent")
 
-        return AF.request(urlRequest)
+        let transport: Session
+        if forceDirect {
+            guard let state = try? NodeServiceStore.shared.read(), state.settings.recoveryEnabled,
+                  let port = state.registry.directPort else {
+                complete(nil, nil, nil)
+                return nil
+            }
+            if Self.directRecoverySessions[port] == nil {
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.connectionProxyDictionary = NodeDirectTransportPolicy.proxySettings(port: port)
+                configuration.timeoutIntervalForRequest = remoteConfigUpdateTimeout
+                configuration.timeoutIntervalForResource = remoteConfigUpdateTimeout
+                configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                Self.directRecoverySessions[port] = Session(configuration: configuration)
+            }
+            transport = Self.directRecoverySessions[port]!
+        } else {
+            transport = AF
+        }
+        return transport.request(urlRequest)
             .validate()
             .responseString(encoding: .utf8) { res in
                 complete(try? res.result.get(), res.response?.suggestedFilename, res.response?.allHeaderFields)
@@ -1122,7 +1144,8 @@ class RemoteConfigManager {
         return shareLinkSchemes.contains(where: { firstLine.hasPrefix($0) })
     }
 
-    static func updateConfig(config: RemoteConfigModel, complete: ((String?) -> Void)? = nil) {
+    static func updateConfig(config: RemoteConfigModel, forceDirect: Bool = false,
+                             complete: ((String?) -> Void)? = nil) {
         var request: DataRequest?
         let settlement = ManagedOperationSettlement<String?> { error in
             DispatchQueue.main.async {
@@ -1138,7 +1161,7 @@ class RemoteConfigManager {
             return NSLocalizedString("Remote Config Update Timed Out", comment: "")
         })
 
-        request = getRemoteConfigData(config: config) { configString, suggestedFilename, responseHeaders in
+        request = getRemoteConfigData(config: config, forceDirect: forceDirect) { configString, suggestedFilename, responseHeaders in
             guard !settlement.isSettled else { return }
             guard let rawConfig = configString else {
                 _ = settlement.finish(NSLocalizedString("Download fail", comment: ""))

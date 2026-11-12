@@ -79,7 +79,7 @@ final class ClaudeProxyLockTransaction {
     }
 
     private func cancel() {
-        finish(Failure(primary: "Claude Proxy Lock change was superseded.",
+        finish(Failure(primary: "AI Proxy Lock change was superseded.",
                        restorationErrors: [], cancelled: true))
     }
 

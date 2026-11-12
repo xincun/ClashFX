@@ -685,7 +685,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         },
         didObserve: { _ in },
         didSuspend: {
-            Logger.log("Claude Proxy Lock Rule-mode recovery suspended after repeated failures; waiting for explicit retry", level: .error)
+            Logger.log("AI Proxy Lock Rule-mode recovery suspended after repeated failures; waiting for explicit retry", level: .error)
         }
     )
 
@@ -798,6 +798,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupLanguageMenu()
         setupConfigEditorMenuItem()
         setupProfileMixinMenuItem()
+        setupNodeServicesMenuItem()
         // 启用自动更新检查（使用fork项目的GitHub Pages）
         AutoUpgradeManager.shared.setup()
         AutoUpgradeManager.shared.setupCheckForUpdatesMenuItem(checkForUpdateMenuItem)
@@ -870,6 +871,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
         startEnhancedModeHealthMonitor()
+        NodeServices.shared.start()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -885,6 +887,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func prepareForTerminationCleanup() {
         isTerminating = true
+        NodeServices.shared.stop()
         cancelDeferredConfigUpdate(reason: "Config update cancelled: application quit")
         invalidateProxyInteractionScope(reason: "application quit")
         enhancedModeLifecycle.invalidate()
@@ -908,6 +911,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func cancelTerminationCleanup() {
         resetSystemProxyAutoRecovery()
         isTerminating = false
+        NodeServices.shared.start()
         SystemProxyManager.shared.resumeAfterCancelledTermination()
         statusItem.menu = statusMenu
         startEnhancedModeHealthMonitor()
@@ -2501,7 +2505,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     ) -> RuntimeConfigPatch {
         let lockEnabled = lockSettings?.enabled ?? Settings.claudeProxyLockEnabled
         let lockTarget = lockSettings?.target ?? Settings.claudeProxyLockTarget
-        let requiresValidConfig = lockEnabled || lockSettings != nil
+        let nodeSettings = try? NodeServiceStore.shared.read().settings
+        let requiresValidConfig = lockEnabled || lockSettings != nil || nodeSettings == nil ||
+            nodeSettings?.portsEnabled == true || nodeSettings?.recoveryEnabled == true
         let targetPath = outputPath ?? Self.runtimePatchedConfigPath
         let removePatched: () -> Void = {
             try? FileManager.default.removeItem(atPath: targetPath)
@@ -2522,6 +2528,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             var changed = applyProfileRuleDirectives(in: &root)
             changed = applyProfileMixin(to: &root) || changed
+
+            try NodeServiceStore.shared.prepare(
+                root: &root, profile: NodeServices.profileKey(configName),
+                additionalReserved: Set([Settings.proxyPort, Int(ConfigManager.shared.apiPort) ?? 0]),
+                protectionRules: lockEnabled ? ClaudeProxyLockPolicy.rules(target: lockTarget) : [],
+                available: NodeServices.portAvailable
+            )
+            changed = true
 
             let measurementMethod = Settings.benchmarkMeasurementMethod
             changed = RuntimeBenchmarkSettingsPolicy.apply(
@@ -2546,7 +2560,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     logClaudeProxyLockOutcome(outcome, target: target)
                 } else {
                     removePatched()
-                    return RuntimeConfigPatch(error: "The Claude Proxy Lock target is invalid.")
+                    return RuntimeConfigPatch(error: "The AI Proxy Lock target is invalid.")
                 }
             }
 
@@ -2590,10 +2604,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         target: String
     ) {
         if let relay = outcome.relayProxy {
-            Logger.log("[Claude Proxy Lock] \(target) exits on the locked node; its server is reached through \(relay)")
+            Logger.log("[AI Proxy Lock] \(target) exits on the locked node; its server is reached through \(relay)")
         } else {
             Logger.log(
-                "[Claude Proxy Lock] \(target) has no fast relay, so its server is dialed directly",
+                "[AI Proxy Lock] \(target) has no fast relay, so its server is dialed directly",
                 level: .warning
             )
         }
@@ -4441,7 +4455,7 @@ extension AppDelegate {
 
     private func installClaudeProxyLockMenuItem() {
         let item = NSMenuItem(
-            title: NSLocalizedString("Claude Proxy Lock…", comment: ""),
+            title: NSLocalizedString("AI Proxy Lock…", comment: ""),
             action: #selector(showClaudeProxyLockSettings(_:)),
             keyEquivalent: ""
         )
@@ -4510,9 +4524,9 @@ extension AppDelegate {
             }
 
             let alert = NSAlert()
-            alert.messageText = NSLocalizedString("Claude Proxy Lock", comment: "")
+            alert.messageText = NSLocalizedString("AI Proxy Lock", comment: "")
             alert.informativeText = NSLocalizedString(
-                "Choose one concrete proxy node. ClashFX will force Claude Desktop, Claude Code, and Anthropic web domains through it in Enhanced Mode. If that node or ClashFX fails, protected traffic is blocked instead of falling back. While enabled, Rule mode, Enhanced Mode, and System Proxy cannot be turned off. Browser extensions, manually configured app proxies, and software that ignores macOS networking settings remain outside this protection.",
+                "Choose one concrete proxy node for Claude, Codex, and Antigravity, including their desktop apps, CLI clients, and supported service domains. AI traffic through ClashFX, including its per-node ports, uses this node and fails closed when unavailable. Other traffic keeps its routing or chosen node port. Rule mode, Enhanced Mode, and System Proxy remain protected. Traffic using another proxy stack or VPN may bypass this control.",
                 comment: ""
             )
 
@@ -4548,7 +4562,7 @@ extension AppDelegate {
             return
         }
         let alert = NSAlert()
-        alert.messageText = NSLocalizedString("Claude Proxy Lock", comment: "")
+        alert.messageText = NSLocalizedString("AI Proxy Lock", comment: "")
         alert.informativeText = message
         alert.addButton(withTitle: NSLocalizedString("Disable Lock", comment: ""))
         alert.addButton(withTitle: NSLocalizedString("Cancel", comment: ""))
@@ -4574,7 +4588,7 @@ extension AppDelegate {
               RemoteControlManager.selectConfig == nil else { return }
         let change = ClaudeLockChange(enabled: enabled, target: target,
                                       generation: enhancedModeGeneration)
-        invalidateProxyInteractionScope(reason: "Claude Proxy Lock change")
+        invalidateProxyInteractionScope(reason: "AI Proxy Lock change")
         claudeLockChange = change
         claudeProxyLockMenuItem?.isEnabled = false
         cancelActiveSpeedTest(reason: "core transition", refreshMenu: false)
@@ -4593,7 +4607,7 @@ extension AppDelegate {
                 DispatchQueue.main.async {
                     guard self.isCurrentClaudeLockChange(change) else {
                         self.finishClaudeLockChange(change, failure: .init(
-                            primary: "Claude Proxy Lock change was superseded.",
+                            primary: "AI Proxy Lock change was superseded.",
                             restorationErrors: [], cancelled: true
                         ))
                         return
@@ -4607,7 +4621,7 @@ extension AppDelegate {
                     SystemProxyManager.shared.captureCheckpoint { result in
                         guard self.isCurrentClaudeLockChange(change) else {
                             self.finishClaudeLockChange(change, failure: .init(
-                                primary: "Claude Proxy Lock change was superseded.",
+                                primary: "AI Proxy Lock change was superseded.",
                                 restorationErrors: [], cancelled: true
                             ))
                             return
@@ -4685,7 +4699,7 @@ extension AppDelegate {
             } else {
                 enableEnhancedMode { _, error in
                     guard self.isCurrentClaudeLockChange(change) else {
-                        completion("Claude Proxy Lock change was superseded."); return
+                        completion("AI Proxy Lock change was superseded."); return
                     }
                     if let error { completion(error); return }
                     reload()
@@ -4695,7 +4709,7 @@ extension AppDelegate {
         } else if isEnhancedModeCleanupRequired {
             disableEnhancedMode { _, error in
                 guard self.isCurrentClaudeLockChange(change) else {
-                    completion("Claude Proxy Lock change was superseded."); return
+                    completion("AI Proxy Lock change was superseded."); return
                 }
                 if let error { completion(error); return }
                 reload()
@@ -4705,7 +4719,7 @@ extension AppDelegate {
             if !ConfigManager.shared.isRunning {
                 startProxy()
                 guard ConfigManager.shared.isRunning else {
-                    completion("Could not start the built-in core to disable Claude Proxy Lock.")
+                    completion("Could not start the built-in core to disable AI Proxy Lock.")
                     return
                 }
             }
@@ -4715,17 +4729,17 @@ extension AppDelegate {
 
     private func reloadClaudeLockRuntime(_ change: ClaudeLockChange, completion: @escaping (String?) -> Void) {
         guard isCurrentClaudeLockChange(change) else {
-            completion("Claude Proxy Lock change was superseded."); return
+            completion("AI Proxy Lock change was superseded."); return
         }
         requestConfigUpdateApplyingRuntimePatch(configName: change.configName) { error in
             guard self.isCurrentClaudeLockChange(change) else {
-                completion("Claude Proxy Lock change was superseded."); return
+                completion("AI Proxy Lock change was superseded."); return
             }
             if let error { completion(error); return }
             self.enqueueOutboundModeChange(
                 mode: change.runtimeSettings.mode, source: .configReload, closeConnections: false
             ) { success in
-                completion(success ? nil : "Could not apply the proxy mode for Claude Proxy Lock.")
+                completion(success ? nil : "Could not apply the proxy mode for AI Proxy Lock.")
             }
         }
     }
@@ -4734,12 +4748,12 @@ extension AppDelegate {
         guard change.runtimeTouched else { completion(nil); return }
         let restore: () -> Void = {
             guard self.isCurrentClaudeLockChange(change) else {
-                completion("Claude Proxy Lock recovery was superseded."); return
+                completion("AI Proxy Lock recovery was superseded."); return
             }
             if change.wasEnhancedActive {
                 self.enableEnhancedMode { _, error in
                     guard self.isCurrentClaudeLockChange(change) else {
-                        completion("Claude Proxy Lock recovery was superseded."); return
+                        completion("AI Proxy Lock recovery was superseded."); return
                     }
                     if let error { completion(error); return }
                     self.reloadClaudeLockRuntime(change, completion: completion)
@@ -4766,7 +4780,7 @@ extension AppDelegate {
             if self.isEnhancedModeCleanupRequired {
                 self.disableEnhancedMode { _, error in
                     guard self.isCurrentClaudeLockChange(change) else {
-                        completion("Claude Proxy Lock recovery was superseded."); return
+                        completion("AI Proxy Lock recovery was superseded."); return
                     }
                     if let error {
                         // Never start a second core while stop ownership remains
@@ -4838,7 +4852,7 @@ extension AppDelegate {
         ) { [weak self] success in
             guard let self else { return }
             if let change, !self.isCurrentClaudeLockChange(change) {
-                completion?("Claude Proxy Lock change was superseded."); return
+                completion?("AI Proxy Lock change was superseded."); return
             }
             guard success else {
                 let error = NSLocalizedString("Could not enable System Proxy.", comment: "")
@@ -4855,15 +4869,15 @@ extension AppDelegate {
 
     private func presentClaudeProxyLockProtectionNotice() {
         NSAlert.alert(with: NSLocalizedString(
-            "Claude Proxy Lock is protecting this setting. Disable the lock first.",
+            "AI Proxy Lock is protecting this setting. Disable the lock first.",
             comment: ""
         ))
     }
 
     private func presentClaudeProxyLockApplyError(_ error: String) {
-        Logger.log("Claude Proxy Lock apply failed: \(error)", level: .error)
+        Logger.log("AI Proxy Lock apply failed: \(error)", level: .error)
         NSAlert.alert(with: String(
-            format: NSLocalizedString("Claude Proxy Lock could not be fully applied: %@", comment: ""),
+            format: NSLocalizedString("AI Proxy Lock could not be fully applied: %@", comment: ""),
             error
         ))
     }
@@ -7578,7 +7592,7 @@ extension AppDelegate {
             lockEnabled: Settings.claudeProxyLockEnabled, preferredEnhancedMode: Settings.enhancedMode
         ), !Settings.enhancedMode {
             Settings.enhancedMode = true
-            Logger.log("Restoring required Enhanced Mode for persisted Claude Proxy Lock")
+            Logger.log("Restoring required Enhanced Mode for persisted AI Proxy Lock")
         }
         guard Settings.enhancedMode else {
             enhancedModeLifecycle.cancelRestore()
@@ -8376,6 +8390,23 @@ extension AppDelegate {
 // MARK: Config actions
 
 extension AppDelegate {
+    var nodeServiceChecksAllowed: Bool {
+        ownsRuntimeControl && !isTerminating && !isRestarting &&
+            !isConfigUpdating && !isConfigUpdateQueued && !isRestoringProxySelection &&
+            !isEnhancedModeTransitionInProgress && isCoreConfigSnapshotVerified && claudeLockChange == nil && ConfigManager.shared.isRunning &&
+            RemoteControlManager.selectConfig == nil
+    }
+
+    func setupNodeServicesMenuItem() {
+        let item = NSMenuItem(title: NSLocalizedString("Multiple Node Proxies…", comment: ""),
+                              action: #selector(actionNodeServices), keyEquivalent: "")
+        item.target = self
+        let anchor = statusMenu.index(of: proxyModeMenuItem)
+        statusMenu.insertItem(item, at: max(0, anchor + 1))
+    }
+
+    @objc private func actionNodeServices() { NodeServicesWindowController.show() }
+
     func setupConfigEditorMenuItem() {
         guard let configMenu = configSeparatorLine.menu else { return }
         let editorItem = NSMenuItem(

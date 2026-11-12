@@ -12,7 +12,16 @@ enum ClaudeProxyLockPolicy {
 
     /// mihomo PROCESS-NAME is an exact match. Claude Desktop's network
     /// processes are "Claude", "Claude Helper", and "Claude Helper (Renderer|GPU|Plugin)".
+    // Keep the original first rule and preference keys for upgrade compatibility.
     static let processNamePattern = "^claude( helper.*)?$"
+    static let additionalProcessPatterns = [
+        "(?i)^(claude|codex|codex-app-server|chatgpt|antigravity|antigravity-cli|agy)( helper.*)?$"
+    ]
+    static let processPathPatterns = [
+        #"(?i)(^|/)(Claude|Codex|CodexCLI|ChatGPT|Antigravity)\.app/Contents/.*$"#,
+        #"(?i)(^|/)\.local/share/claude/versions/[^/]+$"#,
+        #"(?i)(^|/)(\.antigravity|\.gemini/antigravity-cli)/.*$"#
+    ]
 
     struct ProviderSnapshot {
         var name: String
@@ -127,10 +136,20 @@ enum ClaudeProxyLockPolicy {
         var proxy: [String: Any]
     }
 
-    private static let protectedDomains = [
-        "claude.ai",
-        "claude.com",
-        "anthropic.com"
+    // Provider-owned domains use suffix rules; shared Google infrastructure
+    // is listed as exact endpoints so unrelated Google services stay untouched.
+    static let protectedDomains = [
+        "claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
+        "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com", "oaistatsig.com", "openaimerge.com",
+        "antigravity.google"
+    ]
+    static let protectedExactDomains = [
+        "accounts.google.com", "oauth2.googleapis.com", "generativelanguage.googleapis.com",
+        "cloudcode-pa.googleapis.com", "businessaicode.googleapis.com",
+        "businessaicode.us.rep.googleapis.com", "businessaicode.eu.rep.googleapis.com", "businessaicode.mtls.googleapis.com",
+        "aiplatform.googleapis.com", "aiplatform.us.rep.googleapis.com", "aiplatform.eu.rep.googleapis.com", "aiplatform.mtls.googleapis.com",
+        "discoveryengine.googleapis.com", "us-discoveryengine.googleapis.com", "eu-discoveryengine.googleapis.com",
+        "discoveryengine.mtls.googleapis.com", "us-discoveryengine.mtls.googleapis.com", "eu-discoveryengine.mtls.googleapis.com"
     ]
 
     static func isValidTarget(_ target: String) -> Bool {
@@ -139,8 +158,7 @@ enum ClaudeProxyLockPolicy {
             !trimmed.contains(",") &&
             !trimmed.contains("\n") &&
             !trimmed.contains("\r") &&
-            trimmed != "DIRECT" &&
-            trimmed != "REJECT"
+            !["DIRECT", "REJECT", "COMPATIBLE", "PASS", "REJECT-DROP"].contains(trimmed)
     }
 
     static func rules(target: String) -> [String] {
@@ -150,7 +168,16 @@ enum ClaudeProxyLockPolicy {
         let domainRules = protectedDomains.map {
             "DOMAIN-SUFFIX,\($0),\(trimmed)"
         }
-        return [processRule] + domainRules
+        let processRules = additionalProcessPatterns.map { "PROCESS-NAME-REGEX,\($0),\(trimmed)" }
+        let pathRules = processPathPatterns.map { "PROCESS-PATH-REGEX,\($0),\(trimmed)" }
+        let exactRules = protectedExactDomains.map { "DOMAIN,\($0),\(trimmed)" }
+        let targetRules = [processRule] + processRules + pathRules + domainRules + exactRules
+        // mihomo can skip a rule when an outbound lacks UDP support. Keep the
+        // same matcher followed by REJECT so AI traffic never falls through.
+        return targetRules.flatMap { rule -> [String] in
+            guard let comma = rule.lastIndex(of: ",") else { return [rule] }
+            return [rule, String(rule[..<comma]) + ",REJECT"]
+        }
     }
 
     /// The group selected by MATCH, when every possible dependency is resolvable and safe.

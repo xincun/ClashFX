@@ -543,12 +543,11 @@ final class ClaudeProxyLockPolicyTests: XCTestCase {
     }
 
     func testRulesCoverClaudeProcessesAndOfficialDomains() {
-        XCTAssertEqual(ClaudeProxyLockPolicy.rules(target: "IPRoyal Korea"), [
-            "PROCESS-NAME-REGEX,^claude( helper.*)?$,IPRoyal Korea",
-            "DOMAIN-SUFFIX,claude.ai,IPRoyal Korea",
-            "DOMAIN-SUFFIX,claude.com,IPRoyal Korea",
-            "DOMAIN-SUFFIX,anthropic.com,IPRoyal Korea"
-        ])
+        let rules = ClaudeProxyLockPolicy.rules(target: "IPRoyal Korea")
+        XCTAssertEqual(rules.first, "PROCESS-NAME-REGEX,^claude( helper.*)?$,IPRoyal Korea")
+        for domain in ["claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com"] {
+            XCTAssertTrue(rules.contains("DOMAIN-SUFFIX,\(domain),IPRoyal Korea"))
+        }
     }
 
     func testApplyingLockForcesRuleModeAndPrependsRules() {
@@ -598,13 +597,7 @@ final class ClaudeProxyLockPolicyTests: XCTestCase {
         XCTAssertEqual(outcome.serverHost, "147.125.251.178")
         let proxies = root["proxies"] as? [[String: Any]]
         XCTAssertEqual(proxies?.first?["dialer-proxy"] as? String, "Final")
-        XCTAssertEqual(root["rules"] as? [String], [
-            "PROCESS-NAME-REGEX,^claude( helper.*)?$,Korea",
-            "DOMAIN-SUFFIX,claude.ai,Korea",
-            "DOMAIN-SUFFIX,claude.com,Korea",
-            "DOMAIN-SUFFIX,anthropic.com,Korea",
-            "MATCH,Final"
-        ])
+        XCTAssertEqual(root["rules"] as? [String], ClaudeProxyLockPolicy.rules(target: "Korea") + ["MATCH,Final"])
     }
 
     func testLockDoesNotRelayThroughTheLockedNode() {
@@ -1110,7 +1103,19 @@ final class ClaudeProxyLockPolicyTests: XCTestCase {
     }
 
     func testUnsafeOrFallbackTargetsAreRejected() {
-        XCTAssertFalse(ClaudeProxyLockPolicy.isValidTarget("DIRECT"))
+        for target in ["DIRECT", "REJECT", "COMPATIBLE", "PASS", "REJECT-DROP"] {
+            XCTAssertFalse(ClaudeProxyLockPolicy.isValidTarget(target), target)
+            XCTAssertFalse(ClaudeProxyLockPolicy.isValidTarget(" \(target) "), target)
+            XCTAssertTrue(ClaudeProxyLockPolicy.rules(target: target).isEmpty, target)
+            var root: [String: Any] = [
+                "rules": ["MATCH,DIRECT"],
+                "proxies": [["name": target, "type": "direct"]]
+            ]
+            let before = try? JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+            XCTAssertFalse(ClaudeProxyLockPolicy.apply(to: &root, target: target).applied, target)
+            XCTAssertEqual(try? JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]), before, target)
+        }
+        XCTAssertTrue(ClaudeProxyLockPolicy.isValidTarget("JMS-node-1"))
         XCTAssertFalse(ClaudeProxyLockPolicy.isValidTarget("bad,target"))
         XCTAssertTrue(ClaudeProxyLockPolicy.rules(target: "bad,target").isEmpty)
         var root: [String: Any] = ["rules": ["MATCH,DIRECT"]]
@@ -3525,5 +3530,57 @@ final class ProxyGroupSelectionModelTests: XCTestCase {
         XCTAssertEqual(decoded.now, "Hong Kong")
         XCTAssertNil(decoded.fixed)
         XCTAssertEqual(ProxyGroupSelectionPresentation(group: decoded, snapshot: nil)?.mode, .unknownAutomatic)
+    }
+}
+
+
+final class AIProxyLockCoverageTests: XCTestCase {
+    func testDesktopAndCLINamesMatchWithoutCapturingGenericRuntimes() throws {
+        let patterns = [ClaudeProxyLockPolicy.processNamePattern] + ClaudeProxyLockPolicy.additionalProcessPatterns
+        let regexes = try patterns.map { try NSRegularExpression(pattern: $0) }
+        func matches(_ value: String) -> Bool {
+            regexes.contains { $0.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil }
+        }
+        for name in ["Claude", "claude", "Claude Helper (Renderer)", "codex", "Codex", "Codex Helper (GPU)", "codex-app-server", "ChatGPT", "Antigravity", "Antigravity Helper (Plugin)", "agy", "antigravity-cli"] {
+            XCTAssertTrue(matches(name), name)
+        }
+        for name in ["node", "python3", "Google Chrome", "Code", "codexbar", "language_server", "my-claude-proxy"] {
+            XCTAssertFalse(matches(name), name)
+        }
+    }
+
+    func testScopedHelperAndVersionedCLIPaths() throws {
+        let regexes = try ClaudeProxyLockPolicy.processPathPatterns.map { try NSRegularExpression(pattern: $0) }
+        func matches(_ value: String) -> Bool {
+            regexes.contains { $0.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil }
+        }
+        for path in ["/Applications/Antigravity.app/Contents/Resources/bin/language_server", "/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm", "/Applications/Codex.app/Contents/MacOS/Codex", "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex", "/Users/test/.local/share/claude/versions/2.1.0", "/Users/test/.gemini/antigravity-cli/bin/language_server"] {
+            XCTAssertTrue(matches(path), path)
+        }
+        for path in ["/usr/local/bin/node", "/Applications/Windsurf.app/Contents/Resources/bin/language_server", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"] {
+            XCTAssertFalse(matches(path), path)
+        }
+    }
+
+    func testRequiredProviderDomainsAndGoogleScope() {
+        let rules = ClaudeProxyLockPolicy.rules(target: "Locked")
+        for domain in ["claude.ai", "anthropic.com", "chatgpt.com", "openai.com", "oaistatic.com", "antigravity.google"] {
+            XCTAssertTrue(rules.contains("DOMAIN-SUFFIX,\(domain),Locked"), domain)
+        }
+        for host in ["oauth2.googleapis.com", "cloudcode-pa.googleapis.com", "businessaicode.googleapis.com", "businessaicode.us.rep.googleapis.com", "aiplatform.eu.rep.googleapis.com", "generativelanguage.googleapis.com"] {
+            XCTAssertTrue(rules.contains("DOMAIN,\(host),Locked"), host)
+        }
+        XCTAssertFalse(rules.contains("DOMAIN-SUFFIX,google.com,Locked"))
+        XCTAssertFalse(rules.contains("DOMAIN-SUFFIX,googleapis.com,Locked"))
+    }
+
+    func testEveryProtectedMatcherHasImmediateRejectFallback() {
+        let rules = ClaudeProxyLockPolicy.rules(target: "Locked")
+        XCTAssertEqual(rules.count % 2, 0)
+        for index in stride(from: 0, to: rules.count, by: 2) {
+            let rule = rules[index]
+            let separator = rule.lastIndex(of: ",")!
+            XCTAssertEqual(rules[index + 1], String(rule[..<separator]) + ",REJECT")
+        }
     }
 }

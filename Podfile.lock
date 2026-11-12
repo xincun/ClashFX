@@ -1,0 +1,72 @@
+PODS:
+  - Alamofire (5.12.2)
+  - CocoaLumberjack/Core (3.8.5)
+  - CocoaLumberjack/Swift (3.8.5):
+    - CocoaLumberjack/Core
+  - FlexibleDiff (0.0.9)
+  - GzipSwift (5.1.1)
+  - LetsMove (1.25)
+  - RxCocoa (6.9.0):
+    - RxRelay (= 6.9.0)
+    - RxSwift (= 6.9.0)
+  - RxRelay (6.9.0):
+    - RxSwift (= 6.9.0)
+  - RxSwift (6.9.0)
+  - Sparkle (2.9.6)
+  - Starscream (4.0.8)
+  - SwiftFormat/CLI (0.63.1)
+  - SwiftLint (0.65.1)
+  - SwiftyJSON (5.0.2)
+  - Yams (5.0.6)
+
+DEPENDENCIES:
+  - Alamofire (~> 5.0)
+  - CocoaLumberjack/Swift (~> 3.8.0)
+  - FlexibleDiff
+  - GzipSwift
+  - LetsMove
+  - RxCocoa (~> 6.0)
+  - RxSwift (~> 6.0)
+  - Sparkle (~> 2.0)
+  - Starscream (~> 4.0.6)
+  - SwiftFormat/CLI (~> 0.49)
+  - SwiftLint
+  - SwiftyJSON
+  - Yams (~> 5.0)
+
+SPEC REPOS:
+  trunk:
+    - Alamofire
+    - CocoaLumberjack
+    - FlexibleDiff
+    - GzipSwift
+    - LetsMove
+    - RxCocoa
+    - RxRelay
+    - RxSwift
+    - Sparkle
+    - Starscream
+    - SwiftFormat
+    - SwiftLint
+    - SwiftyJSON
+    - Yams
+
+SPEC CHECKSUMS:
+  Alamofire: c5f37d8f438dc1d7fd3ff767f2f80fd01ca381d7
+  CocoaLumberjack: 6a459bc897d6d80bd1b8c78482ec7ad05dffc3f0
+  FlexibleDiff: b9ee9b8305b42c784f5dd40589203c97c55bbaa0
+  GzipSwift: 893f3e48e597a1a4f62fafcb6514220fcf8287fa
+  LetsMove: 7b9fe44737707d984fbd3f47af46609a9a07b461
+  RxCocoa: ac16414696ae706516be3e1ab00fcce5bdc9be8a
+  RxRelay: 6b0c930e5cef57d5fe2032571e5e65b78e3cbdb1
+  RxSwift: 31649ace6aceeb422e16ff71c60804f9c3281ed9
+  Sparkle: b8c9cf4ced217ffc708a1ca5f988a7ba877658db
+  Starscream: 19b5533ddb925208db698f0ac508a100b884a1b9
+  SwiftFormat: 28cc555cfafcac7b75ee4d5a981c676380c37c0e
+  SwiftLint: 7d51ad56923e88694cee5ca806dbbab30f85eaaa
+  SwiftyJSON: f5b1bf1cd8dd53cd25887ac0eabcfd92301c6a5a
+  Yams: e10dae147f517ed57ecae37c5e8681bdf8fcab65
+
+PODFILE CHECKSUM: a71a17ea148f27d333f5ea6c23e2de06184dd8eb
+
+COCOAPODS: 1.16.2

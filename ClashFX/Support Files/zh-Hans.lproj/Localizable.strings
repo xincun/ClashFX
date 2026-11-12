@@ -626,16 +626,16 @@
 /* Requires Enhanced Mode (uses PROCESS-NAME rules) */
 "Requires Enhanced Mode (uses PROCESS-NAME rules)" = "需要先开启增强模式（依赖 PROCESS-NAME 规则）";
 
-/* Claude 专用代理锁定 */
-"Claude Proxy Lock…" = "Claude 专用代理锁定…";
-"Claude Proxy Lock" = "Claude 专用代理锁定";
+/* AI 专用锁定 */
+"AI Proxy Lock…" = "AI 专用锁定…";
+"AI Proxy Lock" = "AI 专用锁定";
 "Pin Claude traffic to one proxy and block fallback" = "将 Claude 流量锁定到一个节点，并阻止故障回落";
 "Choose one concrete proxy node. ClashFX will force Claude Desktop, Claude Code, and Anthropic web domains through it in Enhanced Mode. If that node or ClashFX fails, protected traffic is blocked instead of falling back. While enabled, Rule mode, Enhanced Mode, and System Proxy cannot be turned off. Browser extensions, manually configured app proxies, and software that ignores macOS networking settings remain outside this protection." = "请选择一个具体代理节点。ClashFX 会在增强模式下强制 Claude 桌面版、Claude Code 和 Anthropic 网页域名走该节点。该节点或 ClashFX 失效时，受保护流量会被阻断，不会回落到其他线路。启用期间无法关闭规则模式、增强模式或系统代理。浏览器扩展、应用内手动代理，以及忽略 macOS 网络设置的软件不在此保护范围内。";
 "Apply Lock" = "应用锁定";
 "Enable Lock" = "启用锁定";
 "Disable Lock" = "停用锁定";
-"Claude Proxy Lock is protecting this setting. Disable the lock first." = "Claude 专用代理锁定正在保护此设置，请先停用锁定。";
-"Claude Proxy Lock could not be fully applied: %@" = "Claude 专用代理锁定未能完整生效：%@";
+"AI Proxy Lock is protecting this setting. Disable the lock first." = "AI 专用锁定正在保护此设置，请先停用锁定。";
+"AI Proxy Lock could not be fully applied: %@" = "AI 专用锁定未能完整生效：%@";
 "Proxy core is not running." = "代理核心未运行。";
 "Could not load the proxy list." = "无法载入代理节点列表。";
 "No eligible proxy nodes are available." = "没有可用的具体代理节点。";
@@ -950,3 +950,101 @@
 "Proxy nodes are not responding. Check the network, or switch node or configuration." = "代理节点没有响应。请检查网络，或切换节点或配置。";
 
 "Proxy nodes are failing and the cause could not be determined. The DNS cache was cleared and the configuration reloaded, but the problem remains. Update the subscription or switch configuration." = "代理节点持续失败，且无法确定原因。已清除 DNS 缓存并重新加载配置，问题仍然存在。请更新订阅或切换配置。";
+
+// Local node ports and direct subscription recovery
+"Node Ports & Recovery…" = "节点端口与自动刷新…";
+"Node Ports & Recovery" = "多节点代理与自动刷新";
+"Enable fixed ports for each node" = "为每个节点启用固定端口";
+"Automatically refresh subscription directly after node failures" = "节点连续不通时自动直连刷新订阅";
+"First new port" = "新增节点起始端口";
+"Check interval (s)" = "检测间隔（秒）";
+"Consecutive failures" = "连续失败次数";
+"Refresh cooldown (s)" = "刷新冷却（秒）";
+"Each local port accepts HTTP and SOCKS5 and always uses its assigned node. The main proxy port keeps its routing rules. Edit ports, then save and reload." = "每个本机端口同时支持 HTTP 和 SOCKS5，始终使用对应节点；主端口继续按规则分流。修改端口后请保存并重载。";
+"Node" = "节点";
+"Fixed port" = "固定端口";
+"Connectivity" = "连通状态";
+"Check now" = "立即检测";
+"Refresh subscription directly" = "直连刷新订阅";
+"Copy HTTP address" = "复制 HTTP 地址";
+"Copy SOCKS5 address" = "复制 SOCKS5 地址";
+"Waiting for the next node check" = "等待下一次节点检测";
+"Network offline; node checks paused" = "网络离线，已暂停检测";
+"The active configuration has no inline proxy nodes" = "当前配置没有内联代理节点";
+"Checking node connectivity…" = "正在检测节点连通性…";
+"Node connectivity check finished" = "节点检测完成";
+"Node failure detected; subscription refresh is cooling down" = "节点连接失败，订阅刷新处于冷却期";
+"No managed subscription for the active configuration" = "当前配置没有对应的托管订阅";
+"Refreshing subscription through DIRECT…" = "正在通过 DIRECT 直连刷新订阅…";
+"Direct refresh failed; previous configuration retained" = "直连刷新失败，已保留原配置";
+"Subscription refreshed directly and reloaded" = "订阅已直连刷新并重新加载";
+"Subscription downloaded; runtime reload failed" = "订阅已下载，但运行配置重载失败";
+"Unreachable (%d consecutive failures)" = "不通（连续 %d 次失败）";
+"Check unavailable" = "检测暂不可用";
+"Not checked" = "尚未检测";
+"Enter a port between 1024 and 65535" = "请输入 1024 到 65535 之间的端口";
+"Wait until the current configuration operation finishes" = "请等待当前配置操作完成";
+
+"Fixed ports and automatic refresh are paused while AI Proxy Lock is enabled" = "AI 专用锁定开启期间，固定端口与自动刷新暂停使用";
+
+"Local build — updates disabled" = "本地定制版（更新已屏蔽）";
+
+"Automatic updates blocked in this local build" = "本地定制版已屏蔽自动更新";
+
+"Choose one concrete proxy node for Claude, Codex, and Antigravity, including their desktop apps, CLI clients, and supported service domains. AI traffic through ClashFX, including its per-node ports, uses this node and fails closed when unavailable. Other traffic keeps its routing or chosen node port. Rule mode, Enhanced Mode, and System Proxy remain protected. Traffic using another proxy stack or VPN may bypass this control." = "为 Claude、Codex 和 Antigravity（含桌面端、CLI 与受支持的服务域名）选择一个具体节点。进入 ClashFX 的 AI 流量，包括各节点专用端口上的 AI 流量，都优先使用该节点，不通时阻断。其他流量继续遵循分流或指定节点端口。规则模式、增强模式和系统代理保持保护；其他代理栈或 VPN 中的流量可能绕过此控制。";
+
+"Enable multiple node ports" = "启用多节点独立端口";
+
+"Enable all" = "全部启用";
+
+"Stop all" = "全部停止";
+
+"Enabled" = "启用";
+
+"HTTP / HTTPS proxy" = "HTTP / HTTPS 代理地址";
+
+"Check several nodes to run them at the same time, then Save & Reload once. Each port accepts HTTP and SOCKS5; stopped nodes keep their port. Use separate proxy profiles in Chrome to route pages through different ports." = "勾选多个节点后，点击一次“保存并重载”即可同时运行。每个端口支持 HTTP 和 SOCKS5；停止后保留端口。在 Chrome 代理扩展中建立多个代理配置，即可让不同页面走不同节点。";
+
+"AI traffic uses its locked node; other traffic uses each enabled port's node" = "AI 流量优先使用锁定节点，其他流量使用对应端口的节点";
+
+"Stopped — port retained" = "已停止（端口保留）";
+
+"Chrome setup…" = "Chrome 设置…";
+
+"Select a node first" = "请先选中一个节点";
+
+"Chrome proxy profile" = "Chrome 代理配置";
+
+"Copy server:port" = "复制服务器:端口";
+
+"Node: %@\nProtocol: HTTP\nServer: 127.0.0.1\nPort: %d\n\nCreate a separate proxy profile for each node in your Chrome proxy extension, then map URL rules to those profiles. HTTP proxy supports HTTPS pages too. The same port also accepts SOCKS5. Enable the node and Save & Reload before connecting." = "节点：%@\n协议：HTTP\n服务器：127.0.0.1\n端口：%d\n\n在 Chrome 代理扩展中为每个节点建立独立配置，再将网页规则指向对应配置。HTTP 代理也支持 HTTPS 页面；同一端口还支持 SOCKS5。连接前请启用节点并保存重载。";
+
+"Multiple Node Proxies…" = "多节点代理…";
+
+"%d node ports configured" = "已配置启用 %d 个节点端口";
+
+"AI traffic → %@; other pages use their chosen node ports" = "AI 流量 → %@；其他页面使用各自选择的节点端口";
+
+"Check nodes and Save & Reload to run their fixed local ports. Download speed tests run enabled nodes one at a time, using up to 20 MB or 8 seconds per node. Tests consume proxy traffic and can be stopped." = "勾选节点后点击“保存并重载”以启用固定本机端口。下载测速逐个测试启用的节点，每节点最多 20 MB 或 8 秒；会消耗代理流量，可随时停止。";
+
+"Speed test" = "测速";
+
+"Stop speed test" = "停止测速";
+
+"Save & Reload node changes before testing download speed" = "请先保存并重载节点或端口的更改，再进行下载测速。";
+
+"Testing enabled nodes' download speeds…" = "正在测试启用节点的下载速度…";
+
+"Download speed test finished" = "下载测速已结束";
+
+"Enable and save at least one node before testing download speed" = "请先启用并保存至少一个节点，再进行下载测速。";
+
+"Waiting" = "等待中";
+
+"Testing…" = "测速中…";
+
+"Testing… %.2f MB/s" = "测速中… %.2f MB/s";
+
+"Failed" = "失败";
+
+"Stopped" = "已停止";
