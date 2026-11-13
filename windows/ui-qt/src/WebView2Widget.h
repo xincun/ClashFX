@@ -19,8 +19,10 @@ public:
 
     void configureDashboard(int apiPort,
                             const QString& apiSecret,
-                            const QString& dashboardUrl);
+                            const QString& dashboardUrl,
+                            bool aiLocked = false);
     void reloadDashboard();
+    void retryInitialize();
 
 signals:
     void webViewReady();
@@ -39,16 +41,18 @@ private:
 
     static QString readBundledCompatibilityJS();
     static QString buildMetaCubeXDConfigJS(int port, const QString& secret);
-    static QString buildRulesSnapshotJS(int port, const QString& staleMessage);
+    static QString buildRulesSnapshotJS(int port, const QString& staleMessage, bool aiLocked);
 
     bool initStarted_ = false;
     bool staticScriptsInstalled_ = false;
     int apiPort_ = 0;
     QString apiSecret_;
     QString dashboardUrl_;
+    bool aiLocked_ = false;
     int appliedPort_ = 0;
     QString appliedSecret_;
     QString appliedUrl_;
+    bool appliedAiLocked_ = false;
     QStringList dynamicScriptIds_;
 
     ICoreWebView2Environment* env_ = nullptr;

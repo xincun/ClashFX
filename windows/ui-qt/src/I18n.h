@@ -33,6 +33,7 @@ public:
     void setLanguage(const QString& lang);
 
     static QString pick(const QString& zh, const QString& en);
+    static QString translateBackendText(const QString& text);
 
 signals:
     void languageChanged(const QString& lang);

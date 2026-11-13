@@ -153,6 +153,7 @@ QString TrayIconGenerator::buildTooltip(bool connected, const QJsonObject& snaps
 
     const QJsonObject settings = snapshot.value(QStringLiteral("settings")).toObject();
     const QJsonObject runtime = snapshot.value(QStringLiteral("runtime")).toObject();
+    const bool coreRunning = snapshot.value(QStringLiteral("core_running")).toBool(false);
     const QString profile = settings.value(QStringLiteral("selected_profile")).toString(QStringLiteral("config"));
     const QString mode = settings.value(QStringLiteral("outbound_mode")).toString(QStringLiteral("rule")).toUpper();
     const int mixedPort = runtime.value(QStringLiteral("mixed_port")).toInt(7890);
@@ -164,6 +165,9 @@ QString TrayIconGenerator::buildTooltip(bool connected, const QJsonObject& snaps
 
     QStringList lines;
     lines << QStringLiteral("ClashFX (%1)").arg(snapshot.value(QStringLiteral("arch")).toString());
+    if (!coreRunning) {
+        lines << L("状态: 内核未运行 (请检查配置)", "Status: Core Stopped (Check Config)");
+    }
     lines << L("配置: ", "Profile: ") + profile + QStringLiteral("  |  ") +
                  L("模式: ", "Mode: ") + mode;
     lines << L("混合端口: ", "Mixed Port: ") + QString::number(mixedPort);

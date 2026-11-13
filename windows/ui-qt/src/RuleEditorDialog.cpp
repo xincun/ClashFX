@@ -57,11 +57,11 @@ QString sourceDisplayLabel(const QString& src) {
 }
 
 QColor sourceBadgeColor(const QString& src) {
-    if (src == QStringLiteral("ai_lock")) return QColor(QStringLiteral("#7c3aed"));
-    if (src == QStringLiteral("mixin")) return QColor(QStringLiteral("#2563eb"));
-    if (src == QStringLiteral("cn_apps")) return QColor(QStringLiteral("#059669"));
-    if (src == QStringLiteral("system")) return QColor(QStringLiteral("#64748b"));
-    return QColor(QStringLiteral("#475569"));
+    if (src == QStringLiteral("ai_lock")) return QColor(QStringLiteral("#a78bfa"));
+    if (src == QStringLiteral("mixin")) return QColor(QStringLiteral("#60a5fa"));
+    if (src == QStringLiteral("cn_apps")) return QColor(QStringLiteral("#34d399"));
+    if (src == QStringLiteral("system")) return QColor(QStringLiteral("#94a3b8"));
+    return QColor(QStringLiteral("#cbd5e1"));
 }
 
 int variantIntOr(const QVariant& v, int fallback = -1) {
@@ -86,7 +86,7 @@ RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
     headerDescLabel_ = new QLabel(this);
     headerDescLabel_->setWordWrap(true);
     headerDescLabel_->setStyleSheet(QStringLiteral(
-        "background-color: #eff6ff; color: #1e3a8a; border: 1px solid #bfdbfe; "
+        "background-color: #1e293b; color: #dbeafe; border: 1px solid #334155; "
         "border-radius: 6px; padding: 8px 12px; font-size: 12px;"));
     rootLayout->addWidget(headerDescLabel_);
 
@@ -116,7 +116,7 @@ RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
           "Routes 118,000+ domestic domains and Chinese IPs directly without going through overseas proxies (GEOSITE,cn + GEOIP,CN)."),
         presetBox);
     cnHint->setWordWrap(true);
-    cnHint->setStyleSheet(QStringLiteral("color: #64748b; font-size: 12px; margin-left: 22px;"));
+    cnHint->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px; margin-left: 22px;"));
 
     bypassLANCheck_ = new QCheckBox(
         L("局域网与内网地址直连（推荐）", "Bypass Local Network & Private IPs via DIRECT (Recommended)"),
@@ -127,7 +127,7 @@ RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
           "Routes localhost, .local domains, and private LAN subnets directly (GEOSITE,private + GEOIP,LAN)."),
         presetBox);
     lanHint->setWordWrap(true);
-    lanHint->setStyleSheet(QStringLiteral("color: #64748b; font-size: 12px; margin-left: 22px;"));
+    lanHint->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px; margin-left: 22px;"));
 
     presetLayout->addWidget(bypassCNWebCheck_);
     presetLayout->addWidget(cnHint);
@@ -149,7 +149,7 @@ RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
         rulesBox);
     emptyHintLabel_->setWordWrap(true);
     emptyHintLabel_->setStyleSheet(QStringLiteral(
-        "background-color: #f8fafc; color: #475569; border: 1px dashed #cbd5e1; "
+        "background-color: #222226; color: #a1a1aa; border: 1px dashed #3f3f46; "
         "border-radius: 6px; padding: 14px; font-size: 12px;"));
     rulesBoxLayout->addWidget(emptyHintLabel_);
 
@@ -178,7 +178,7 @@ RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
     addRowBtn_->setStyleSheet(QStringLiteral(
         "QPushButton { font-weight: 600; padding: 5px 14px; }"));
     extraKeysBadge_ = new QLabel(rulesBox);
-    extraKeysBadge_->setStyleSheet(QStringLiteral("color: #64748b; font-size: 12px;"));
+    extraKeysBadge_->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
     tableToolRow->addWidget(addRowBtn_);
     tableToolRow->addStretch(1);
     tableToolRow->addWidget(extraKeysBadge_);
@@ -197,7 +197,7 @@ RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
 
     auto* yamlTopRow = new QHBoxLayout();
     yamlPathLabel_ = new QLabel(yamlPage);
-    yamlPathLabel_->setStyleSheet(QStringLiteral("color: #475569; font-size: 12px;"));
+    yamlPathLabel_->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
     auto* openFolderBtn = new QPushButton(L("打开配置文件夹", "Open Config Folder"), yamlPage);
     openFolderBtn->setAutoDefault(false);
     yamlTopRow->addWidget(yamlPathLabel_, 1);
@@ -229,7 +229,7 @@ RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
         effPage);
     effTipLabel->setWordWrap(true);
     effTipLabel->setStyleSheet(QStringLiteral(
-        "background-color: #f8fafc; color: #334155; border: 1px solid #e2e8f0; "
+        "background-color: #222226; color: #d4d4d8; border: 1px solid #3f3f46; "
         "border-radius: 5px; padding: 6px 10px; font-size: 12px;"));
     effLayout->addWidget(effTipLabel);
 
@@ -276,7 +276,7 @@ RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
     auto* providerToolRow = new QHBoxLayout();
     providerMetaLabel_ = new QLabel(providerDetailBox_);
     providerMetaLabel_->setWordWrap(true);
-    providerMetaLabel_->setStyleSheet(QStringLiteral("color: #475569; font-size: 12px;"));
+    providerMetaLabel_->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
 
     openRulesetFolderBtn_ = new QPushButton(L("打开所在目录", "Show in Folder"), providerDetailBox_);
     openRulesetFolderBtn_->setAutoDefault(false);
@@ -290,7 +290,7 @@ RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
         "QPushButton { background-color: #059669; color: #ffffff; font-weight: 600; "
         "border: 1px solid #047857; border-radius: 5px; padding: 5px 14px; }"
         "QPushButton:hover { background-color: #047857; }"
-        "QPushButton:disabled { background-color: #a7f3d0; border-color: #a7f3d0; }"));
+        "QPushButton:disabled { background-color: #1f2937; color: #6b7280; border-color: #374151; }"));
 
     providerToolRow->addWidget(providerMetaLabel_, 1);
     providerToolRow->addWidget(openRulesetFolderBtn_);
@@ -331,7 +331,7 @@ RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
         "QPushButton { background-color: #2563eb; color: #ffffff; font-weight: 600; "
         "border: 1px solid #1d4ed8; border-radius: 6px; padding: 7px 20px; font-size: 13px; }"
         "QPushButton:hover { background-color: #1d4ed8; }"
-        "QPushButton:disabled { background-color: #93c5fd; border-color: #93c5fd; }"));
+        "QPushButton:disabled { background-color: #1e293b; color: #64748b; border-color: #334155; }"));
     auto* closeBtn = new QPushButton(L("关闭", "Close"), this);
     closeBtn->setAutoDefault(false);
     closeBtn->setStyleSheet(QStringLiteral("padding: 7px 16px;"));
@@ -440,8 +440,8 @@ void RuleEditorDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
                        "Editing global <b>Config Patch (Profile Mixin)</b>: automatically merged into all profiles at runtime (Active: <b>%1</b>, Primary Group: <b>%2</b>).")
                          .arg(selectedProfile_.toHtmlEscaped(), defaultTarget_.toHtmlEscaped());
     if (outboundMode_ != QStringLiteral("RULE")) {
-        header += L("  <span style='color:#b45309;'>[注意：当前出站模式为 %1，切回 RULE 规则模式后分流才会生效]</span>",
-                    "  <span style='color:#b45309;'>[Note: Outbound mode is %1; switch to RULE mode for split routing]</span>")
+        header += L("  <span style='color:#fbbf24;'>[注意：当前出站模式为 %1，切回 RULE 规则模式后分流才会生效]</span>",
+                    "  <span style='color:#fbbf24;'>[Note: Outbound mode is %1; switch to RULE mode for split routing]</span>")
                       .arg(outboundMode_);
     }
     headerDescLabel_->setText(header);
@@ -597,7 +597,7 @@ void RuleEditorDialog::rebuildCustomTable(int focusRow) {
 
         auto* delBtn = new QPushButton(L("删除", "Del"), actionWrap);
         delBtn->setAutoDefault(false);
-        delBtn->setStyleSheet(QStringLiteral("color: #dc2626; padding: 2px 6px;"));
+        delBtn->setStyleSheet(QStringLiteral("color: #f87171; padding: 2px 6px;"));
 
         actionRow->addWidget(upBtn);
         actionRow->addWidget(downBtn);
@@ -758,11 +758,11 @@ void RuleEditorDialog::setDirty(bool dirty, const QString& savedHint) {
     dirty_ = dirty;
     updateFooterButtonsForTab();
     if (dirty) {
-        statusLabel_->setStyleSheet(QStringLiteral("color: #d97706; font-weight: 600;"));
+        statusLabel_->setStyleSheet(QStringLiteral("color: #fbbf24; font-weight: 600;"));
         statusLabel_->setText(L("● 配置补丁有未保存修改，点击右侧「保存并立即生效」即可应用",
                                 "● Unsaved Config Patch changes — click 'Save & Apply Now'"));
     } else if (!savedHint.isEmpty()) {
-        statusLabel_->setStyleSheet(QStringLiteral("color: #059669; font-weight: 600;"));
+        statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-weight: 600;"));
         statusLabel_->setText(savedHint);
     } else if (!rulesetDirty_) {
         statusLabel_->clear();
@@ -772,12 +772,12 @@ void RuleEditorDialog::setDirty(bool dirty, const QString& savedHint) {
 void RuleEditorDialog::setRulesetDirty(bool dirty, const QString& savedHint) {
     rulesetDirty_ = dirty;
     if (dirty) {
-        statusLabel_->setStyleSheet(QStringLiteral("color: #d97706; font-weight: 600;"));
+        statusLabel_->setStyleSheet(QStringLiteral("color: #fbbf24; font-weight: 600;"));
         statusLabel_->setText(L("● 规则集 %1 已修改，点击「保存并热更新规则集」立即生效（无需重启内核）",
                                 "● Ruleset %1 modified — click 'Save & Hot-Update Ruleset' to apply in 0ms")
                                   .arg(activeEditableProvider_));
     } else if (!savedHint.isEmpty()) {
-        statusLabel_->setStyleSheet(QStringLiteral("color: #059669; font-weight: 600;"));
+        statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-weight: 600;"));
         statusLabel_->setText(savedHint);
     } else if (!dirty_) {
         statusLabel_->clear();
@@ -929,7 +929,7 @@ void RuleEditorDialog::renderEffectiveTable(int preferredRuleIndex) {
         effTable_->setItem(row, 0, idxItem);
 
         auto* srcItem = new QTableWidgetItem(srcLabel);
-        srcItem->setForeground(disabled ? QColor(QStringLiteral("#94a3b8")) : sourceBadgeColor(src));
+        srcItem->setForeground(disabled ? QColor(QStringLiteral("#71717a")) : sourceBadgeColor(src));
         QFont f = srcItem->font();
         f.setBold(true);
         f.setStrikeOut(disabled);
@@ -970,11 +970,11 @@ void RuleEditorDialog::renderEffectiveTable(int preferredRuleIndex) {
                 QFont cf = cell->font();
                 cf.setStrikeOut(true);
                 cell->setFont(cf);
-                cell->setForeground(QColor(QStringLiteral("#94a3b8")));
+                cell->setForeground(QColor(QStringLiteral("#71717a")));
             }
         }
         if (isEditableProv && !disabled) {
-            plItem->setForeground(QColor(QStringLiteral("#047857")));
+            plItem->setForeground(QColor(QStringLiteral("#34d399")));
             QFont pf = plItem->font();
             pf.setBold(true);
             plItem->setFont(pf);
@@ -1040,7 +1040,7 @@ void RuleEditorDialog::onEffectiveItemChanged(QTableWidgetItem* item) {
                       if (data.isObject()) {
                           applyEffectiveRulesData(data.toObject(), ruleIndex);
                       }
-                      statusLabel_->setStyleSheet(QStringLiteral("color: #059669; font-weight: 600;"));
+                      statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-weight: 600;"));
                       statusLabel_->setText(
                           wantDisabled
                               ? L("✓ 已实时停用顶层规则 #%1（内存即时生效，重载配置后恢复启用）",
@@ -1115,7 +1115,7 @@ void RuleEditorDialog::loadDetailForRuleObject(const QJsonObject& r, bool forceR
         resetRulesetBtn_->setVisible(rp.value(QStringLiteral("can_reset")).toBool(true));
         saveRulesetBtn_->setVisible(true);
 
-        providerMetaLabel_->setStyleSheet(QStringLiteral("color: #065f46; font-weight: 600; font-size: 12px;"));
+        providerMetaLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-weight: 600; font-size: 12px;"));
         providerMetaLabel_->setText(
             L("本地可编辑规则集：%1（当前生效 %2 条）— 每行一条 TYPE,VALUE，无需写出口目标",
               "Editable local ruleset: %1 (%2 active rules) — one TYPE,VALUE per line, no target needed")
@@ -1124,7 +1124,7 @@ void RuleEditorDialog::loadDetailForRuleObject(const QJsonObject& r, bool forceR
 
         providerDetailEdit_->setReadOnly(false);
         providerDetailEdit_->setStyleSheet(QStringLiteral(
-            "QPlainTextEdit { background-color: #ffffff; border: 1px solid #10b981; border-radius: 4px; }"));
+            "QPlainTextEdit { background-color: #18181b; color: #f4f4f5; border: 1px solid #10b981; border-radius: 4px; }"));
 
         if (forceReloadEditor || activeEditableProvider_ != payload || !rulesetDirty_) {
             activeEditableProvider_ = payload;
@@ -1143,7 +1143,7 @@ void RuleEditorDialog::loadDetailForRuleObject(const QJsonObject& r, bool forceR
     resetRulesetBtn_->setVisible(false);
     saveRulesetBtn_->setVisible(false);
 
-    providerMetaLabel_->setStyleSheet(QStringLiteral("color: #64748b; font-size: 12px;"));
+    providerMetaLabel_->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
     if (payload == QStringLiteral("clashfx-internal-direct")) {
         providerMetaLabel_->setText(
             L("只读预览：ClashFX 内核自身防环回守护规则集（固定直连，不可修改或禁用，防止 TUN 流量死循环）",
@@ -1156,7 +1156,7 @@ void RuleEditorDialog::loadDetailForRuleObject(const QJsonObject& r, bool forceR
 
     providerDetailEdit_->setReadOnly(true);
     providerDetailEdit_->setStyleSheet(QStringLiteral(
-        "QPlainTextEdit { background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 4px; }"));
+        "QPlainTextEdit { background-color: #1f1f23; color: #d4d4d8; border: 1px solid #3f3f46; border-radius: 4px; }"));
 
     QStringList lines;
     lines << QStringLiteral("[%1]  %2,%3%4")

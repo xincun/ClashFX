@@ -20,10 +20,47 @@
 #include <QMessageBox>
 #include <QTimer>
 #include <QUrl>
+#include <algorithm>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace clashfx {
 
 namespace {
+
+void presentTopLevelDialog(QDialog* dlg) {
+    if (!dlg) return;
+    if (dlg->isMinimized()) {
+        dlg->showNormal();
+    } else {
+        dlg->show();
+    }
+    dlg->setWindowState((dlg->windowState() & ~Qt::WindowMinimized) | Qt::WindowActive);
+    dlg->raise();
+    dlg->activateWindow();
+#ifdef Q_OS_WIN
+    if (HWND hwnd = reinterpret_cast<HWND>(dlg->winId())) {
+        SetForegroundWindow(hwnd);
+    }
+#endif
+}
+
+int proxyGroupSortTier(const QString& type) {
+    if (type.compare(QStringLiteral("Selector"), Qt::CaseInsensitive) == 0 ||
+        type.compare(QStringLiteral("Select"), Qt::CaseInsensitive) == 0) {
+        return 0;
+    }
+    if (type.compare(QStringLiteral("URLTest"), Qt::CaseInsensitive) == 0 ||
+        type.compare(QStringLiteral("Fallback"), Qt::CaseInsensitive) == 0) {
+        return 1;
+    }
+    return 2;
+}
 
 QString formatTrafficBytes(qint64 bytes) {
     if (bytes <= 0) {
@@ -142,6 +179,7 @@ TrayController::TrayController(DaemonClient* client,
 }
 
 TrayController::~TrayController() {
+    closeAllDialogs();
     if (consoleWindow_) {
         consoleWindow_->setAllowClose(true);
         delete consoleWindow_;
@@ -149,6 +187,26 @@ TrayController::~TrayController() {
     }
     delete trayMenu_;
     trayMenu_ = nullptr;
+}
+
+void TrayController::closeAllDialogs() {
+    auto destroyDlg = [](auto& ptr) {
+        if (ptr) {
+            ptr->disconnect();
+            ptr->deleteLater();
+            ptr.clear();
+        }
+    };
+    destroyDlg(aiLockDlg_);
+    destroyDlg(multiNodeDlg_);
+    destroyDlg(rulesDlg_);
+    destroyDlg(subsDlg_);
+    destroyDlg(diagDlg_);
+    destroyDlg(settingsDlg_);
+}
+
+QWidget* TrayController::modalDialogParent() const {
+    return (consoleWindow_ && consoleWindow_->isVisible()) ? consoleWindow_ : nullptr;
 }
 
 bool TrayController::startSingleInstanceServer() {
@@ -194,7 +252,9 @@ void TrayController::handleExternalCommand(const QString& message) {
     } else if (message == QStringLiteral("CMD:--open-settings")) {
         openSettingsDialog();
     } else if (message == QStringLiteral("CMD:--quit")) {
-        quitAll();
+        quitAll(false);
+    } else if (message == QStringLiteral("CMD:--quit-uninstall")) {
+        quitAll(true);
     } else if (message.startsWith(QStringLiteral("clash://"), Qt::CaseInsensitive) ||
                message.startsWith(QStringLiteral("clashfx://"), Qt::CaseInsensitive)) {
         importSchemeUri(message);
@@ -216,8 +276,16 @@ void TrayController::onStateChanged(const QJsonObject& snapshot) {
     I18n::instance().setLanguage(lang);
 
     const QJsonObject hk = settings.value(QStringLiteral("hotkeys")).toObject();
-    hotkeys_->applyHotkeys(hk.value(QStringLiteral("toggle_system_proxy")).toString(),
-                           hk.value(QStringLiteral("switch_outbound_mode")).toString());
+    const QStringList failedChords = hotkeys_->applyHotkeys(
+        hk.value(QStringLiteral("toggle_system_proxy")).toString(),
+        hk.value(QStringLiteral("switch_outbound_mode")).toString());
+    if (!failedChords.isEmpty() && trayIcon_) {
+        trayIcon_->showMessage(
+            QStringLiteral("ClashFX"),
+            L("全局快捷键已被其他程序占用或格式无效: ", "Global hotkey unavailable or already in use: ") +
+                failedChords.join(QStringLiteral(", ")),
+            QSystemTrayIcon::Warning);
+    }
 
     consoleWindow_->applySnapshot(connected_, snapshot_);
     rebuildTrayVisualsAndMenu();
@@ -241,13 +309,20 @@ void TrayController::onToggleSystemProxyHotkey() {
     const bool next = !settings.value(QStringLiteral("system_proxy_enabled")).toBool(false);
     QJsonObject p;
     p.insert(QStringLiteral("enabled"), next);
-    client_->call(QStringLiteral("set_system_proxy"), p);
+    client_->call(QStringLiteral("set_system_proxy"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        if (!ok) {
+            trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+        }
+    });
 }
 
 void TrayController::onSwitchModeHotkey() {
     if (!client_ || snapshot_.isEmpty()) return;
     const QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
     if (settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false)) {
+        trayIcon_->showMessage(QStringLiteral("ClashFX"),
+                               L("AI 专用锁定开启期间出站模式固定为规则模式。",
+                                 "Outbound mode is locked to Rule while AI Proxy Lock is active."));
         return;
     }
     const QString cur = settings.value(QStringLiteral("outbound_mode")).toString(QStringLiteral("rule")).toLower();
@@ -257,7 +332,11 @@ void TrayController::onSwitchModeHotkey() {
 
     QJsonObject p;
     p.insert(QStringLiteral("mode"), next);
-    client_->call(QStringLiteral("set_outbound_mode"), p);
+    client_->call(QStringLiteral("set_outbound_mode"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        if (!ok) {
+            trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+        }
+    });
 }
 
 bool TrayController::isMenuTreeVisible() const {
@@ -281,6 +360,7 @@ QByteArray TrayController::buildMenuSignature() const {
     const QJsonObject runtime = snapshot_.value(QStringLiteral("runtime")).toObject();
     QJsonObject sig;
     sig.insert(QStringLiteral("connected"), connected_);
+    sig.insert(QStringLiteral("core_running"), snapshot_.value(QStringLiteral("core_running")).toBool(false));
     sig.insert(QStringLiteral("lang"), I18n::instance().language());
     sig.insert(QStringLiteral("preset"), settings.value(QStringLiteral("tray_icon_preset")));
     sig.insert(QStringLiteral("sys"), settings.value(QStringLiteral("system_proxy_enabled")));
@@ -309,15 +389,16 @@ void TrayController::handleConfigMutationResult(const QString& actionTitle,
     if (ok) {
         return;
     }
+    const QString localizedErr = I18n::translateBackendText(err);
     const bool aiLocked = snapshot_.value(QStringLiteral("settings"))
                               .toObject()
                               .value(QStringLiteral("claudeProxyLockEnabled"))
                               .toBool(false);
     if (aiLocked && retryAction) {
-        QMessageBox box(consoleWindow_);
+        QMessageBox box(modalDialogParent());
         box.setIcon(QMessageBox::Warning);
         box.setWindowTitle(actionTitle);
-        box.setText(actionTitle + L("失败：\n", " failed:\n") + err +
+        box.setText(actionTitle + L("失败：\n", " failed:\n") + localizedErr +
                     L("\n\n当前已启用 AI 专用锁定（要求目标配置包含锁定的具体节点）。是否停用 AI 专用锁定并立即重试？",
                       "\n\nAI Proxy Lock is active (which requires the locked node to exist in the profile). Disable AI Proxy Lock and retry now?"));
         auto* disableRetryBtn = box.addButton(L("停用 AI 锁定并重试", "Disable AI Lock & Retry"), QMessageBox::AcceptRole);
@@ -330,7 +411,7 @@ void TrayController::handleConfigMutationResult(const QString& actionTitle,
             p.insert(QStringLiteral("allow_uac"), false);
             client_->call(QStringLiteral("set_ai_lock"), p, [this, actionTitle, retryAction](bool disOk, const QJsonValue&, const QString& disErr, const QString&) {
                 if (!disOk) {
-                    QMessageBox::warning(consoleWindow_, actionTitle, disErr);
+                    QMessageBox::warning(modalDialogParent(), actionTitle, I18n::translateBackendText(disErr));
                     return;
                 }
                 retryAction();
@@ -338,18 +419,19 @@ void TrayController::handleConfigMutationResult(const QString& actionTitle,
         }
         return;
     }
-    trayIcon_->showMessage(QStringLiteral("ClashFX"), actionTitle + QStringLiteral(": ") + err, QSystemTrayIcon::Warning);
+    trayIcon_->showMessage(QStringLiteral("ClashFX"), actionTitle + QStringLiteral(": ") + localizedErr, QSystemTrayIcon::Warning);
 }
 
 void TrayController::rebuildTrayVisualsAndMenu(bool forceMenu) {
     const QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
+    const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
     const QString preset = settings.value(QStringLiteral("tray_icon_preset")).toString(QStringLiteral("default"));
     const bool sysProxy = settings.value(QStringLiteral("system_proxy_enabled")).toBool(false);
     const bool enhanced = settings.value(QStringLiteral("enhanced_mode")).toBool(false);
     const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
 
     TrayVisualState vis = TrayVisualState::Disconnected;
-    if (connected_ && !snapshot_.isEmpty()) {
+    if (connected_ && !snapshot_.isEmpty() && coreRunning) {
         if (enhanced) vis = TrayVisualState::EnhancedTun;
         else if (sysProxy) vis = TrayVisualState::SystemProxy;
         else vis = TrayVisualState::Idle;
@@ -384,6 +466,7 @@ void TrayController::rebuildTrayVisualsAndMenu(bool forceMenu) {
 void TrayController::rebuildMenuContents() {
     const QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
     const QJsonObject runtime = snapshot_.value(QStringLiteral("runtime")).toObject();
+    const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
 
     const QString preset = settings.value(QStringLiteral("tray_icon_preset")).toString(QStringLiteral("default"));
     const bool sysProxy = settings.value(QStringLiteral("system_proxy_enabled")).toBool(false);
@@ -401,6 +484,13 @@ void TrayController::rebuildMenuContents() {
     trayMenu_->clear();
     for (QMenu* sub : oldSubMenus) {
         sub->deleteLater();
+    }
+
+    if (connected_ && !snapshot_.isEmpty() && !coreRunning) {
+        QAction* coreWarnAct = trayMenu_->addAction(
+            L("⚠ 代理内核未运行（点击打开控制台查看原因）", "⚠ Proxy core stopped (Click to inspect)"));
+        connect(coreWarnAct, &QAction::triggered, this, &TrayController::openConsole);
+        trayMenu_->addSeparator();
     }
 
     // 0. Top subscription quota & expiry status row (aligned with macOS ClashFX)
@@ -444,15 +534,28 @@ void TrayController::rebuildMenuContents() {
         connect(act, &QAction::triggered, this, [this, targetMode]() {
             QJsonObject p;
             p.insert(QStringLiteral("mode"), targetMode);
-            client_->call(QStringLiteral("set_outbound_mode"), p);
+            client_->call(QStringLiteral("set_outbound_mode"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+                if (!ok) {
+                    trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+                }
+            });
         });
     }
 
-    // 3. Dynamic Proxy Groups (GLOBAL only shown in Global mode; hidden groups already filtered)
-    const QJsonArray groups = snapshot_.value(QStringLiteral("proxy_groups")).toArray();
+    // 3. Dynamic Proxy Groups (Selector groups prioritized first; relative YAML order preserved)
+    const QJsonArray rawGroups = snapshot_.value(QStringLiteral("proxy_groups")).toArray();
+    QList<QJsonObject> orderedGroups;
+    orderedGroups.reserve(rawGroups.size());
+    for (const QJsonValue& gv : rawGroups) {
+        orderedGroups.append(gv.toObject());
+    }
+    std::stable_sort(orderedGroups.begin(), orderedGroups.end(), [](const QJsonObject& a, const QJsonObject& b) {
+        return proxyGroupSortTier(a.value(QStringLiteral("type")).toString()) <
+               proxyGroupSortTier(b.value(QStringLiteral("type")).toString());
+    });
+
     bool addedGroupsSep = false;
-    for (const QJsonValue& gv : groups) {
-        const QJsonObject g = gv.toObject();
+    for (const QJsonObject& g : orderedGroups) {
         const QString gName = g.value(QStringLiteral("name")).toString();
         const QString gType = g.value(QStringLiteral("type")).toString();
         const QString now = g.value(QStringLiteral("now")).toString();
@@ -481,11 +584,18 @@ void TrayController::rebuildMenuContents() {
         QMenu* gMenu = trayMenu_->addMenu(groupMenuTitle);
 
         QAction* benchGrpAct = gMenu->addAction(L("测试本组延迟", "Test Group Latency"));
-        benchGrpAct->setEnabled(connected_);
+        benchGrpAct->setEnabled(connected_ && coreRunning);
         connect(benchGrpAct, &QAction::triggered, this, [this, gName]() {
             QJsonObject p;
             p.insert(QStringLiteral("group"), gName);
-            client_->call(QStringLiteral("benchmark_group"), p);
+            client_->call(QStringLiteral("benchmark_group"), p, [this, gName](bool ok, const QJsonValue&, const QString& err, const QString&) {
+                if (!ok) {
+                    trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+                    return;
+                }
+                trayIcon_->showMessage(QStringLiteral("ClashFX"),
+                                       L("策略组延迟测试已完成: ", "Latency test finished for group: ") + gName);
+            });
         });
         gMenu->addSeparator();
 
@@ -511,7 +621,11 @@ void TrayController::rebuildMenuContents() {
                     QJsonObject p;
                     p.insert(QStringLiteral("group"), gName);
                     p.insert(QStringLiteral("target"), itemName);
-                    client_->call(QStringLiteral("select_proxy"), p);
+                    client_->call(QStringLiteral("select_proxy"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+                        if (!ok) {
+                            trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+                        }
+                    });
                 });
             }
         }
@@ -526,7 +640,11 @@ void TrayController::rebuildMenuContents() {
                     connect(autoAct, &QAction::triggered, this, [this, gName]() {
                         QJsonObject p;
                         p.insert(QStringLiteral("group"), gName);
-                        client_->call(QStringLiteral("restore_auto_selection"), p);
+                        client_->call(QStringLiteral("restore_auto_selection"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+                            if (!ok) {
+                                trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+                            }
+                        });
                     });
                 } else {
                     QAction* autoHintAct = gMenu->addAction(L("自动测速择优中", "Automatic Selection Active"));
@@ -557,7 +675,11 @@ void TrayController::rebuildMenuContents() {
     connect(sysAct, &QAction::triggered, this, [this](bool checked) {
         QJsonObject p;
         p.insert(QStringLiteral("enabled"), checked);
-        client_->call(QStringLiteral("set_system_proxy"), p);
+        client_->call(QStringLiteral("set_system_proxy"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+            if (!ok) {
+                trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+            }
+        });
     });
 
     QAction* tunAct = trayMenu_->addAction(L("增强模式 (TUN)", "Enhanced Mode (TUN)"));
@@ -570,7 +692,7 @@ void TrayController::rebuildMenuContents() {
         p.insert(QStringLiteral("allow_uac"), true);
         client_->call(QStringLiteral("set_enhanced_mode"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
             if (!ok) {
-                trayIcon_->showMessage(QStringLiteral("ClashFX"), err, QSystemTrayIcon::Warning);
+                trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
             }
         });
     });
@@ -578,7 +700,11 @@ void TrayController::rebuildMenuContents() {
     QAction* offAllAct = trayMenu_->addAction(L("关闭所有代理模式", "Turn Off All Proxy Modes"));
     offAllAct->setEnabled(connected_ && !aiLocked);
     connect(offAllAct, &QAction::triggered, this, [this]() {
-        client_->call(QStringLiteral("turn_off_all_proxies"));
+        client_->call(QStringLiteral("turn_off_all_proxies"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+            if (!ok) {
+                trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+            }
+        });
     });
 
     trayMenu_->addSeparator();
@@ -638,36 +764,55 @@ void TrayController::rebuildMenuContents() {
     });
     cfgMenu->addAction(L("托管订阅管理…", "Managed Subscriptions…"), this, &TrayController::openSubscriptionsDialog);
     cfgMenu->addAction(L("更新 GEO 数据库 (MMDB / GeoSite)", "Update GEO Databases"), this, [this]() {
+        trayIcon_->showMessage(QStringLiteral("ClashFX"),
+                               L("正在后台下载更新 GEO 数据库…", "Updating GEO databases in background…"));
         client_->call(QStringLiteral("update_geo_databases"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
             trayIcon_->showMessage(
                 QStringLiteral("ClashFX"),
-                ok ? L("GEO 数据库更新完成并已热重载。", "GEO databases updated successfully.") : err);
+                ok ? L("GEO 数据库更新完成并已热重载。", "GEO databases updated and hot-reloaded.")
+                   : I18n::translateBackendText(err),
+                ok ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning);
         });
     });
 
     // 7. Speed test & Copy terminal command
-    trayMenu_->addAction(L("一键延迟测速", "Latency Speed Test"), this, [this]() {
-        client_->call(QStringLiteral("benchmark_all"));
+    QAction* benchAllAct = trayMenu_->addAction(L("一键延迟测速", "Latency Speed Test"), this, [this]() {
+        trayIcon_->showMessage(QStringLiteral("ClashFX"),
+                               L("正在并发测试所有节点延迟…", "Testing latency across proxy nodes…"));
+        client_->call(QStringLiteral("benchmark_all"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+            trayIcon_->showMessage(
+                QStringLiteral("ClashFX"),
+                ok ? L("全节点延迟测试已完成。", "Latency speed test finished.")
+                   : I18n::translateBackendText(err),
+                ok ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning);
+        });
     });
+    benchAllAct->setEnabled(connected_ && coreRunning);
 
     QMenu* copyCmdMenu = trayMenu_->addMenu(L("复制终端代理命令", "Copy Terminal Proxy Command"));
-    copyCmdMenu->addAction(QStringLiteral("PowerShell"), this, [mixedPort]() {
+    copyCmdMenu->addAction(QStringLiteral("PowerShell"), this, [this, mixedPort]() {
         const QString cmd = QStringLiteral(
             "$env:HTTP_PROXY=\"http://127.0.0.1:%1\"; $env:HTTPS_PROXY=\"http://127.0.0.1:%1\"; $env:ALL_PROXY=\"socks5://127.0.0.1:%1\"")
                                 .arg(mixedPort);
         QApplication::clipboard()->setText(cmd);
+        trayIcon_->showMessage(QStringLiteral("ClashFX"),
+                               L("PowerShell 代理环境变量命令已复制到剪贴板。", "PowerShell proxy command copied to clipboard."));
     });
-    copyCmdMenu->addAction(QStringLiteral("CMD"), this, [mixedPort]() {
+    copyCmdMenu->addAction(QStringLiteral("CMD"), this, [this, mixedPort]() {
         const QString cmd = QStringLiteral(
-            "set HTTP_PROXY=http://127.0.0.1:%1 & set HTTPS_PROXY=http://127.0.0.1:%1")
+            "set HTTP_PROXY=http://127.0.0.1:%1 & set HTTPS_PROXY=http://127.0.0.1:%1 & set ALL_PROXY=socks5://127.0.0.1:%1")
                                 .arg(mixedPort);
         QApplication::clipboard()->setText(cmd);
+        trayIcon_->showMessage(QStringLiteral("ClashFX"),
+                               L("CMD 代理环境变量命令已复制到剪贴板。", "CMD proxy command copied to clipboard."));
     });
-    copyCmdMenu->addAction(QStringLiteral("Bash / WSL"), this, [mixedPort]() {
+    copyCmdMenu->addAction(QStringLiteral("Bash / WSL"), this, [this, mixedPort]() {
         const QString cmd = QStringLiteral(
             "export https_proxy=http://127.0.0.1:%1 http_proxy=http://127.0.0.1:%1 all_proxy=socks5://127.0.0.1:%1")
                                 .arg(mixedPort);
         QApplication::clipboard()->setText(cmd);
+        trayIcon_->showMessage(QStringLiteral("ClashFX"),
+                               L("Bash / WSL 代理环境变量命令已复制到剪贴板。", "Bash / WSL proxy command copied to clipboard."));
     });
 
     // 8. Settings submenu
@@ -739,7 +884,7 @@ void TrayController::rebuildMenuContents() {
     helpMenu->addAction(L("关于 ClashFX", "About ClashFX"), this, &TrayController::showAboutBox);
 
     trayMenu_->addSeparator();
-    trayMenu_->addAction(L("退出 ClashFX", "Quit ClashFX"), this, &TrayController::quitAll);
+    trayMenu_->addAction(L("退出 ClashFX", "Quit ClashFX"), this, [this]() { quitAll(false); });
 }
 
 void TrayController::mutateSettingBool(const QString& key, bool value) {
@@ -748,7 +893,11 @@ void TrayController::mutateSettingBool(const QString& key, bool value) {
     settings.insert(key, value);
     QJsonObject params;
     params.insert(QStringLiteral("settings"), settings);
-    client_->call(QStringLiteral("update_settings"), params);
+    client_->call(QStringLiteral("update_settings"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        if (!ok) {
+            trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+        }
+    });
 }
 
 void TrayController::mutateSettingString(const QString& key, const QString& value) {
@@ -757,7 +906,11 @@ void TrayController::mutateSettingString(const QString& key, const QString& valu
     settings.insert(key, value);
     QJsonObject params;
     params.insert(QStringLiteral("settings"), settings);
-    client_->call(QStringLiteral("update_settings"), params);
+    client_->call(QStringLiteral("update_settings"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        if (!ok) {
+            trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+        }
+    });
 }
 
 void TrayController::importSchemeUri(const QString& uri) {
@@ -767,7 +920,7 @@ void TrayController::importSchemeUri(const QString& uri) {
     client_->call(QStringLiteral("import_url_scheme"), params, [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
         if (!ok) {
             trayIcon_->showMessage(QStringLiteral("ClashFX"),
-                                   L("导入订阅链接失败: ", "Failed to import URI: ") + err,
+                                   L("导入订阅链接失败: ", "Failed to import URI: ") + I18n::translateBackendText(err),
                                    QSystemTrayIcon::Warning);
             return;
         }
@@ -782,7 +935,7 @@ void TrayController::copyDiagnosticInfo() {
     if (!client_) return;
     client_->call(QStringLiteral("get_diagnostic_info"), QJsonObject(), [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
         if (!ok) {
-            trayIcon_->showMessage(QStringLiteral("ClashFX"), err, QSystemTrayIcon::Warning);
+            trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
             return;
         }
         const QString rep = data.toObject().value(QStringLiteral("report")).toString();
@@ -796,7 +949,7 @@ void TrayController::checkForUpdates() {
     if (!client_) return;
     client_->call(QStringLiteral("check_updates"), QJsonObject(), [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
         if (!ok) {
-            QMessageBox::warning(consoleWindow_, L("检查更新", "Check for Updates"), err);
+            QMessageBox::warning(modalDialogParent(), L("检查更新", "Check for Updates"), I18n::translateBackendText(err));
             return;
         }
         const QJsonObject res = data.toObject();
@@ -807,13 +960,13 @@ void TrayController::checkForUpdates() {
                                 ? res.value(QStringLiteral("release_url")).toString()
                                 : res.value(QStringLiteral("download_url")).toString();
         if (!avail) {
-            QMessageBox::information(consoleWindow_,
+            QMessageBox::information(modalDialogParent(),
                                      L("检查更新", "Check for Updates"),
                                      L("当前已是最新版本 (", "You are running the latest version (") + curVer + QStringLiteral(")."));
             return;
         }
         const auto btn = QMessageBox::question(
-            consoleWindow_,
+            modalDialogParent(),
             L("发现新版本", "Update Available"),
             L("发现新版本 ", "New version available: ") + latest +
                 L("\n是否立即在浏览器打开下载页面？", "\nOpen download page in browser now?"));
@@ -827,7 +980,7 @@ void TrayController::showAboutBox() {
     const QString ver = snapshot_.value(QStringLiteral("version")).toString(QStringLiteral("1.19.24-win.1"));
     const QString arch = snapshot_.value(QStringLiteral("arch")).toString();
     QMessageBox::about(
-        consoleWindow_,
+        modalDialogParent(),
         L("关于 ClashFX", "About ClashFX"),
         QStringLiteral("<h3>ClashFX for Windows</h3>"
                        "<p>Version: <b>%1</b> (%2)</p>"
@@ -842,34 +995,28 @@ void TrayController::openConsole() {
 
 void TrayController::openAiLockDialog() {
     if (!aiLockDlg_) {
-        aiLockDlg_ = new AiLockDialog(client_, consoleWindow_);
+        aiLockDlg_ = new AiLockDialog(client_, nullptr);
         aiLockDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
     }
-    aiLockDlg_->show();
-    aiLockDlg_->raise();
-    aiLockDlg_->activateWindow();
+    presentTopLevelDialog(aiLockDlg_);
 }
 
 void TrayController::openMultiNodeDialog() {
     if (!multiNodeDlg_) {
-        multiNodeDlg_ = new MultiNodeDialog(client_, consoleWindow_);
+        multiNodeDlg_ = new MultiNodeDialog(client_, nullptr);
         multiNodeDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
     }
-    multiNodeDlg_->show();
-    multiNodeDlg_->raise();
-    multiNodeDlg_->activateWindow();
+    presentTopLevelDialog(multiNodeDlg_);
 }
 
 void TrayController::openRuleEditorDialog() {
     if (!rulesDlg_) {
-        rulesDlg_ = new RuleEditorDialog(client_, consoleWindow_);
+        rulesDlg_ = new RuleEditorDialog(client_, nullptr);
         rulesDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
     } else {
         rulesDlg_->reloadMixinFromDaemon();
     }
-    rulesDlg_->show();
-    rulesDlg_->raise();
-    rulesDlg_->activateWindow();
+    presentTopLevelDialog(rulesDlg_);
 }
 
 void TrayController::openActiveRulesDialog() {
@@ -881,44 +1028,44 @@ void TrayController::openActiveRulesDialog() {
 
 void TrayController::openSubscriptionsDialog() {
     if (!subsDlg_) {
-        subsDlg_ = new SubscriptionsDialog(client_, consoleWindow_);
+        subsDlg_ = new SubscriptionsDialog(client_, nullptr);
         subsDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
     }
-    subsDlg_->show();
-    subsDlg_->raise();
-    subsDlg_->activateWindow();
+    presentTopLevelDialog(subsDlg_);
 }
 
 void TrayController::openDiagnosticsDialog(const QString& preselectNode) {
     if (!diagDlg_) {
-        diagDlg_ = new NodeDiagnosticDialog(client_, consoleWindow_);
+        diagDlg_ = new NodeDiagnosticDialog(client_, nullptr);
         diagDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
     }
     if (!preselectNode.isEmpty()) {
         diagDlg_->preselectNode(preselectNode);
     }
-    diagDlg_->show();
-    diagDlg_->raise();
-    diagDlg_->activateWindow();
+    presentTopLevelDialog(diagDlg_);
 }
 
 void TrayController::openSettingsDialog() {
     if (!settingsDlg_) {
-        settingsDlg_ = new SettingsDialog(client_, consoleWindow_);
+        settingsDlg_ = new SettingsDialog(client_, nullptr);
         settingsDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
     }
-    settingsDlg_->show();
-    settingsDlg_->raise();
-    settingsDlg_->activateWindow();
+    presentTopLevelDialog(settingsDlg_);
 }
 
-void TrayController::quitAll() {
+void TrayController::quitAll(bool forceRestoreProxy) {
+    closeAllDialogs();
     if (consoleWindow_) {
         consoleWindow_->setAllowClose(true);
+        consoleWindow_->close();
     }
     if (client_ && client_->isConnected()) {
         client_->stopReconnect();
-        client_->call(QStringLiteral("quit_daemon"), QJsonObject(), [](bool, const QJsonValue&, const QString&, const QString&) {
+        QJsonObject params;
+        if (forceRestoreProxy) {
+            params.insert(QStringLiteral("force_restore_proxy"), true);
+        }
+        client_->call(QStringLiteral("quit_daemon"), params, [](bool, const QJsonValue&, const QString&, const QString&) {
             QTimer::singleShot(120, qApp, &QCoreApplication::quit);
         });
         QTimer::singleShot(800, qApp, &QCoreApplication::quit);

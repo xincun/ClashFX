@@ -39,7 +39,7 @@ AiLockDialog::AiLockDialog(DaemonClient* client, QWidget* parent)
           "• Fails closed (REJECT) if the locked node goes down — never falls back to DIRECT or other nodes."),
         this);
     descLabel->setWordWrap(true);
-    descLabel->setStyleSheet(QStringLiteral("color: #52525b; font-size: 12px;"));
+    descLabel->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
     root->addWidget(descLabel);
 
     auto* statusBox = new QGroupBox(L("当前保护状态", "Protection Status"), this);
@@ -47,7 +47,7 @@ AiLockDialog::AiLockDialog(DaemonClient* client, QWidget* parent)
     statusLabel_ = new QLabel(statusBox);
     statusLabel_->setStyleSheet(QStringLiteral("font-weight: 600; font-size: 13px;"));
     relayLabel_ = new QLabel(statusBox);
-    relayLabel_->setStyleSheet(QStringLiteral("color: #52525b; font-size: 12px;"));
+    relayLabel_->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
     statusLayout->addWidget(statusLabel_);
     statusLayout->addWidget(relayLabel_);
     root->addWidget(statusBox);
@@ -110,12 +110,14 @@ void AiLockDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
         const QString name = item.value(QStringLiteral("name")).toString();
         const QString type = item.value(QStringLiteral("type")).toString();
         const QString server = item.value(QStringLiteral("server")).toString();
+        const QString provider = item.value(QStringLiteral("provider")).toString();
         QString label = name;
-        if (!type.isEmpty() || !server.isEmpty()) {
-            label += QStringLiteral("  [%1%2%3]")
-                         .arg(type,
-                              (!type.isEmpty() && !server.isEmpty()) ? QStringLiteral(" • ") : QString(),
-                              server);
+        QStringList meta;
+        if (!type.isEmpty()) meta << type;
+        if (!provider.isEmpty()) meta << (QStringLiteral("provider:") + provider);
+        if (!server.isEmpty()) meta << server;
+        if (!meta.isEmpty()) {
+            label += QStringLiteral("  [%1]").arg(meta.join(QStringLiteral(" • ")));
         }
         targetCombo_->addItem(label, name);
         if (!currentTarget.isEmpty() && name == currentTarget) {
@@ -134,7 +136,7 @@ void AiLockDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
             L("警告：当前配置中不存在锁定节点「", "WARNING: Locked node missing in active profile: ") +
             currentTarget +
             (I18n::instance().isChinese() ? QStringLiteral("」，请改选节点或停用锁定！") : QString()));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #dc2626; font-weight: 700; font-size: 13px;"));
+        statusLabel_->setStyleSheet(QStringLiteral("color: #f87171; font-weight: 700; font-size: 13px;"));
     }
 
     disableBtn_->setEnabled(locked);
@@ -161,7 +163,7 @@ void AiLockDialog::onEnableClicked() {
     client_->call(QStringLiteral("set_ai_lock"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
         enableBtn_->setEnabled(true);
         if (!ok) {
-            QMessageBox::critical(this, windowTitle(), err);
+            QMessageBox::critical(this, windowTitle(), I18n::translateBackendText(err));
         }
     });
 }
@@ -178,7 +180,7 @@ void AiLockDialog::onDisableClicked() {
     client_->call(QStringLiteral("set_ai_lock"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
         disableBtn_->setEnabled(true);
         if (!ok) {
-            QMessageBox::critical(this, windowTitle(), err);
+            QMessageBox::critical(this, windowTitle(), I18n::translateBackendText(err));
         }
     });
 }
@@ -244,8 +246,9 @@ MultiNodeDialog::MultiNodeDialog(DaemonClient* client, QWidget* parent)
     root->addLayout(topBar2);
 
     statusBanner_ = new QLabel(this);
+    statusBanner_->setWordWrap(true);
     statusBanner_->setStyleSheet(QStringLiteral(
-        "background-color: #f4f4f5; color: #27272a; border: 1px solid #e4e4e7; border-radius: 6px; padding: 6px 10px;"));
+        "background-color: #222226; color: #e4e4e7; border: 1px solid #3f3f46; border-radius: 6px; padding: 6px 10px;"));
     root->addWidget(statusBanner_);
 
     model_ = new QStandardItemModel(0, 5, this);
@@ -411,7 +414,7 @@ void MultiNodeDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
         }
     }
 
-    const QString statusText = ns.value(QStringLiteral("status_text")).toString().trimmed();
+    const QString statusText = I18n::translateBackendText(ns.value(QStringLiteral("status_text")).toString());
     QString banner = selProfile + QStringLiteral(" — ") +
                      (I18n::instance().isChinese()
                           ? QStringLiteral("已启用 %1 / %2 个节点端口").arg(enabledNodeCount).arg(rows.size())
@@ -554,7 +557,7 @@ void MultiNodeDialog::onSaveAndApply() {
         saveBtn_->setEnabled(true);
         if (!ok) {
             userEditedPending_ = true;
-            QMessageBox::critical(this, windowTitle(), err);
+            QMessageBox::critical(this, windowTitle(), I18n::translateBackendText(err));
         }
     });
 }
@@ -564,7 +567,7 @@ void MultiNodeDialog::onCheckConnectivity() {
     checkBtn_->setEnabled(false);
     client_->call(QStringLiteral("node_check_connectivity"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
         checkBtn_->setEnabled(true);
-        if (!ok) QMessageBox::warning(this, windowTitle(), err);
+        if (!ok) QMessageBox::warning(this, windowTitle(), I18n::translateBackendText(err));
     });
 }
 
@@ -573,7 +576,7 @@ void MultiNodeDialog::onDirectRefresh() {
     directRefreshBtn_->setEnabled(false);
     client_->call(QStringLiteral("node_refresh_direct"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
         directRefreshBtn_->setEnabled(true);
-        if (!ok) QMessageBox::warning(this, windowTitle(), err);
+        if (!ok) QMessageBox::warning(this, windowTitle(), I18n::translateBackendText(err));
     });
 }
 
@@ -590,7 +593,7 @@ void MultiNodeDialog::onToggleSpeedTest() {
     const QString method = isSpeedTesting_ ? QStringLiteral("node_speed_test_cancel")
                                            : QStringLiteral("node_speed_test_start");
     client_->call(method, QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
-        if (!ok) QMessageBox::warning(this, windowTitle(), err);
+        if (!ok) QMessageBox::warning(this, windowTitle(), I18n::translateBackendText(err));
     });
 }
 
@@ -600,6 +603,9 @@ int MultiNodeDialog::selectedRowPort(QString* outNodeName) const {
     if (row < 0 || row >= model_->rowCount()) {
         return 0;
     }
+    if (!idx.isValid()) {
+        tableView_->selectRow(row);
+    }
     if (outNodeName) {
         *outNodeName = model_->item(row, 1)->text();
     }
@@ -607,15 +613,21 @@ int MultiNodeDialog::selectedRowPort(QString* outNodeName) const {
 }
 
 void MultiNodeDialog::onCopyHttp() {
-    const int port = selectedRowPort();
+    QString nodeName;
+    const int port = selectedRowPort(&nodeName);
     if (port <= 0) return;
-    QApplication::clipboard()->setText(QStringLiteral("http://127.0.0.1:%1").arg(port));
+    const QString addr = QStringLiteral("http://127.0.0.1:%1").arg(port);
+    QApplication::clipboard()->setText(addr);
+    statusBanner_->setText(L("✓ 已复制节点「%1」的 HTTP 代理地址: %2", "✓ Copied HTTP proxy for \"%1\": %2").arg(nodeName, addr));
 }
 
 void MultiNodeDialog::onCopySocks() {
-    const int port = selectedRowPort();
+    QString nodeName;
+    const int port = selectedRowPort(&nodeName);
     if (port <= 0) return;
-    QApplication::clipboard()->setText(QStringLiteral("socks5://127.0.0.1:%1").arg(port));
+    const QString addr = QStringLiteral("socks5://127.0.0.1:%1").arg(port);
+    QApplication::clipboard()->setText(addr);
+    statusBanner_->setText(L("✓ 已复制节点「%1」的 SOCKS5 代理地址: %2", "✓ Copied SOCKS5 proxy for \"%1\": %2").arg(nodeName, addr));
 }
 
 void MultiNodeDialog::onShowChromeGuide() {
@@ -661,20 +673,17 @@ NodeDiagnosticDialog::NodeDiagnosticDialog(DaemonClient* client, QWidget* parent
 
     nodeCombo_ = new QComboBox(this);
     nodeCombo_->setEditable(true);
-    providerEdit_ = new QLineEdit(this);
-    providerEdit_->setPlaceholderText(L("可选（仅外部 proxy-provider 节点需填写）", "Optional (proxy-provider name if applicable)"));
     urlEdit_ = new QLineEdit(QStringLiteral("https://cp.cloudflare.com/generate_204"), this);
 
     form->addRow(L("目标节点:", "Target Node:"), nodeCombo_);
-    form->addRow(L("Provider 名称:", "Provider Name:"), providerEdit_);
     form->addRow(L("探测 URL:", "Benchmark URL:"), urlEdit_);
     root->addLayout(form);
 
     outputEdit_ = new QPlainTextEdit(this);
     outputEdit_->setReadOnly(true);
     outputEdit_->setPlaceholderText(
-        L("点击「开始单节点探测」将直接调用内核测试该节点（不改动当前选组状态），并输出 DNS / TLS / SNI / QUIC / 认证 / 超时 分类诊断建议。",
-          "Click 'Run Probe' to test the selected node non-intrusively and view structured DNS / TLS / SNI / QUIC / Auth / Timeout diagnostics."));
+        L("点击「开始单节点探测」将直接调用内核测试该节点（自动识别内联或外部 proxy-provider 节点，不改动当前选组状态），并输出 DNS / TLS / SNI / QUIC / 认证 / 超时 分类诊断建议。",
+          "Click 'Run Probe' to test the selected node non-intrusively (inline or proxy-provider auto-detected) and view structured DNS / TLS / SNI / QUIC / Auth / Timeout diagnostics."));
     root->addWidget(outputEdit_, 1);
 
     auto* btnRow = new QHBoxLayout();
@@ -694,6 +703,7 @@ NodeDiagnosticDialog::NodeDiagnosticDialog(DaemonClient* client, QWidget* parent
     connect(closeBtn, &QPushButton::clicked, this, &QDialog::close);
 
     if (client_) {
+        connect(client_, &DaemonClient::stateChanged, this, &NodeDiagnosticDialog::refreshFromSnapshot);
         refreshFromSnapshot(client_->snapshot());
     }
 }
@@ -707,9 +717,10 @@ void NodeDiagnosticDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
     for (const QJsonValue& v : candidates) {
         const QJsonObject o = v.toObject();
         const QString name = o.value(QStringLiteral("name")).toString();
+        const QString provider = o.value(QStringLiteral("provider")).toString();
         if (!name.isEmpty() && !seen.contains(name)) {
             seen.insert(name);
-            nodeCombo_->addItem(name);
+            nodeCombo_->addItem(name, provider);
         }
     }
     const QJsonArray groups = snapshot.value(QStringLiteral("proxy_groups")).toArray();
@@ -720,7 +731,7 @@ void NodeDiagnosticDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
             if (!name.isEmpty() && !seen.contains(name) &&
                 name != QStringLiteral("DIRECT") && name != QStringLiteral("REJECT")) {
                 seen.insert(name);
-                nodeCombo_->addItem(name);
+                nodeCombo_->addItem(name, QString());
             }
         }
     }
@@ -749,18 +760,24 @@ void NodeDiagnosticDialog::onRunProbe() {
     if (nodeName.isEmpty()) {
         return;
     }
+    QString providerName;
+    const int matchedIdx = nodeCombo_->findText(nodeName);
+    if (matchedIdx >= 0) {
+        providerName = nodeCombo_->itemData(matchedIdx, Qt::UserRole).toString().trimmed();
+    }
+
     runBtn_->setEnabled(false);
     outputEdit_->setPlainText(L("正在探测节点，请稍候...", "Probing node, please wait..."));
 
     QJsonObject params;
     params.insert(QStringLiteral("node_name"), nodeName);
-    params.insert(QStringLiteral("provider_name"), providerEdit_->text().trimmed());
+    params.insert(QStringLiteral("provider_name"), providerName);
     params.insert(QStringLiteral("benchmark_url"), urlEdit_->text().trimmed());
 
     client_->call(QStringLiteral("diagnose_node"), params, [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
         runBtn_->setEnabled(true);
         if (!ok) {
-            outputEdit_->setPlainText(L("探测请求失败：\n", "Probe request failed:\n") + err);
+            outputEdit_->setPlainText(L("探测请求失败：\n", "Probe request failed:\n") + I18n::translateBackendText(err));
             return;
         }
         const QJsonObject rep = data.toObject();

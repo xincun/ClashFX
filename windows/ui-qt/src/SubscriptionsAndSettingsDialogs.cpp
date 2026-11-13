@@ -9,11 +9,15 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QJsonArray>
+#include <QKeySequence>
 #include <QMessageBox>
+#include <QPointer>
 #include <QTabWidget>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <memory>
 
 namespace clashfx {
 
@@ -25,36 +29,31 @@ SubscriptionsDialog::SubscriptionsDialog(DaemonClient* client, QWidget* parent)
     : QDialog(parent)
     , client_(client) {
     setWindowIcon(TrayIconGenerator::appIcon());
-    setWindowTitle(L("托管配置订阅管理", "Managed Subscriptions"));
-    resize(820, 520);
+    resize(840, 540);
 
     auto* root = new QVBoxLayout(this);
     root->setSpacing(10);
 
     auto* autoBar = new QHBoxLayout();
-    autoUpdateCheck_ = new QCheckBox(L("自动定时更新托管订阅", "Automatically update subscriptions"), this);
-    auto* everyLabel = new QLabel(L("更新间隔 (分钟):", "Interval (minutes):"), this);
+    autoUpdateCheck_ = new QCheckBox(this);
+    everyLabel_ = new QLabel(this);
     intervalMinutesSpin_ = new QSpinBox(this);
     intervalMinutesSpin_->setRange(5, 10080);
     intervalMinutesSpin_->setValue(120);
-    auto* saveIntervalBtn = new QPushButton(L("保存自动更新设置", "Save Interval"), this);
+    saveIntervalBtn_ = new QPushButton(this);
+    statusLabel_ = new QLabel(this);
+    statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-size: 12px; font-weight: 600;"));
 
     autoBar->addWidget(autoUpdateCheck_);
     autoBar->addSpacing(12);
-    autoBar->addWidget(everyLabel);
+    autoBar->addWidget(everyLabel_);
     autoBar->addWidget(intervalMinutesSpin_);
-    autoBar->addWidget(saveIntervalBtn);
-    autoBar->addStretch(1);
+    autoBar->addWidget(saveIntervalBtn_);
+    autoBar->addSpacing(12);
+    autoBar->addWidget(statusLabel_, 1);
     root->addLayout(autoBar);
 
     table_ = new QTableWidget(0, 5, this);
-    table_->setHorizontalHeaderLabels({
-        L("配置名", "Profile"),
-        L("订阅地址", "Subscription URL"),
-        L("已用 / 总流量", "Used / Total"),
-        L("到期时间", "Expires"),
-        L("最近更新", "Last Updated"),
-    });
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setSelectionMode(QAbstractItemView::SingleSelection);
     table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -66,45 +65,69 @@ SubscriptionsDialog::SubscriptionsDialog(DaemonClient* client, QWidget* parent)
     table_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
     root->addWidget(table_, 1);
 
-    auto* editBox = new QGroupBox(L("添加或更新订阅", "Add or Update Subscription"), this);
-    auto* editForm = new QFormLayout(editBox);
-    nameEdit_ = new QLineEdit(editBox);
-    nameEdit_->setPlaceholderText(L("例如 my-airport（留空则自动根据 URL 命名）", "e.g. my-provider (optional)"));
-    urlEdit_ = new QLineEdit(editBox);
+    editBox_ = new QGroupBox(this);
+    auto* editForm = new QFormLayout(editBox_);
+    nameEdit_ = new QLineEdit(editBox_);
+
+    auto* urlRow = new QHBoxLayout();
+    urlEdit_ = new QLineEdit(editBox_);
+    urlEdit_->setEchoMode(QLineEdit::Password);
     urlEdit_->setPlaceholderText(QStringLiteral("https://example.com/api/v1/client/subscribe?token=..."));
-    userAgentEdit_ = new QLineEdit(editBox);
-    userAgentEdit_->setPlaceholderText(L("可选（留空默认 clash.meta/v1.19.24）", "Optional (default clash.meta/v1.19.24)"));
-    activateCheck_ = new QCheckBox(L("拉取成功后立即切换至该配置", "Switch to this profile immediately after pull"), editBox);
+    toggleUrlVisBtn_ = new QPushButton(editBox_);
+    toggleUrlVisBtn_->setAutoDefault(false);
+    urlRow->addWidget(urlEdit_, 1);
+    urlRow->addWidget(toggleUrlVisBtn_);
+
+    userAgentEdit_ = new QLineEdit(editBox_);
+    activateCheck_ = new QCheckBox(editBox_);
     activateCheck_->setChecked(true);
 
-    editForm->addRow(L("配置名称:", "Profile Name:"), nameEdit_);
-    editForm->addRow(L("订阅 URL:", "Subscription URL:"), urlEdit_);
-    editForm->addRow(L("自定义 User-Agent:", "Custom User-Agent:"), userAgentEdit_);
+    nameFormLabel_ = new QLabel(editBox_);
+    urlFormLabel_ = new QLabel(editBox_);
+    uaFormLabel_ = new QLabel(editBox_);
+
+    editForm->addRow(nameFormLabel_, nameEdit_);
+    editForm->addRow(urlFormLabel_, urlRow);
+    editForm->addRow(uaFormLabel_, userAgentEdit_);
     editForm->addRow(QString(), activateCheck_);
-    root->addWidget(editBox);
+    root->addWidget(editBox_);
 
     auto* btnRow = new QHBoxLayout();
-    saveSubBtn_ = new QPushButton(L("拉取并保存订阅", "Save & Pull Subscription"), this);
+    saveSubBtn_ = new QPushButton(this);
     saveSubBtn_->setDefault(true);
-    auto* refreshSelBtn = new QPushButton(L("立即更新选中", "Refresh Selected"), this);
-    auto* refreshAllBtn = new QPushButton(L("更新全部", "Refresh All"), this);
-    auto* deleteBtn = new QPushButton(L("删除选中订阅", "Delete Selected"), this);
-    auto* closeBtn = new QPushButton(L("关闭", "Close"), this);
+    refreshSelBtn_ = new QPushButton(this);
+    refreshAllBtn_ = new QPushButton(this);
+    deleteBtn_ = new QPushButton(this);
+    closeBtn_ = new QPushButton(this);
 
     btnRow->addWidget(saveSubBtn_);
-    btnRow->addWidget(refreshSelBtn);
-    btnRow->addWidget(refreshAllBtn);
-    btnRow->addWidget(deleteBtn);
+    btnRow->addWidget(refreshSelBtn_);
+    btnRow->addWidget(refreshAllBtn_);
+    btnRow->addWidget(deleteBtn_);
     btnRow->addStretch(1);
-    btnRow->addWidget(closeBtn);
+    btnRow->addWidget(closeBtn_);
     root->addLayout(btnRow);
 
-    connect(saveIntervalBtn, &QPushButton::clicked, this, &SubscriptionsDialog::onSaveAutoUpdate);
+    connect(saveIntervalBtn_, &QPushButton::clicked, this, &SubscriptionsDialog::onSaveAutoUpdate);
+    connect(autoUpdateCheck_, &QCheckBox::toggled, this, [this](bool) {
+        if (!suppressAutoUpdateSignal_) {
+            onSaveAutoUpdate();
+        }
+    });
+    connect(intervalMinutesSpin_, &QSpinBox::editingFinished, this, [this]() {
+        if (!suppressAutoUpdateSignal_) {
+            onSaveAutoUpdate();
+        }
+    });
+    connect(toggleUrlVisBtn_, &QPushButton::clicked, this, &SubscriptionsDialog::onToggleUrlVisibility);
     connect(saveSubBtn_, &QPushButton::clicked, this, &SubscriptionsDialog::onAddOrUpdate);
-    connect(refreshSelBtn, &QPushButton::clicked, this, &SubscriptionsDialog::onRefreshSelected);
-    connect(refreshAllBtn, &QPushButton::clicked, this, &SubscriptionsDialog::onRefreshAll);
-    connect(deleteBtn, &QPushButton::clicked, this, &SubscriptionsDialog::onDeleteSelected);
+    connect(refreshSelBtn_, &QPushButton::clicked, this, &SubscriptionsDialog::onRefreshSelected);
+    connect(refreshAllBtn_, &QPushButton::clicked, this, &SubscriptionsDialog::onRefreshAll);
+    connect(deleteBtn_, &QPushButton::clicked, this, &SubscriptionsDialog::onDeleteSelected);
     connect(table_, &QTableWidget::itemSelectionChanged, this, &SubscriptionsDialog::onSelectionChanged);
+    connect(nameEdit_, &QLineEdit::textEdited, this, [this]() { formDirty_ = true; });
+    connect(userAgentEdit_, &QLineEdit::textEdited, this, [this]() { formDirty_ = true; });
+    connect(urlEdit_, &QLineEdit::textEdited, this, [this]() { formDirty_ = true; });
     connect(urlEdit_, &QLineEdit::textChanged, this, [this](const QString& text) {
         const QString host = QUrl(text.trimmed()).host();
         if (!host.isEmpty()) {
@@ -113,12 +136,69 @@ SubscriptionsDialog::SubscriptionsDialog(DaemonClient* client, QWidget* parent)
             nameEdit_->setPlaceholderText(L("例如 my-airport（留空则自动根据 URL 命名）", "e.g. my-provider (optional)"));
         }
     });
-    connect(closeBtn, &QPushButton::clicked, this, &QDialog::close);
+    connect(closeBtn_, &QPushButton::clicked, this, &QDialog::close);
+    connect(&I18n::instance(), &I18n::languageChanged, this, [this]() { retranslateUi(); });
+
+    retranslateUi();
 
     if (client_) {
         connect(client_, &DaemonClient::stateChanged, this, &SubscriptionsDialog::refreshFromSnapshot);
         refreshFromSnapshot(client_->snapshot());
     }
+}
+
+void SubscriptionsDialog::retranslateUi() {
+    setWindowTitle(L("托管配置订阅管理", "Managed Subscriptions"));
+    autoUpdateCheck_->setText(L("自动定时更新托管订阅", "Automatically update subscriptions"));
+    everyLabel_->setText(L("更新间隔 (分钟):", "Interval (minutes):"));
+    saveIntervalBtn_->setText(L("保存自动更新设置", "Save Interval"));
+    table_->setHorizontalHeaderLabels({
+        L("配置名", "Profile"),
+        L("订阅地址 (已脱敏)", "Subscription URL (Masked)"),
+        L("已用 / 总流量", "Used / Total"),
+        L("到期时间", "Expires"),
+        L("最近更新", "Last Updated"),
+    });
+    editBox_->setTitle(L("添加或更新订阅", "Add or Update Subscription"));
+    nameFormLabel_->setText(L("配置名称:", "Profile Name:"));
+    urlFormLabel_->setText(L("订阅 URL:", "Subscription URL:"));
+    uaFormLabel_->setText(L("自定义 User-Agent:", "Custom User-Agent:"));
+    if (urlEdit_->text().trimmed().isEmpty()) {
+        nameEdit_->setPlaceholderText(L("例如 my-airport（留空则自动根据 URL 命名）", "e.g. my-provider (optional)"));
+    }
+    userAgentEdit_->setPlaceholderText(L("可选（留空默认 clash.meta/v1.19.24）", "Optional (default clash.meta/v1.19.24)"));
+    activateCheck_->setText(L("拉取成功后立即切换至该配置", "Switch to this profile immediately after pull"));
+    toggleUrlVisBtn_->setText(urlVisible_ ? L("隐藏", "Hide") : L("显示", "Show"));
+    saveSubBtn_->setText(L("拉取并保存订阅", "Save & Pull Subscription"));
+    refreshSelBtn_->setText(L("立即更新选中", "Refresh Selected"));
+    refreshAllBtn_->setText(L("更新全部", "Refresh All"));
+    deleteBtn_->setText(L("删除选中订阅", "Delete Selected"));
+    closeBtn_->setText(L("关闭", "Close"));
+}
+
+void SubscriptionsDialog::onToggleUrlVisibility() {
+    urlVisible_ = !urlVisible_;
+    urlEdit_->setEchoMode(urlVisible_ ? QLineEdit::Normal : QLineEdit::Password);
+    toggleUrlVisBtn_->setText(urlVisible_ ? L("隐藏", "Hide") : L("显示", "Show"));
+}
+
+QString SubscriptionsDialog::maskSubscriptionUrl(const QString& rawUrl) {
+    const QString trimmed = rawUrl.trimmed();
+    if (trimmed.isEmpty()) {
+        return QStringLiteral("—");
+    }
+    const QUrl parsed(trimmed);
+    if (parsed.isValid() && !parsed.scheme().isEmpty() && !parsed.host().isEmpty()) {
+        QString authority = parsed.scheme() + QStringLiteral("://") + parsed.host();
+        if (parsed.port() > 0) {
+            authority += QLatin1Char(':') + QString::number(parsed.port());
+        }
+        return authority + QStringLiteral("/***");
+    }
+    if (trimmed.size() > 14) {
+        return trimmed.left(10) + QStringLiteral("***");
+    }
+    return QStringLiteral("***");
 }
 
 QString SubscriptionsDialog::formatBytes(qint64 bytes) {
@@ -131,12 +211,21 @@ QString SubscriptionsDialog::formatBytes(qint64 bytes) {
 
 void SubscriptionsDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
     const QJsonObject settings = snapshot.value(QStringLiteral("settings")).toObject();
+    suppressAutoUpdateSignal_ = true;
     autoUpdateCheck_->setChecked(settings.value(QStringLiteral("auto_update_subs")).toBool(true));
     const int sec = settings.value(QStringLiteral("auto_update_interval_sec")).toInt(7200);
     intervalMinutesSpin_->setValue(qMax(5, sec / 60));
+    suppressAutoUpdateSignal_ = false;
+
+    if (table_->currentRow() >= 0 && table_->item(table_->currentRow(), 0)) {
+        selectedProfileName_ = table_->item(table_->currentRow(), 0)->text();
+    }
 
     const QJsonArray subs = snapshot.value(QStringLiteral("subscriptions")).toArray();
+    table_->blockSignals(true);
     table_->setRowCount(subs.size());
+    int rowToSelect = -1;
+
     for (int i = 0; i < subs.size(); ++i) {
         const QJsonObject s = subs.at(i).toObject();
         const QString name = s.value(QStringLiteral("name")).toString();
@@ -170,20 +259,42 @@ void SubscriptionsDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
 
         auto* nameItem = new QTableWidgetItem(name);
         nameItem->setData(Qt::UserRole, s.value(QStringLiteral("user_agent")).toString());
+
+        auto* urlItem = new QTableWidgetItem(maskSubscriptionUrl(url));
+        urlItem->setData(Qt::UserRole, url);
+
         table_->setItem(i, 0, nameItem);
-        table_->setItem(i, 1, new QTableWidgetItem(url));
+        table_->setItem(i, 1, urlItem);
         table_->setItem(i, 2, new QTableWidgetItem(trafficStr));
         table_->setItem(i, 3, new QTableWidgetItem(expireStr));
         table_->setItem(i, 4, new QTableWidgetItem(updatedStr));
+
+        if (!selectedProfileName_.isEmpty() && name == selectedProfileName_) {
+            rowToSelect = i;
+        }
+    }
+    if (rowToSelect >= 0) {
+        table_->selectRow(rowToSelect);
+    }
+    table_->blockSignals(false);
+
+    if (rowToSelect >= 0 && !formDirty_) {
+        suppressSelectionFill_ = true;
+        onSelectionChanged();
+        suppressSelectionFill_ = false;
     }
 }
 
 void SubscriptionsDialog::onSelectionChanged() {
     const int row = table_->currentRow();
     if (row < 0 || row >= table_->rowCount()) return;
-    nameEdit_->setText(table_->item(row, 0)->text());
-    urlEdit_->setText(table_->item(row, 1)->text());
+    selectedProfileName_ = table_->item(row, 0)->text();
+    nameEdit_->setText(selectedProfileName_);
+    urlEdit_->setText(table_->item(row, 1)->data(Qt::UserRole).toString());
     userAgentEdit_->setText(table_->item(row, 0)->data(Qt::UserRole).toString());
+    if (!suppressSelectionFill_) {
+        formDirty_ = false;
+    }
 }
 
 void SubscriptionsDialog::onAddOrUpdate() {
@@ -194,17 +305,29 @@ void SubscriptionsDialog::onAddOrUpdate() {
         return;
     }
     saveSubBtn_->setEnabled(false);
+    statusLabel_->setStyleSheet(QStringLiteral("color: #60a5fa; font-size: 12px; font-weight: 600;"));
+    statusLabel_->setText(L("正在拉取并校验订阅配置…", "Pulling & validating subscription…"));
+
     QJsonObject params;
     params.insert(QStringLiteral("name"), nameEdit_->text().trimmed());
     params.insert(QStringLiteral("url"), url);
     params.insert(QStringLiteral("user_agent"), userAgentEdit_->text().trimmed());
     params.insert(QStringLiteral("select_after"), activateCheck_->isChecked());
-    client_->call(QStringLiteral("upsert_subscription"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+    client_->call(QStringLiteral("upsert_subscription"), params, [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
         saveSubBtn_->setEnabled(true);
         if (!ok) {
-            QMessageBox::critical(this, windowTitle(), err);
+            statusLabel_->setStyleSheet(QStringLiteral("color: #f87171; font-size: 12px; font-weight: 600;"));
+            statusLabel_->setText(L("拉取失败", "Failed"));
+            QMessageBox::critical(this, windowTitle(), I18n::translateBackendText(err));
             return;
         }
+        formDirty_ = false;
+        const QString savedName = data.toObject().value(QStringLiteral("name")).toString();
+        if (!savedName.isEmpty()) {
+            selectedProfileName_ = savedName;
+        }
+        statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-size: 12px; font-weight: 600;"));
+        statusLabel_->setText(L("✓ 订阅已保存并完成拉取", "✓ Subscription saved & updated"));
         client_->call(QStringLiteral("get_state"));
     });
 }
@@ -212,22 +335,62 @@ void SubscriptionsDialog::onAddOrUpdate() {
 void SubscriptionsDialog::onRefreshSelected() {
     if (!client_) return;
     const int row = table_->currentRow();
-    if (row < 0 || row >= table_->rowCount()) return;
+    if (row < 0 || row >= table_->rowCount()) {
+        QMessageBox::information(this, windowTitle(), L("请先在列表中选中一个托管订阅。", "Please select a subscription row first."));
+        return;
+    }
+    const QString subName = table_->item(row, 0)->text();
+    refreshSelBtn_->setEnabled(false);
+    statusLabel_->setStyleSheet(QStringLiteral("color: #60a5fa; font-size: 12px; font-weight: 600;"));
+    statusLabel_->setText(L("正在更新订阅「%1」…", "Refreshing \"%1\"…").arg(subName));
+
     QJsonObject params;
-    params.insert(QStringLiteral("name"), table_->item(row, 0)->text());
-    client_->call(QStringLiteral("refresh_subscription"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
-        if (!ok) QMessageBox::warning(this, windowTitle(), err);
+    params.insert(QStringLiteral("name"), subName);
+    client_->call(QStringLiteral("refresh_subscription"), params, [this, subName](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        refreshSelBtn_->setEnabled(true);
+        if (!ok) {
+            statusLabel_->setStyleSheet(QStringLiteral("color: #f87171; font-size: 12px; font-weight: 600;"));
+            statusLabel_->setText(L("更新失败", "Refresh failed"));
+            QMessageBox::warning(this, windowTitle(), I18n::translateBackendText(err));
+        } else {
+            statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-size: 12px; font-weight: 600;"));
+            statusLabel_->setText(L("✓ 已更新订阅「%1」", "✓ Refreshed \"%1\"").arg(subName));
+        }
         client_->call(QStringLiteral("get_state"));
     });
 }
 
 void SubscriptionsDialog::onRefreshAll() {
-    if (!client_) return;
-    for (int i = 0; i < table_->rowCount(); ++i) {
+    if (!client_ || table_->rowCount() <= 0) return;
+    const int total = table_->rowCount();
+    refreshAllBtn_->setEnabled(false);
+    statusLabel_->setStyleSheet(QStringLiteral("color: #60a5fa; font-size: 12px; font-weight: 600;"));
+    statusLabel_->setText(L("正在并发更新全部 %1 个订阅…", "Refreshing all %1 subscriptions…").arg(total));
+
+    auto remaining = std::make_shared<int>(total);
+    auto failures = std::make_shared<QStringList>();
+    QPointer<SubscriptionsDialog> self(this);
+
+    for (int i = 0; i < total; ++i) {
+        const QString subName = table_->item(i, 0)->text();
         QJsonObject params;
-        params.insert(QStringLiteral("name"), table_->item(i, 0)->text());
-        client_->call(QStringLiteral("refresh_subscription"), params, [this](bool, const QJsonValue&, const QString&, const QString&) {
-            client_->call(QStringLiteral("get_state"));
+        params.insert(QStringLiteral("name"), subName);
+        client_->call(QStringLiteral("refresh_subscription"), params, [self, subName, remaining, failures](bool ok, const QJsonValue&, const QString& err, const QString&) {
+            if (!ok) {
+                failures->append(subName + QStringLiteral(": ") + I18n::translateBackendText(err));
+            }
+            if (--(*remaining) == 0 && self) {
+                self->refreshAllBtn_->setEnabled(true);
+                if (failures->isEmpty()) {
+                    self->statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-size: 12px; font-weight: 600;"));
+                    self->statusLabel_->setText(L("✓ 全部订阅已更新完成", "✓ All subscriptions refreshed"));
+                } else {
+                    self->statusLabel_->setStyleSheet(QStringLiteral("color: #fbbf24; font-size: 12px; font-weight: 600;"));
+                    self->statusLabel_->setText(L("部分订阅更新失败", "Some subscriptions failed"));
+                    QMessageBox::warning(self, self->windowTitle(), failures->join(QLatin1Char('\n')));
+                }
+                self->client_->call(QStringLiteral("get_state"));
+            }
         });
     }
 }
@@ -235,22 +398,45 @@ void SubscriptionsDialog::onRefreshAll() {
 void SubscriptionsDialog::onDeleteSelected() {
     if (!client_) return;
     const int row = table_->currentRow();
-    if (row < 0 || row >= table_->rowCount()) return;
+    if (row < 0 || row >= table_->rowCount()) {
+        QMessageBox::information(this, windowTitle(), L("请先在列表中选中要移除的订阅。", "Please select a subscription row first."));
+        return;
+    }
     const QString name = table_->item(row, 0)->text();
-    const auto ans = QMessageBox::question(
-        this,
-        windowTitle(),
-        L("确定移除托管订阅「", "Remove managed subscription \"") + name +
-            L("」吗？\n点击「Yes」将同时删除本地对应的 .yaml 配置文件；点击「No」仅取消订阅关联但保留配置文件。",
-              "\"?\nClick 'Yes' to also delete its local .yaml file, or 'No' to keep the file."),
-        QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel);
-    if (ans == QMessageBox::Cancel) return;
 
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Question);
+    box.setWindowTitle(windowTitle());
+    box.setText(L("如何处理托管订阅「%1」？", "How would you like to remove \"%1\"?").arg(name));
+    box.setInformativeText(
+        L("你可以同时删除对应的本地 .yaml 配置文件，或者仅移除定时更新记录并保留本地配置文件。",
+          "You can either delete both the subscription and its local .yaml profile, or unlink auto-updates while keeping the local .yaml file."));
+    auto* delBothBtn = box.addButton(L("删除订阅及本地文件", "Delete Subscription & Local File"), QMessageBox::DestructiveRole);
+    auto* unlinkOnlyBtn = box.addButton(L("仅移除订阅记录 (保留本地文件)", "Unlink Only (Keep Local File)"), QMessageBox::ActionRole);
+    auto* cancelBtn = box.addButton(L("取消", "Cancel"), QMessageBox::RejectRole);
+    box.setDefaultButton(cancelBtn);
+    box.exec();
+
+    if (box.clickedButton() != delBothBtn && box.clickedButton() != unlinkOnlyBtn) {
+        return;
+    }
+
+    const bool deleteFile = (box.clickedButton() == delBothBtn);
     QJsonObject params;
     params.insert(QStringLiteral("name"), name);
-    params.insert(QStringLiteral("delete_file"), ans == QMessageBox::Yes);
+    params.insert(QStringLiteral("delete_file"), deleteFile);
     client_->call(QStringLiteral("remove_subscription"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
-        if (!ok) QMessageBox::warning(this, windowTitle(), err);
+        if (!ok) {
+            QMessageBox::warning(this, windowTitle(), I18n::translateBackendText(err));
+            return;
+        }
+        selectedProfileName_.clear();
+        formDirty_ = false;
+        nameEdit_->clear();
+        urlEdit_->clear();
+        userAgentEdit_->clear();
+        statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-size: 12px; font-weight: 600;"));
+        statusLabel_->setText(L("✓ 已移除订阅", "✓ Subscription removed"));
     });
 }
 
@@ -262,7 +448,12 @@ void SubscriptionsDialog::onSaveAutoUpdate() {
     QJsonObject params;
     params.insert(QStringLiteral("settings"), settings);
     client_->call(QStringLiteral("update_settings"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
-        if (!ok) QMessageBox::warning(this, windowTitle(), err);
+        if (!ok) {
+            QMessageBox::warning(this, windowTitle(), I18n::translateBackendText(err));
+            return;
+        }
+        statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-size: 12px; font-weight: 600;"));
+        statusLabel_->setText(L("✓ 自动更新设置已保存", "✓ Auto-update interval saved"));
     });
 }
 
@@ -275,7 +466,7 @@ SettingsDialog::SettingsDialog(DaemonClient* client, QWidget* parent)
     , client_(client) {
     setWindowIcon(TrayIconGenerator::appIcon());
     setWindowTitle(L("ClashFX 偏好设置", "ClashFX Settings"));
-    resize(660, 540);
+    resize(680, 560);
 
     auto* root = new QVBoxLayout(this);
     auto* tabs = new QTabWidget(this);
@@ -371,24 +562,45 @@ SettingsDialog::SettingsDialog(DaemonClient* client, QWidget* parent)
     auto* autoPage = new QWidget(tabs);
     auto* autoForm = new QFormLayout(autoPage);
 
-    hotkeySysProxyEdit_ = new QLineEdit(autoPage);
-    hotkeySysProxyEdit_->setPlaceholderText(QStringLiteral("Ctrl+Alt+P"));
-    hotkeyModeEdit_ = new QLineEdit(autoPage);
-    hotkeyModeEdit_->setPlaceholderText(QStringLiteral("Ctrl+Alt+M"));
+    auto* hkSysRow = new QHBoxLayout();
+    hotkeySysProxyEdit_ = new QKeySequenceEdit(autoPage);
+    auto* clearHkSysBtn = new QPushButton(L("清除", "Clear"), autoPage);
+    clearHkSysBtn->setAutoDefault(false);
+    hkSysRow->addWidget(hotkeySysProxyEdit_, 1);
+    hkSysRow->addWidget(clearHkSysBtn);
+
+    auto* hkModeRow = new QHBoxLayout();
+    hotkeyModeEdit_ = new QKeySequenceEdit(autoPage);
+    auto* clearHkModeBtn = new QPushButton(L("清除", "Clear"), autoPage);
+    clearHkModeBtn->setAutoDefault(false);
+    hkModeRow->addWidget(hotkeyModeEdit_, 1);
+    hkModeRow->addWidget(clearHkModeBtn);
+
+    auto keepSingleChord = [](QKeySequenceEdit* ed) {
+        connect(ed, &QKeySequenceEdit::keySequenceChanged, ed, [ed](const QKeySequence& seq) {
+            if (seq.count() > 1) {
+                ed->setKeySequence(QKeySequence(seq[0]));
+            }
+        });
+    };
+    keepSingleChord(hotkeySysProxyEdit_);
+    keepSingleChord(hotkeyModeEdit_);
+    connect(clearHkSysBtn, &QPushButton::clicked, hotkeySysProxyEdit_, &QKeySequenceEdit::clear);
+    connect(clearHkModeBtn, &QPushButton::clicked, hotkeyModeEdit_, &QKeySequenceEdit::clear);
 
     currentNetLabel_ = new QLabel(autoPage);
     currentNetLabel_->setWordWrap(true);
-    currentNetLabel_->setStyleSheet(QStringLiteral("color: #52525b; font-size: 12px;"));
-    auto* addCurNetBtn = new QPushButton(L("将当前活动网络加入自动暂停列表", "Add Current Network to Auto-Suspend"), autoPage);
+    currentNetLabel_->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
+    auto* addCurNetBtn = new QPushButton(L("选择当前网络特征加入自动暂停列表…", "Add Active Network Feature to Auto-Suspend…"), autoPage);
 
     suspendNetsEdit_ = new QPlainTextEdit(autoPage);
     suspendNetsEdit_->setPlaceholderText(
-        L("每行填写一个网络名称 (Network Profile)、网关 IP 或 DNS 后缀；匹配时自动暂停系统代理。",
-          "One Windows Network Profile name, Gateway IP, or DNS suffix per line."));
+        L("每行填写一个当前连接的 Wi-Fi / 网络配置名、网关 IP 或 DNS 后缀；匹配时自动暂停系统代理。",
+          "One active Wi-Fi / Network Profile name, Gateway IP, or DNS suffix per line."));
 
-    autoForm->addRow(L("开关系统代理快捷键:", "Toggle System Proxy Hotkey:"), hotkeySysProxyEdit_);
-    autoForm->addRow(L("切换出站模式快捷键:", "Switch Outbound Mode Hotkey:"), hotkeyModeEdit_);
-    autoForm->addRow(L("当前检测到的网络特征:", "Detected Active Network:"), currentNetLabel_);
+    autoForm->addRow(L("开关系统代理快捷键:", "Toggle System Proxy Hotkey:"), hkSysRow);
+    autoForm->addRow(L("切换出站模式快捷键:", "Switch Outbound Mode Hotkey:"), hkModeRow);
+    autoForm->addRow(L("当前活动网络特征:", "Detected Active Network:"), currentNetLabel_);
     autoForm->addRow(QString(), addCurNetBtn);
     autoForm->addRow(L("自动暂停系统代理列表:", "Auto-Suspend Networks:"), suspendNetsEdit_);
     tabs->addTab(autoPage, L("快捷键与网络自暂停", "Hotkeys & Network"));
@@ -453,8 +665,10 @@ void SettingsDialog::loadFromSnapshot(const QJsonObject& snapshot) {
     customConfigAsIsCheck_->setChecked(baseSettings_.value(QStringLiteral("custom_config_as_is")).toBool(false));
 
     const QJsonObject hk = baseSettings_.value(QStringLiteral("hotkeys")).toObject();
-    hotkeySysProxyEdit_->setText(hk.value(QStringLiteral("toggle_system_proxy")).toString());
-    hotkeyModeEdit_->setText(hk.value(QStringLiteral("switch_outbound_mode")).toString());
+    hotkeySysProxyEdit_->setKeySequence(
+        QKeySequence::fromString(hk.value(QStringLiteral("toggle_system_proxy")).toString(), QKeySequence::PortableText));
+    hotkeyModeEdit_->setKeySequence(
+        QKeySequence::fromString(hk.value(QStringLiteral("switch_outbound_mode")).toString(), QKeySequence::PortableText));
 
     QStringList suspLines;
     for (const QJsonValue& v : baseSettings_.value(QStringLiteral("suspend_networks")).toArray()) {
@@ -502,8 +716,27 @@ void SettingsDialog::onResetBypass() {
 }
 
 void SettingsDialog::onAddCurrentNetwork() {
-    if (detectedNetTokens_.isEmpty()) return;
-    const QString candidate = detectedNetTokens_.first();
+    if (detectedNetTokens_.isEmpty()) {
+        QMessageBox::information(this, windowTitle(), L("当前未检测到可匹配的活动网络特征。", "No active network features detected."));
+        return;
+    }
+    QString candidate = detectedNetTokens_.first();
+    if (detectedNetTokens_.size() > 1) {
+        bool okChoice = false;
+        const QString picked = QInputDialog::getItem(
+            this,
+            windowTitle(),
+            L("请选择要用于识别当前网络的特征（当连接到该网络时自动暂停系统代理）：",
+              "Select the active network identifier to trigger auto-suspend:"),
+            detectedNetTokens_,
+            0,
+            false,
+            &okChoice);
+        if (!okChoice || picked.trimmed().isEmpty()) {
+            return;
+        }
+        candidate = picked.trimmed();
+    }
     QStringList existing = suspendNetsEdit_->toPlainText().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
     if (!existing.contains(candidate, Qt::CaseInsensitive)) {
         existing << candidate;
@@ -514,7 +747,10 @@ void SettingsDialog::onAddCurrentNetwork() {
 void SettingsDialog::onSaveClicked() {
     if (!client_) return;
 
-    QJsonObject updated = baseSettings_;
+    // Merge onto live daemon settings snapshot so tray changes made while this dialog was open are preserved.
+    const QJsonObject liveSettings = client_->snapshot().value(QStringLiteral("settings")).toObject();
+    QJsonObject updated = liveSettings.isEmpty() ? baseSettings_ : liveSettings;
+
     updated.insert(QStringLiteral("port_override"), portOverrideSpin_->value());
     updated.insert(QStringLiteral("api_port"), apiPortSpin_->value());
     updated.insert(QStringLiteral("api_secret"), apiSecretEdit_->text().trimmed());
@@ -532,8 +768,10 @@ void SettingsDialog::onSaveClicked() {
     updated.insert(QStringLiteral("custom_config_as_is"), customConfigAsIsCheck_->isChecked());
 
     QJsonObject hk;
-    hk.insert(QStringLiteral("toggle_system_proxy"), hotkeySysProxyEdit_->text().trimmed());
-    hk.insert(QStringLiteral("switch_outbound_mode"), hotkeyModeEdit_->text().trimmed());
+    hk.insert(QStringLiteral("toggle_system_proxy"),
+              hotkeySysProxyEdit_->keySequence().toString(QKeySequence::PortableText).trimmed());
+    hk.insert(QStringLiteral("switch_outbound_mode"),
+              hotkeyModeEdit_->keySequence().toString(QKeySequence::PortableText).trimmed());
     updated.insert(QStringLiteral("hotkeys"), hk);
 
     QJsonArray suspArr;
@@ -549,7 +787,7 @@ void SettingsDialog::onSaveClicked() {
     client_->call(QStringLiteral("update_settings"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
         saveBtn_->setEnabled(true);
         if (!ok) {
-            QMessageBox::critical(this, windowTitle(), err);
+            QMessageBox::critical(this, windowTitle(), I18n::translateBackendText(err));
             return;
         }
         accept();

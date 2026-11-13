@@ -42,7 +42,7 @@ public slots:
     void openSubscriptionsDialog();
     void openDiagnosticsDialog(const QString& preselectNode = QString());
     void openSettingsDialog();
-    void quitAll();
+    void quitAll(bool forceRestoreProxy = false);
 
 private slots:
     void onConnectionChanged(bool connected);
@@ -66,6 +66,8 @@ private:
     void copyDiagnosticInfo();
     void checkForUpdates();
     void showAboutBox();
+    void closeAllDialogs();
+    QWidget* modalDialogParent() const;
 
     DaemonClient* client_ = nullptr;
     QString uiServerName_;

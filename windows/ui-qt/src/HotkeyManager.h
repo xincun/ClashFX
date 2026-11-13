@@ -3,6 +3,7 @@
 #include <QAbstractNativeEventFilter>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 
 namespace clashfx {
 
@@ -12,8 +13,8 @@ public:
     explicit HotkeyManager(QObject* parent = nullptr);
     ~HotkeyManager() override;
 
-    void applyHotkeys(const QString& toggleSystemProxy,
-                      const QString& switchOutboundMode);
+    QStringList applyHotkeys(const QString& toggleSystemProxy,
+                             const QString& switchOutboundMode);
 
     bool nativeEventFilter(const QByteArray& eventType,
                            void* message,

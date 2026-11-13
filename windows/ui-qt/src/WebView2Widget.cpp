@@ -109,10 +109,12 @@ WebView2Widget::~WebView2Widget() {
 
 void WebView2Widget::configureDashboard(int apiPort,
                                         const QString& apiSecret,
-                                        const QString& dashboardUrl) {
+                                        const QString& dashboardUrl,
+                                        bool aiLocked) {
     apiPort_ = apiPort;
     apiSecret_ = apiSecret;
     dashboardUrl_ = dashboardUrl.trimmed();
+    aiLocked_ = aiLocked;
 
     if (isVisible()) {
         ensureInitialized();
@@ -120,6 +122,13 @@ void WebView2Widget::configureDashboard(int apiPort,
     if (webview_) {
         applyScriptsAndNavigate(false);
     }
+}
+
+void WebView2Widget::retryInitialize() {
+    if (!webview_ && !controller_) {
+        initStarted_ = false;
+    }
+    ensureInitialized();
 }
 
 void WebView2Widget::reloadDashboard() {
@@ -202,6 +211,7 @@ void WebView2Widget::ensureInitialized() {
                 return S_OK;
             }
             if (FAILED(hr) || !createdEnv) {
+                self->initStarted_ = false;
                 emit self->webViewFailed(QStringLiteral("CreateCoreWebView2Environment failed: 0x%1")
                                              .arg(static_cast<quint32>(hr), 8, 16, QLatin1Char('0')));
                 return S_OK;
@@ -217,6 +227,7 @@ void WebView2Widget::ensureInitialized() {
                         return S_OK;
                     }
                     if (FAILED(ctrlHr) || !ctrl) {
+                        self->initStarted_ = false;
                         emit self->webViewFailed(QStringLiteral("CreateCoreWebView2Controller failed: 0x%1")
                                                      .arg(static_cast<quint32>(ctrlHr), 8, 16, QLatin1Char('0')));
                         return S_OK;
@@ -309,16 +320,18 @@ void WebView2Widget::applyScriptsAndNavigate(bool forceNavigate) {
         }
     }
 
-    const bool configChanged = (appliedPort_ != apiPort_) ||
-                               (appliedSecret_ != apiSecret_) ||
-                               (appliedUrl_ != dashboardUrl_);
-    if (!configChanged && !forceNavigate) {
+    const bool endpointChanged = (appliedPort_ != apiPort_) ||
+                                 (appliedSecret_ != apiSecret_) ||
+                                 (appliedUrl_ != dashboardUrl_);
+    const bool lockChangedOnly = !endpointChanged && (appliedAiLocked_ != aiLocked_);
+    if (!endpointChanged && !lockChangedOnly && !forceNavigate) {
         return;
     }
 
     appliedPort_ = apiPort_;
     appliedSecret_ = apiSecret_;
     appliedUrl_ = dashboardUrl_;
+    appliedAiLocked_ = aiLocked_;
 
     removeDynamicScripts();
 
@@ -327,8 +340,30 @@ void WebView2Widget::applyScriptsAndNavigate(bool forceNavigate) {
 
     const QStringList dynamicScripts = {
         buildMetaCubeXDConfigJS(apiPort_, apiSecret_),
-        buildRulesSnapshotJS(apiPort_, staleMsg),
+        buildRulesSnapshotJS(apiPort_, staleMsg, aiLocked_),
     };
+
+    if (lockChangedOnly && !forceNavigate) {
+        for (const QString& script : dynamicScripts) {
+            const std::wstring scriptW = script.toStdWString();
+            QPointer<WebView2Widget> self(this);
+            auto* handler = makeComHandler<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler,
+                                           LPCWSTR>(
+                [self](HRESULT hr, LPCWSTR id) -> HRESULT {
+                    if (self && SUCCEEDED(hr) && id) {
+                        self->dynamicScriptIds_.append(QString::fromWCharArray(id));
+                    }
+                    return S_OK;
+                });
+            webview_->AddScriptToExecuteOnDocumentCreated(scriptW.c_str(), handler);
+            handler->Release();
+        }
+        const QString liveFlagJs = QStringLiteral("window.__CLASHFX_AI_LOCKED__ = %1;")
+                                       .arg(aiLocked_ ? QStringLiteral("true") : QStringLiteral("false"));
+        const std::wstring liveW = liveFlagJs.toStdWString();
+        webview_->ExecuteScript(liveW.c_str(), nullptr);
+        return;
+    }
 
     auto remaining = std::make_shared<int>(dynamicScripts.size());
     QPointer<WebView2Widget> self(this);
@@ -387,28 +422,48 @@ QString WebView2Widget::buildMetaCubeXDConfigJS(int port, const QString& secret)
 #endif
 }
 
-QString WebView2Widget::buildRulesSnapshotJS(int port, const QString& staleMessage) {
+QString WebView2Widget::buildRulesSnapshotJS(int port, const QString& staleMessage, bool aiLocked) {
 #ifdef Q_OS_WIN
     const QString backend = escapeJsSingleQuoted(QStringLiteral("http://127.0.0.1:%1").arg(port));
     const QString msg = escapeJsSingleQuoted(staleMessage);
+    const QString guardInternalMsg = escapeJsSingleQuoted(
+        L("系统防环回守护规则固定开启，不可停用", "ClashFX internal loop-prevention guard cannot be disabled"));
+    const QString guardAiModeMsg = escapeJsSingleQuoted(
+        L("AI 专用锁定开启期间出站模式固定为规则模式", "Outbound mode is locked to Rule while AI Proxy Lock is active"));
     QString tpl = QStringLiteral(R"JS(
 (function() {
+  window.__CLASHFX_AI_LOCKED__ = __AILOCKED__;
   var BACKEND_ORIGIN = '__BACKEND__';
   var STALE_MESSAGE = '__STALE__';
+  var GUARD_INTERNAL_MSG = '__GUARD_INTERNAL__';
+  var GUARD_AIMODE_MSG = '__GUARD_AIMODE__';
   var BANNER_ID = 'clashfx-stale-rules-banner';
+  var NOTICE_ID = 'clashfx-guard-notice-banner';
   var rulesSnapshot = null;
+  var rulePayloadByIndex = {};
+  var aiLockIndices = [];
   var originalFetch = window.fetch;
 
-  function isRulesRequest(input, init) {
+  function parseBackendRequest(input, init) {
     var method = ((init && init.method) || (typeof input !== 'string' && input.method) || 'GET').toUpperCase();
-    if (method !== 'GET') return false;
     var rawURL = (typeof input === 'string') ? input : (input.url || '');
     try {
       var url = new URL(rawURL, window.location.href);
-      return url.origin === BACKEND_ORIGIN && url.pathname === '/rules';
+      if (url.origin !== BACKEND_ORIGIN) return null;
+      return { method: method, pathname: url.pathname };
     } catch (_) {
-      return false;
+      return null;
     }
+  }
+  function showGuardNotice(text) {
+    var existing = document.getElementById(NOTICE_ID);
+    if (existing) existing.remove();
+    var toast = document.createElement('div');
+    toast.id = NOTICE_ID;
+    toast.textContent = text;
+    toast.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;padding:8px 14px;border-radius:8px;background:rgba(185,28,28,0.95);color:#fff;font:600 12px Segoe UI,sans-serif;box-shadow:0 4px 12px rgba(0,0,0,0.35);pointer-events:none;';
+    (document.body || document.documentElement).appendChild(toast);
+    setTimeout(function() { if (toast.parentNode) toast.remove(); }, 2800);
   }
   function showStaleBanner() {
     if (document.getElementById(BANNER_ID)) return;
@@ -426,6 +481,21 @@ QString WebView2Widget::buildRulesSnapshotJS(int port, const QString& staleMessa
     if (Number(count) <= 0 || typeof value !== 'string') return false;
     var ms = Date.parse(value);
     return isFinite(ms) && ms > 0;
+  }
+  function indexRuleMetadata(payload) {
+    if (!payload || !Array.isArray(payload.rules)) return;
+    var nextMap = {};
+    var nextAi = [];
+    for (var i = 0; i < payload.rules.length; i++) {
+      var r = payload.rules[i];
+      if (!r || typeof r !== 'object') continue;
+      var idx = (typeof r.index === 'number') ? r.index : i;
+      var pl = String(r.payload || '');
+      nextMap[String(idx)] = pl;
+      if (pl === 'clashfx-ai-lock') nextAi.push(String(idx));
+    }
+    rulePayloadByIndex = nextMap;
+    aiLockIndices = nextAi;
   }
   function sanitizeRuleTimes(payload) {
     if (!payload || !Array.isArray(payload.rules)) return false;
@@ -445,7 +515,56 @@ QString WebView2Widget::buildRulesSnapshotJS(int port, const QString& staleMessa
     return changed;
   }
   window.fetch = function(input, init) {
-    if (!isRulesRequest(input, init)) return originalFetch.apply(this, arguments);
+    var reqInfo = parseBackendRequest(input, init);
+    if (!reqInfo) return originalFetch.apply(this, arguments);
+
+    if (reqInfo.method === 'PATCH' && reqInfo.pathname === '/configs' && window.__CLASHFX_AI_LOCKED__) {
+      if (init && typeof init.body === 'string') {
+        try {
+          var cfgPatch = JSON.parse(init.body);
+          if (cfgPatch && typeof cfgPatch.mode === 'string' && cfgPatch.mode.toLowerCase() !== 'rule') {
+            showGuardNotice(GUARD_AIMODE_MSG);
+            return Promise.resolve(new Response(JSON.stringify({message: GUARD_AIMODE_MSG}), {
+              status: 403, headers: {'Content-Type': 'application/json'}
+            }));
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (reqInfo.method === 'PATCH' && reqInfo.pathname === '/rules/disable' && init && typeof init.body === 'string') {
+      try {
+        var patchMap = JSON.parse(init.body);
+        if (patchMap && typeof patchMap === 'object') {
+          var keys = Object.keys(patchMap);
+          var touchedAiVal = null;
+          for (var k = 0; k < keys.length; k++) {
+            var plName = rulePayloadByIndex[keys[k]] || '';
+            if (plName === 'clashfx-internal-direct') {
+              showGuardNotice(GUARD_INTERNAL_MSG);
+              return Promise.resolve(new Response(JSON.stringify({message: GUARD_INTERNAL_MSG}), {
+                status: 403, headers: {'Content-Type': 'application/json'}
+              }));
+            }
+            if (plName === 'clashfx-ai-lock') {
+              touchedAiVal = Boolean(patchMap[keys[k]]);
+            }
+          }
+          if (touchedAiVal !== null && aiLockIndices.length > 1) {
+            for (var a = 0; a < aiLockIndices.length; a++) {
+              patchMap[aiLockIndices[a]] = touchedAiVal;
+            }
+            var clonedInit = Object.assign({}, init, { body: JSON.stringify(patchMap) });
+            return originalFetch.call(this, input, clonedInit);
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (reqInfo.method !== 'GET' || reqInfo.pathname !== '/rules') {
+      return originalFetch.apply(this, arguments);
+    }
+
     var receiver = this, args = arguments;
     return originalFetch.apply(receiver, args).then(function(response) {
       if (response && response.ok) {
@@ -453,6 +572,7 @@ QString WebView2Widget::buildRulesSnapshotJS(int port, const QString& staleMessa
           try {
             var payload = JSON.parse(text);
             if (!Array.isArray(payload.rules)) return response;
+            indexRuleMetadata(payload);
             var changed = sanitizeRuleTimes(payload);
             var normalized = changed ? JSON.stringify(payload) : text;
             rulesSnapshot = normalized;
@@ -481,12 +601,16 @@ QString WebView2Widget::buildRulesSnapshotJS(int port, const QString& staleMessa
   };
 })();
 )JS");
+    tpl.replace(QStringLiteral("__AILOCKED__"), aiLocked ? QStringLiteral("true") : QStringLiteral("false"));
     tpl.replace(QStringLiteral("__BACKEND__"), backend);
     tpl.replace(QStringLiteral("__STALE__"), msg);
+    tpl.replace(QStringLiteral("__GUARD_INTERNAL__"), guardInternalMsg);
+    tpl.replace(QStringLiteral("__GUARD_AIMODE__"), guardAiModeMsg);
     return tpl;
 #else
     Q_UNUSED(port);
     Q_UNUSED(staleMessage);
+    Q_UNUSED(aiLocked);
     return QString();
 #endif
 }

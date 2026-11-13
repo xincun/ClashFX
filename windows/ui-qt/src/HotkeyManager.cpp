@@ -48,9 +48,13 @@ bool HotkeyManager::parseChord(const QString& text, unsigned int& outModifiers, 
     outModifiers = 0;
     outVk = 0;
 #ifdef Q_OS_WIN
-    const QString trimmed = text.trimmed();
+    QString trimmed = text.trimmed();
     if (trimmed.isEmpty()) {
         return false;
+    }
+    if (trimmed.endsWith(QStringLiteral("++"))) {
+        outVk = VK_OEM_PLUS;
+        trimmed.chop(1);
     }
     const QStringList parts = trimmed.split(QLatin1Char('+'), Qt::SkipEmptyParts);
     for (const QString& rawPart : parts) {
@@ -73,6 +77,58 @@ bool HotkeyManager::parseChord(const QString& text, unsigned int& outModifiers, 
             if (ok && fn >= 1 && fn <= 24) {
                 outVk = static_cast<unsigned int>(VK_F1 + (fn - 1));
             }
+        } else if (p == QStringLiteral("SPACE")) {
+            outVk = VK_SPACE;
+        } else if (p == QStringLiteral("TAB")) {
+            outVk = VK_TAB;
+        } else if (p == QStringLiteral("BACKSPACE")) {
+            outVk = VK_BACK;
+        } else if (p == QStringLiteral("RETURN") || p == QStringLiteral("ENTER")) {
+            outVk = VK_RETURN;
+        } else if (p == QStringLiteral("ESC") || p == QStringLiteral("ESCAPE")) {
+            outVk = VK_ESCAPE;
+        } else if (p == QStringLiteral("INS") || p == QStringLiteral("INSERT")) {
+            outVk = VK_INSERT;
+        } else if (p == QStringLiteral("DEL") || p == QStringLiteral("DELETE")) {
+            outVk = VK_DELETE;
+        } else if (p == QStringLiteral("HOME")) {
+            outVk = VK_HOME;
+        } else if (p == QStringLiteral("END")) {
+            outVk = VK_END;
+        } else if (p == QStringLiteral("PGUP") || p == QStringLiteral("PAGEUP")) {
+            outVk = VK_PRIOR;
+        } else if (p == QStringLiteral("PGDOWN") || p == QStringLiteral("PAGEDOWN")) {
+            outVk = VK_NEXT;
+        } else if (p == QStringLiteral("LEFT")) {
+            outVk = VK_LEFT;
+        } else if (p == QStringLiteral("RIGHT")) {
+            outVk = VK_RIGHT;
+        } else if (p == QStringLiteral("UP")) {
+            outVk = VK_UP;
+        } else if (p == QStringLiteral("DOWN")) {
+            outVk = VK_DOWN;
+        } else if (p == QStringLiteral("-") || p == QStringLiteral("MINUS")) {
+            outVk = VK_OEM_MINUS;
+        } else if (p == QStringLiteral("=") || p == QStringLiteral("EQUAL")) {
+            outVk = VK_OEM_PLUS;
+        } else if (p == QStringLiteral("[") || p == QStringLiteral("{")) {
+            outVk = VK_OEM_4;
+        } else if (p == QStringLiteral("]") || p == QStringLiteral("}")) {
+            outVk = VK_OEM_6;
+        } else if (p == QStringLiteral("\\") || p == QStringLiteral("|")) {
+            outVk = VK_OEM_5;
+        } else if (p == QStringLiteral(";") || p == QStringLiteral(":")) {
+            outVk = VK_OEM_1;
+        } else if (p == QStringLiteral("'") || p == QStringLiteral("\"")) {
+            outVk = VK_OEM_7;
+        } else if (p == QStringLiteral(",") || p == QStringLiteral("<")) {
+            outVk = VK_OEM_COMMA;
+        } else if (p == QStringLiteral(".") || p == QStringLiteral(">")) {
+            outVk = VK_OEM_PERIOD;
+        } else if (p == QStringLiteral("/") || p == QStringLiteral("?")) {
+            outVk = VK_OEM_2;
+        } else if (p == QStringLiteral("`") || p == QStringLiteral("~")) {
+            outVk = VK_OEM_3;
         }
     }
     if (outModifiers == 0 || outVk == 0) {
@@ -86,11 +142,12 @@ bool HotkeyManager::parseChord(const QString& text, unsigned int& outModifiers, 
 #endif
 }
 
-void HotkeyManager::applyHotkeys(const QString& toggleSystemProxy,
-                                 const QString& switchOutboundMode) {
+QStringList HotkeyManager::applyHotkeys(const QString& toggleSystemProxy,
+                                        const QString& switchOutboundMode) {
+    QStringList failed;
     if (toggleSystemProxy.trimmed() == currentSysProxyChord_ &&
         switchOutboundMode.trimmed() == currentModeChord_) {
-        return;
+        return failed;
     }
     unregisterAll();
     currentSysProxyChord_ = toggleSystemProxy.trimmed();
@@ -99,13 +156,28 @@ void HotkeyManager::applyHotkeys(const QString& toggleSystemProxy,
 #ifdef Q_OS_WIN
     unsigned int mods = 0;
     unsigned int vk = 0;
-    if (parseChord(currentSysProxyChord_, mods, vk)) {
-        sysProxyRegistered_ = (RegisterHotKey(nullptr, kHotkeyIdToggleSystemProxy, mods, vk) != FALSE);
+    if (!currentSysProxyChord_.isEmpty()) {
+        if (parseChord(currentSysProxyChord_, mods, vk)) {
+            sysProxyRegistered_ = (RegisterHotKey(nullptr, kHotkeyIdToggleSystemProxy, mods, vk) != FALSE);
+        } else {
+            sysProxyRegistered_ = false;
+        }
+        if (!sysProxyRegistered_) {
+            failed.append(currentSysProxyChord_);
+        }
     }
-    if (parseChord(currentModeChord_, mods, vk)) {
-        modeRegistered_ = (RegisterHotKey(nullptr, kHotkeyIdSwitchOutboundMode, mods, vk) != FALSE);
+    if (!currentModeChord_.isEmpty()) {
+        if (parseChord(currentModeChord_, mods, vk)) {
+            modeRegistered_ = (RegisterHotKey(nullptr, kHotkeyIdSwitchOutboundMode, mods, vk) != FALSE);
+        } else {
+            modeRegistered_ = false;
+        }
+        if (!modeRegistered_) {
+            failed.append(currentModeChord_);
+        }
     }
 #endif
+    return failed;
 }
 
 bool HotkeyManager::nativeEventFilter(const QByteArray& eventType,

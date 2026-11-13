@@ -93,7 +93,6 @@ private slots:
 private:
     DaemonClient* client_ = nullptr;
     QComboBox* nodeCombo_ = nullptr;
-    QLineEdit* providerEdit_ = nullptr;
     QLineEdit* urlEdit_ = nullptr;
     QPushButton* runBtn_ = nullptr;
     QPlainTextEdit* outputEdit_ = nullptr;

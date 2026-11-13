@@ -1,4 +1,4 @@
-#ifndef MyArch
+﻿#ifndef MyArch
   #define MyArch "arm64"
 #endif
 #ifndef AppVersion
@@ -38,10 +38,21 @@ ArchitecturesInstallIn64BitMode=x64compatible
 #endif
 
 [Languages]
+Name: "chinesesimplified"; MessagesFile: "compiler:Default.isl,ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[CustomMessages]
+chinesesimplified.CreateDesktopShortcut=创建桌面快捷方式(&D)
+english.CreateDesktopShortcut=Create a &desktop shortcut
+chinesesimplified.AdditionalShortcuts=附加快捷方式:
+english.AdditionalShortcuts=Additional shortcuts:
+chinesesimplified.RegisterServiceMsg=正在注册 ClashFX 提权 TUN 系统服务...
+english.RegisterServiceMsg=Registering ClashFX privileged TUN service...
+chinesesimplified.LaunchAppDesc=立即启动 ClashFX
+english.LaunchAppDesc=Launch ClashFX
+
 [Tasks]
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+Name: "desktopicon"; Description: "{cm:CreateDesktopShortcut}"; GroupDescription: "{cm:AdditionalShortcuts}"; Flags: unchecked
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -67,25 +78,79 @@ Root: HKCR; Subkey: "clashfx\shell\open\command"; ValueType: string; ValueName: 
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "ClashFX"; Flags: uninsdeletevalue
 
 [Run]
-Filename: "{app}\clashfx-service.exe"; Parameters: "install"; StatusMsg: "Registering ClashFX privileged TUN service..."; Flags: runhidden waituntilterminated
-Filename: "{app}\clashfx-ui.exe"; Description: "Launch ClashFX"; Flags: nowait postinstall skipifsilent runasoriginaluser
+Filename: "{app}\clashfx-service.exe"; Parameters: "install"; StatusMsg: "{cm:RegisterServiceMsg}"; Flags: runhidden waituntilterminated
+Filename: "{app}\clashfx-ui.exe"; Description: "{cm:LaunchAppDesc}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
-Filename: "{app}\clashfx-ui.exe"; Parameters: "--quit"; RunOnceId: "QuitClashFXUI"; Flags: runhidden waituntilterminated skipifdoesntexist
+Filename: "{app}\clashfx-ui.exe"; Parameters: "--quit-uninstall"; RunOnceId: "QuitClashFXUI"; Flags: runhidden waituntilterminated skipifdoesntexist
+Filename: "{app}\clashfx-daemon.exe"; Parameters: "-cleanup-uninstall"; RunOnceId: "CleanupClashFXDaemon"; Flags: runhidden waituntilterminated skipifdoesntexist
 Filename: "{app}\clashfx-service.exe"; Parameters: "uninstall"; RunOnceId: "UninstallClashFXService"; Flags: runhidden waituntilterminated skipifdoesntexist
 
 [Code]
-procedure StopRunningClashFXProcesses();
+procedure CleanupLoopbackProxyForHive(RootKey: Integer; const BaseSubkey: String);
+var
+  InetKey: String;
+  RunKey: String;
+  ProxySrv: String;
+  LowerSrv: String;
+begin
+  InetKey := BaseSubkey + 'Software\Microsoft\Windows\CurrentVersion\Internet Settings';
+  if RegQueryStringValue(RootKey, InetKey, 'ProxyServer', ProxySrv) then
+  begin
+    LowerSrv := LowerCase(ProxySrv);
+    if (Pos('127.0.0.1:', LowerSrv) > 0) or (Pos('localhost:', LowerSrv) > 0) then
+    begin
+      RegWriteDWordValue(RootKey, InetKey, 'ProxyEnable', 0);
+      RegDeleteValue(RootKey, InetKey, 'ProxyServer');
+    end;
+  end;
+
+  RunKey := BaseSubkey + 'Software\Microsoft\Windows\CurrentVersion\Run';
+  RegDeleteValue(RootKey, RunKey, 'ClashFX');
+end;
+
+procedure CleanupLoopbackProxyInRegistry();
+var
+  UserSids: TArrayOfString;
+  I: Integer;
+begin
+  CleanupLoopbackProxyForHive(HKCU, '');
+  if RegGetSubkeyNames(HKU, '', UserSids) then
+  begin
+    for I := 0 to GetArrayLength(UserSids) - 1 do
+    begin
+      if (Pos('S-1-5-21-', UserSids[I]) = 1) and (Pos('_Classes', UserSids[I]) = 0) then
+      begin
+        CleanupLoopbackProxyForHive(HKU, UserSids[I] + '\');
+      end;
+    end;
+  end;
+end;
+
+procedure StopRunningClashFXProcesses(ForUninstall: Boolean);
 var
   ResultCode: Integer;
   ExistingUI: String;
+  ExistingDaemon: String;
   ExistingSvc: String;
 begin
   ExistingUI := ExpandConstant('{app}\clashfx-ui.exe');
   if FileExists(ExistingUI) then
   begin
-    Exec(ExistingUI, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    if ForUninstall then
+      Exec(ExistingUI, '--quit-uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+    else
+      Exec(ExistingUI, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Sleep(400);
+  end;
+
+  if ForUninstall then
+  begin
+    ExistingDaemon := ExpandConstant('{app}\clashfx-daemon.exe');
+    if FileExists(ExistingDaemon) then
+    begin
+      Exec(ExistingDaemon, '-cleanup-uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
   end;
 
   ExistingSvc := ExpandConstant('{app}\clashfx-service.exe');
@@ -99,17 +164,29 @@ begin
   Exec('sc.exe', 'stop ClashFXService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec('taskkill.exe', '/F /IM clashfx-service.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec('taskkill.exe', '/F /IM mihomo_core.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ForUninstall then
+  begin
+    CleanupLoopbackProxyInRegistry();
+  end;
   Sleep(500);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  StopRunningClashFXProcesses();
+  StopRunningClashFXProcesses(False);
   Result := '';
 end;
 
 function InitializeUninstall(): Boolean;
 begin
-  StopRunningClashFXProcesses();
+  StopRunningClashFXProcesses(True);
   Result := True;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    CleanupLoopbackProxyInRegistry();
+  end;
 end;
