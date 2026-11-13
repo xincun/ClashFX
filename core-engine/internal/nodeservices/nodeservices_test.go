@@ -61,9 +61,20 @@ func TestNodePortRegistryReconcileReorderAndRenameStability(t *testing.T) {
 		t.Fatalf("ports drifted across reorder/rename: %+v", b2)
 	}
 
-	// Batch port edit + disable check
+	// Batch port edit + reserved-port rejection + cross-profile port reuse check
+	if err := reg.SetPortsWithReserved("local:sub", map[string]int{"HK-01": 7890}, map[int]bool{7890: true}); err == nil {
+		t.Fatal("expected reserved port 7890 to be rejected by SetPortsWithReserved")
+	}
 	if err := reg.SetPorts("local:sub", map[string]int{"HK-01": 21500}); err != nil {
 		t.Fatal(err)
+	}
+	// Another profile can reuse 21002 without being blocked by inactive profile "local:sub"
+	otherBindings, err := reg.Reconcile("local:other", []map[string]any{
+		{"name": "SG-01", "type": "socks5", "server": "sg1.example.com"},
+		{"name": "SG-01", "type": "socks5", "server": "sg1-dup.example.com"},
+	}, 21002, map[int]bool{7890: true}, func(int) bool { return true })
+	if err != nil || len(otherBindings) != 1 || otherBindings[0].Port != 21002 {
+		t.Fatalf("expected active profile port isolation + duplicate tolerance, got %+v (%v)", otherBindings, err)
 	}
 	if err := reg.SetEnabled("local:sub", map[string]bool{"US-01": false}); err != nil {
 		t.Fatal(err)

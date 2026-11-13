@@ -69,11 +69,16 @@ rules:
 		t.Fatal(err)
 	}
 
+	_, _ = store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.EnhancedMode = true
+		return nil
+	})
+
 	applier := &mockApplier{}
 	ctrl := NewController(store, applier, "")
-	// Simulate 19090 being in Windows Hyper-V excluded port range -> must relocate to 19091!
+	// Simulate 7890 and 19090 being in Windows Hyper-V excluded port range -> must relocate to 7891 and 19091!
 	ctrl.SetPortProbeForTest(func(port int, _ bool) (bool, bool) {
-		if port == 19090 {
+		if port == 7890 || port == 19090 {
 			return false, true
 		}
 		return true, false
@@ -83,11 +88,17 @@ rules:
 	if err != nil {
 		t.Fatal(err)
 	}
+	if st.MixedPort != 7891 {
+		t.Fatalf("MixedPort = %d, want 7891 (skipped reserved 7890)", st.MixedPort)
+	}
 	if st.APIPort != 19091 {
 		t.Fatalf("APIPort = %d, want 19091 (skipped reserved 19090)", st.APIPort)
 	}
-	if !strings.Contains(applier.appliedData, "x-clashfx-recovery-selections") || !strings.Contains(applier.appliedData, "GoodNode") {
-		t.Fatalf("expected recovery selection in cold-start config:\n%s", applier.appliedData)
+	if strings.Contains(applier.appliedData, "x-clashfx-recovery-selections") {
+		t.Fatalf("legacy custom recovery key must not be injected into stock Mihomo config:\n%s", applier.appliedData)
+	}
+	if !strings.Contains(applier.appliedData, "msftconnecttest.com") {
+		t.Fatalf("expected default Windows NCSI fake-ip-filter in managed TUN config:\n%s", applier.appliedData)
 	}
 
 	// Switch to a broken profile -> preflight validation fails BEFORE touching active runtime!

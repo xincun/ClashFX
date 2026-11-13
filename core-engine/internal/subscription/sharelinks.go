@@ -34,12 +34,27 @@ func ConvertShareLinksPayload(raw []byte) ([]byte, error) {
 	}
 	filtered := make([]map[string]any, 0, len(proxies))
 	names := make([]string, 0, len(proxies))
+	seenNames := make(map[string]int, len(proxies))
 	policy := make(map[string]any)
 	for _, proxy := range proxies {
-		name, _ := proxy["name"].(string)
-		if name == "" || isSubscriptionInfoProxyName(name) {
+		rawName, _ := proxy["name"].(string)
+		baseName := strings.TrimSpace(rawName)
+		if baseName == "" || isSubscriptionInfoProxyName(baseName) {
 			continue
 		}
+		name := baseName
+		if seenNames[name] > 0 {
+			for suffix := seenNames[name] + 1; ; suffix++ {
+				cand := fmt.Sprintf("%s (%d)", baseName, suffix)
+				if seenNames[cand] == 0 {
+					seenNames[baseName] = suffix
+					name = cand
+					break
+				}
+			}
+		}
+		seenNames[name] = 1
+		proxy["name"] = name
 		filtered = append(filtered, proxy)
 		names = append(names, name)
 		if server, ok := proxy["server"].(string); ok && server != "" && net.ParseIP(server) == nil {
@@ -86,7 +101,9 @@ func ConvertShareLinksPayload(raw []byte) ([]byte, error) {
 			"DOMAIN,localhost,DIRECT",
 			"DOMAIN-SUFFIX,local,DIRECT",
 			"DOMAIN-SUFFIX,cn,DIRECT",
+			"GEOSITE,cn,DIRECT",
 			"GEOIP,LAN,DIRECT,no-resolve",
+			"GEOIP,CN,DIRECT,no-resolve",
 			"MATCH,Proxy",
 		},
 	}

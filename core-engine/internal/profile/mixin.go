@@ -156,20 +156,35 @@ func ResolveMixinRuleLine(rawLine, defTarget string, literalPROXYExists bool) st
 		return trimmed
 	}
 	tp := strings.ToUpper(strings.TrimSpace(parts[0]))
-	targetIdx := 2
 	if tp == "MATCH" {
-		targetIdx = 1
-	}
-	if targetIdx >= len(parts) {
+		tgt := strings.TrimSpace(parts[1])
+		if (tgt == ProxyTargetPlaceholder && !literalPROXYExists) || strings.EqualFold(tgt, "@DEFAULT") {
+			parts[0] = "MATCH"
+			parts[1] = defTarget
+			return strings.Join(parts[:2], ",")
+		}
 		return trimmed
+	}
+	if len(parts) < 3 {
+		return trimmed
+	}
+	targetIdx := len(parts) - 1
+	for targetIdx >= 3 {
+		opt := strings.ToLower(strings.TrimSpace(parts[targetIdx]))
+		if opt == "no-resolve" || opt == "src" {
+			targetIdx--
+			continue
+		}
+		break
 	}
 	tgt := strings.TrimSpace(parts[targetIdx])
 	if (tgt == ProxyTargetPlaceholder && !literalPROXYExists) || strings.EqualFold(tgt, "@DEFAULT") {
-		parts[targetIdx] = defTarget
-		for i := range parts {
-			parts[i] = strings.TrimSpace(parts[i])
+		payload := strings.TrimSpace(strings.Join(parts[1:targetIdx], ","))
+		tail := []string{tp, payload, defTarget}
+		for _, extra := range parts[targetIdx+1:] {
+			tail = append(tail, strings.TrimSpace(extra))
 		}
-		return strings.Join(parts, ",")
+		return strings.Join(tail, ",")
 	}
 	return trimmed
 }

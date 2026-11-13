@@ -132,19 +132,19 @@ func (r *Registry) Reconcile(
 	}
 	names := make([]string, 0, len(proxies))
 	nameSet := make(map[string]bool, len(proxies))
-	serverKeys := make([]string, len(proxies))
+	serverKeys := make([]string, 0, len(proxies))
 	serverCounts := map[string]int{}
 
-	for i, px := range proxies {
+	for _, px := range proxies {
 		name, _ := px["name"].(string)
 		name = strings.TrimSpace(name)
 		if name == "" || nameSet[name] {
-			return nil, ErrInvalidNodes
+			continue
 		}
 		nameSet[name] = true
 		names = append(names, name)
 		sk := proxyServerKey(px)
-		serverKeys[i] = sk
+		serverKeys = append(serverKeys, sk)
 		if sk != "" {
 			serverCounts[sk]++
 		}
@@ -156,10 +156,8 @@ func (r *Registry) Reconcile(
 	for p := range reserved {
 		used[p] = true
 	}
-	for _, list := range r.Profiles {
-		for _, b := range list {
-			used[b.Port] = true
-		}
+	for _, b := range previous {
+		used[b.Port] = true
 	}
 	if r.DirectPort != nil {
 		used[*r.DirectPort] = true
@@ -232,9 +230,13 @@ func (r *Registry) Reconcile(
 }
 
 func (r *Registry) SetPorts(profileKey string, changes map[string]int) error {
+	return r.SetPortsWithReserved(profileKey, changes, nil)
+}
+
+func (r *Registry) SetPortsWithReserved(profileKey string, changes map[string]int, reserved map[int]bool) error {
 	next := r.clone()
 	for name, port := range changes {
-		if port < 1024 || port > 65535 || (next.DirectPort != nil && port == *next.DirectPort) {
+		if port < 1024 || port > 65535 || reserved[port] || (next.DirectPort != nil && port == *next.DirectPort) {
 			return PortConflictError{Port: port}
 		}
 		list := next.Profiles[profileKey]
@@ -253,13 +255,11 @@ func (r *Registry) SetPorts(profileKey string, changes map[string]int) error {
 	}
 
 	seenPorts := map[int]bool{}
-	for _, list := range next.Profiles {
-		for _, b := range list {
-			if seenPorts[b.Port] {
-				return PortConflictError{Port: b.Port}
-			}
-			seenPorts[b.Port] = true
+	for _, b := range next.Profiles[profileKey] {
+		if seenPorts[b.Port] {
+			return PortConflictError{Port: b.Port}
 		}
+		seenPorts[b.Port] = true
 	}
 	*r = next
 	return nil
@@ -519,6 +519,10 @@ func (s *Store) writeLocked(st PersistedState) error {
 }
 
 func (s *Store) UpdateProfileBindings(profileName string, portChanges map[string]int, enabledChanges map[string]bool) error {
+	return s.UpdateProfileBindingsWithReserved(profileName, portChanges, enabledChanges, nil)
+}
+
+func (s *Store) UpdateProfileBindingsWithReserved(profileName string, portChanges map[string]int, enabledChanges map[string]bool, reserved map[int]bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -528,7 +532,7 @@ func (s *Store) UpdateProfileBindings(profileName string, portChanges map[string
 	}
 	pKey := ProfileKey(profileName)
 	if len(portChanges) > 0 {
-		if err := st.Registry.SetPorts(pKey, portChanges); err != nil {
+		if err := st.Registry.SetPortsWithReserved(pKey, portChanges, reserved); err != nil {
 			return err
 		}
 	}
@@ -578,6 +582,10 @@ func (s *Store) ActiveBindings(profileName string) ([]NodePortBinding, *int, Set
 
 // Prepare mutates root in-place with fixed node listeners + direct-refresh listener (pure 1-port-to-1-node proxy bindings, no sub-rules).
 func (s *Store) Prepare(root map[string]any, profileName string, coreRunning bool) ([]NodePortBinding, error) {
+	return s.PrepareWithFallbackProxies(root, profileName, coreRunning, nil)
+}
+
+func (s *Store) PrepareWithFallbackProxies(root map[string]any, profileName string, coreRunning bool, fallbackProxies []map[string]any) ([]NodePortBinding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -591,6 +599,9 @@ func (s *Store) Prepare(root map[string]any, profileName string, coreRunning boo
 
 	reserved := ReservedPortsInConfig(root)
 	proxies := mapSliceFromAny(root["proxies"])
+	if len(proxies) == 0 && len(fallbackProxies) > 0 {
+		proxies = fallbackProxies
+	}
 	pKey := ProfileKey(profileName)
 
 	availFn := func(port int) bool {
@@ -610,9 +621,13 @@ func (s *Store) Prepare(root map[string]any, profileName string, coreRunning boo
 	}
 
 	names := make([]string, 0, len(proxies))
+	seenActive := make(map[string]bool, len(proxies))
 	for _, px := range proxies {
-		if n, _ := px["name"].(string); strings.TrimSpace(n) != "" {
-			names = append(names, strings.TrimSpace(n))
+		n, _ := px["name"].(string)
+		n = strings.TrimSpace(n)
+		if n != "" && !seenActive[n] {
+			seenActive[n] = true
+			names = append(names, n)
 		}
 	}
 	st.ActiveNames[pKey] = names
@@ -645,6 +660,13 @@ func (s *Store) Prepare(root map[string]any, profileName string, coreRunning boo
 }
 
 func (s *Store) TransformHookForController(isCoreRunning func() bool) func(root map[string]any, settings profile.AppSettings) error {
+	return s.TransformHookForControllerWithProviders(isCoreRunning, nil)
+}
+
+func (s *Store) TransformHookForControllerWithProviders(
+	isCoreRunning func() bool,
+	fallbackProxiesLoader func(root map[string]any) []map[string]any,
+) func(root map[string]any, settings profile.AppSettings) error {
 	return func(root map[string]any, settings profile.AppSettings) error {
 		if settings.EnhancedMode && settings.CustomConfigAsIs {
 			return nil
@@ -653,7 +675,11 @@ func (s *Store) TransformHookForController(isCoreRunning func() bool) func(root 
 		if isCoreRunning != nil {
 			running = isCoreRunning()
 		}
-		_, err := s.Prepare(root, settings.SelectedProfile, running)
+		var fallback []map[string]any
+		if fallbackProxiesLoader != nil {
+			fallback = fallbackProxiesLoader(root)
+		}
+		_, err := s.PrepareWithFallbackProxies(root, settings.SelectedProfile, running, fallback)
 		return err
 	}
 }

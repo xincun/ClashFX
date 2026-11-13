@@ -327,29 +327,55 @@ func (m *Manager) Refresh(ctx context.Context, name string, directProxyPort int)
 }
 
 func (m *Manager) UpdateExternalResource(ctx context.Context, rawURL, destFileName string, minBytes int) error {
-	client, err := newSubscriptionHTTPClient(0, 90*time.Second)
+	return m.UpdateExternalResourceViaProxy(ctx, rawURL, destFileName, minBytes, 0)
+}
+
+func (m *Manager) UpdateExternalResourceViaProxy(ctx context.Context, rawURL, destFileName string, minBytes int, localProxyPort int) error {
+	downloadOnce := func(proxyPort int) ([]byte, error) {
+		client, err := newSubscriptionHTTPClient(proxyPort, 90*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSpace(rawURL), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", DefaultSubscriptionUserAgent)
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("HTTP %d downloading %s", resp.StatusCode, destFileName)
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 128*1024*1024))
+		if err != nil {
+			return nil, err
+		}
+		if len(data) < minBytes {
+			return nil, fmt.Errorf("downloaded %s too small (%d bytes)", destFileName, len(data))
+		}
+		return data, nil
+	}
+
+	var (
+		data []byte
+		err  error
+	)
+	if localProxyPort > 0 {
+		data, err = downloadOnce(localProxyPort)
+	}
+	if len(data) == 0 {
+		if directData, dErr := downloadOnce(0); dErr == nil {
+			data = directData
+			err = nil
+		} else if err == nil {
+			err = dErr
+		}
+	}
 	if err != nil {
 		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSpace(rawURL), nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", DefaultSubscriptionUserAgent)
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d downloading %s", resp.StatusCode, destFileName)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 128*1024*1024))
-	if err != nil {
-		return err
-	}
-	if len(data) < minBytes {
-		return fmt.Errorf("downloaded %s too small (%d bytes)", destFileName, len(data))
 	}
 	dst := filepath.Join(m.store.ActiveConfigDir(), destFileName)
 	return profile.WriteFileAtomic(dst, data, 0644)

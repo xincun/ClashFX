@@ -79,6 +79,12 @@ func NewRunner(trustedDir string) *Runner {
 	}
 }
 
+func (r *Runner) TrustedDir() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.trustedDir
+}
+
 func (r *Runner) SetCoreBinaryForTest(exeName string, readyTimeout, stopTimeout time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -240,6 +246,23 @@ func probeHTTPReadiness(ctx context.Context, ep configProbeEndpoints, readyOnce 
 	}
 }
 
+func isPathWithinDir(baseDir, targetPath string) bool {
+	if resolvedBase, err := filepath.EvalSymlinks(baseDir); err == nil {
+		baseDir = resolvedBase
+	}
+	if resolvedTarget, err := filepath.EvalSymlinks(targetPath); err == nil {
+		targetPath = resolvedTarget
+	}
+	rel, err := filepath.Rel(baseDir, targetPath)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
 func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 	cleanHome, err := validateCleanAbsPath("home_dir", homeDir, true, true)
 	if err != nil {
@@ -248,6 +271,9 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 	cleanConfig, err := validateCleanAbsPath("config_file", configFile, true, false)
 	if err != nil {
 		return r.Status(), err
+	}
+	if !isPathWithinDir(cleanHome, cleanConfig) {
+		return r.Status(), fmt.Errorf("config_file %q must reside within home_dir %q", cleanConfig, cleanHome)
 	}
 	var cleanUI string
 	if strings.TrimSpace(extUI) != "" {
@@ -278,21 +304,21 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 
 	cmd := exec.Command(corePath, args...)
 	cmd.Dir = r.trustedDir
+	// Always confine stock Mihomo file access via SAFE_PATHS so SYSTEM-launched
+	// mihomo_core cannot read/write arbitrary provider paths outside home_dir / trustedDir.
+	env := make([]string, 0, len(os.Environ())+1)
+	safeList := []string{cleanHome, r.trustedDir}
 	if cleanUI != "" {
-		env := make([]string, 0, len(os.Environ())+1)
-		safeList := []string{cleanUI}
-		if existing := strings.TrimSpace(os.Getenv("SAFE_PATHS")); existing != "" {
-			safeList = append([]string{existing}, safeList...)
-		}
-		for _, kv := range os.Environ() {
-			if strings.HasPrefix(strings.ToUpper(kv), "SAFE_PATHS=") {
-				continue
-			}
-			env = append(env, kv)
-		}
-		env = append(env, "SAFE_PATHS="+strings.Join(safeList, string(os.PathListSeparator)))
-		cmd.Env = env
+		safeList = append(safeList, cleanUI)
 	}
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(strings.ToUpper(kv), "SAFE_PATHS=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "SAFE_PATHS="+strings.Join(safeList, string(os.PathListSeparator)))
+	cmd.Env = env
 	configureChildProcess(cmd)
 
 	stdoutPipe, err := cmd.StdoutPipe()

@@ -182,6 +182,34 @@ func (m *Manager) Shutdown(keepFailClosedForAILock bool) error {
 	return m.Restore()
 }
 
+// CleanupForUninstall unconditionally restores pre-ClashFX proxy settings (even if
+// AI Proxy Lock fail-closed was active) or disables any lingering loopback proxy so
+// uninstalling ClashFX never leaves the machine offline. Non-loopback corporate
+// proxies are left untouched if no ClashFX snapshot exists.
+func (m *Manager) CleanupForUninstall() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	snap, hasSnap, err := m.readSnapshotLocked()
+	if err == nil && hasSnap {
+		if wErr := m.backend.WriteState(sanitizeRestoreTarget(snap.PreClashFXState, snap.AppliedProxyServer)); wErr != nil {
+			return wErr
+		}
+		_ = os.Remove(m.snapshotPath)
+		return nil
+	}
+
+	cur, rErr := m.backend.ReadState()
+	if rErr != nil {
+		return rErr
+	}
+	if cur.ProxyEnable != 0 && isLoopbackProxyServer(cur.ProxyServer) {
+		cur.ProxyEnable = 0
+		return m.backend.WriteState(cur)
+	}
+	return nil
+}
+
 // ForceClearAll implements "Turn Off All Proxy Modes": unconditionally turns off
 // ProxyEnable, clears ProxyServer and AutoConfigURL, and removes any snapshot.
 func (m *Manager) ForceClearAll() error {
@@ -310,7 +338,19 @@ func sanitizeRestoreTarget(base OSProxyState, applied string) OSProxyState {
 
 func isLoopbackProxyServer(s string) bool {
 	s = strings.ToLower(strings.TrimSpace(s))
-	return strings.HasPrefix(s, "127.0.0.1:") || strings.HasPrefix(s, "localhost:")
+	if strings.HasPrefix(s, "127.0.0.1:") || strings.HasPrefix(s, "localhost:") {
+		return true
+	}
+	for _, part := range strings.Split(s, ";") {
+		part = strings.TrimSpace(part)
+		if idx := strings.IndexByte(part, '='); idx >= 0 {
+			part = strings.TrimSpace(part[idx+1:])
+		}
+		if strings.HasPrefix(part, "127.0.0.1:") || strings.HasPrefix(part, "localhost:") {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) readSnapshotLocked() (persistedSnapshot, bool, error) {

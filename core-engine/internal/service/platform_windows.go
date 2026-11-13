@@ -10,12 +10,19 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/Microsoft/go-winio"
 	"golang.org/x/sys/windows"
+)
+
+var (
+	modkernel32                      = windows.NewLazySystemDLL("kernel32.dll")
+	procGetNamedPipeClientProcessId  = modkernel32.NewProc("GetNamedPipeClientProcessId")
 )
 
 func configureChildProcess(cmd *exec.Cmd) {
@@ -175,4 +182,49 @@ func ListenSecurePipe() (net.Listener, error) {
 		OutputBufferSize:   16 * 1024,
 	}
 	return winio.ListenPipe(ServicePipeName, cfg)
+}
+
+// VerifyPipePeer ensures only trusted ClashFX binaries (clashfx-daemon.exe or
+// clashfx-service.exe) located inside trustedDir can invoke privileged service actions.
+func VerifyPipePeer(conn net.Conn, trustedDir string) error {
+	pipeConn, ok := conn.(interface{ Fd() uintptr })
+	if !ok {
+		return errors.New("unauthorized pipe caller: invalid pipe handle")
+	}
+	var clientPID uint32
+	r1, _, callErr := procGetNamedPipeClientProcessId.Call(
+		pipeConn.Fd(),
+		uintptr(unsafe.Pointer(&clientPID)),
+	)
+	if r1 == 0 || clientPID == 0 {
+		return fmt.Errorf("unauthorized pipe caller: query client PID failed: %w", callErr)
+	}
+
+	proc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, clientPID)
+	if err != nil {
+		return fmt.Errorf("unauthorized pipe caller: open client process %d: %w", clientPID, err)
+	}
+	defer windows.CloseHandle(proc)
+
+	buf := make([]uint16, windows.MAX_PATH*4)
+	size := uint32(len(buf))
+	if err := windows.QueryFullProcessImageName(proc, 0, &buf[0], &size); err != nil {
+		return fmt.Errorf("unauthorized pipe caller: query image path: %w", err)
+	}
+	clientExe := windows.UTF16ToString(buf[:size])
+	if resolved, err := filepath.EvalSymlinks(clientExe); err == nil {
+		clientExe = resolved
+	}
+	cleanTrusted := filepath.Clean(trustedDir)
+	if resolvedDir, err := filepath.EvalSymlinks(cleanTrusted); err == nil {
+		cleanTrusted = resolvedDir
+	}
+
+	clientDir := filepath.Clean(filepath.Dir(clientExe))
+	clientBase := strings.ToLower(filepath.Base(clientExe))
+	if !strings.EqualFold(clientDir, cleanTrusted) ||
+		(clientBase != "clashfx-daemon.exe" && clientBase != "clashfx-service.exe") {
+		return fmt.Errorf("unauthorized pipe caller %q (must be clashfx-daemon.exe inside %q)", clientExe, cleanTrusted)
+	}
+	return nil
 }

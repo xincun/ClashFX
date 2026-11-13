@@ -18,6 +18,25 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var defaultWindowsFakeIPFilter = []any{
+	"*.lan",
+	"*.local",
+	"*.localdomain",
+	"*.msftconnecttest.com",
+	"*.msftncsi.com",
+	"dns.msftncsi.com",
+	"time.*.com",
+	"time.*.gov",
+	"ntp.*.com",
+	"localhost.ptlogin2.qq.com",
+	"localhost.sec.qq.com",
+	"+.stun.*.*",
+	"+.stun.*.*.*",
+	"+.srv.nintendo.net",
+	"+.stun.playstation.net",
+	"xbox.*.microsoft.com",
+}
+
 // TransformHook mutates the candidate runtime YAML map before validation (e.g.
 // AI Proxy Lock, Multi-Node fixed ports, CN Apps bypass, Enhanced TUN settings).
 type TransformHook func(root map[string]any, settings profile.AppSettings) error
@@ -118,8 +137,8 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 		}
 	}
 
-	// 2. Apply runtime port, controller, DNS, TUN, and recovery selection policies
-	state, err := c.prepareRuntimeTopology(root, settings, includeRecoverySelections)
+	// 2. Apply runtime port, controller, DNS, and TUN policies
+	state, err := c.prepareRuntimeTopology(root, settings)
 	if err != nil {
 		return c.lastState, err
 	}
@@ -188,7 +207,7 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 	return state, nil
 }
 
-func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profile.AppSettings, includeRecoverySelections bool) (AppliedRuntimeState, error) {
+func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profile.AppSettings) (AppliedRuntimeState, error) {
 	state := AppliedRuntimeState{
 		ProfileName: settings.SelectedProfile,
 		Enhanced:    settings.EnhancedMode,
@@ -227,6 +246,22 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		}
 	}
 	mixedPort := intFromYAML(root["mixed-port"])
+	ownedMixedPort := c.lastState.MixedPort
+	if mixedPort != ownedMixedPort && !c.isPortUsable(mixedPort, false) {
+		if settings.PortOverride > 0 {
+			return state, fmt.Errorf("configured proxy port %d is unavailable or occupied by another application", mixedPort)
+		}
+		if ownedMixedPort > 0 && c.isPortUsable(ownedMixedPort, false) {
+			mixedPort = ownedMixedPort
+		} else {
+			fallback, err := portprobe.FindAvailablePort(7890, 7999, nil, false, c.probePort)
+			if err != nil {
+				return state, fmt.Errorf("select mixed-port: %w", err)
+			}
+			mixedPort = fallback
+		}
+		root["mixed-port"] = mixedPort
+	}
 	if intFromYAML(root["port"]) == mixedPort {
 		delete(root, "port")
 	}
@@ -333,6 +368,9 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		if fir, _ := dnsMap["fake-ip-range"].(string); fir == "" {
 			dnsMap["fake-ip-range"] = "198.18.0.1/16"
 		}
+		if strings.EqualFold(fmt.Sprint(dnsMap["enhanced-mode"]), "fake-ip") && dnsMap["fake-ip-filter"] == nil {
+			dnsMap["fake-ip-filter"] = append([]any(nil), defaultWindowsFakeIPFilter...)
+		}
 		if dnsMap["default-nameserver"] == nil {
 			dnsMap["default-nameserver"] = []string{"114.114.114.114", "223.5.5.5", "119.29.29.29"}
 		}
@@ -400,19 +438,8 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		root["tun"] = map[string]any{"enable": false}
 	}
 
-	// Startup recovery selections (only for cold start; Mihomo's PUT /configs rejects unknown top-level keys?
-	// Wait: Mihomo's YAML unmarshaler ignores unknown top-level keys without strict mode, AND our
-	// mihomo-bin reads x-clashfx-recovery-selections on startup!)
-	if includeRecoverySelections {
-		if sel := c.store.RecoverySelectionsForProfile(settings.SelectedProfile); len(sel) > 0 {
-			filtered := filterValidSelections(root, sel)
-			if len(filtered) > 0 {
-				root[profile.RecoverySelectionsKey] = filtered
-			}
-		}
-	} else {
-		delete(root, profile.RecoverySelectionsKey)
-	}
+	// Strip any legacy custom recovery key; stock Mihomo persists selections via profile.store-selected + REST replay.
+	delete(root, profile.RecoverySelectionsKey)
 
 	return state, nil
 }
@@ -475,44 +502,6 @@ func PrependUniqueRules(root map[string]any, prefixRules []string) {
 		out = append(out, s)
 	}
 	root["rules"] = out
-}
-
-func filterValidSelections(root map[string]any, sel map[string]string) map[string]string {
-	groups, _ := root["proxy-groups"].([]any)
-	if len(groups) == 0 {
-		return nil
-	}
-	out := map[string]string{}
-	for _, gRaw := range groups {
-		g, ok := gRaw.(map[string]any)
-		if !ok {
-			continue
-		}
-		gName, _ := g["name"].(string)
-		gType, _ := g["type"].(string)
-		if gName == "" || strings.ToLower(gType) != "select" {
-			continue
-		}
-		want, ok := sel[gName]
-		if !ok || want == "" {
-			continue
-		}
-		// Verify candidate is listed in group proxies (if explicit proxies list present)
-		if cands, ok := g["proxies"].([]any); ok && len(cands) > 0 {
-			found := false
-			for _, c := range cands {
-				if fmt.Sprint(c) == want {
-					found = true
-					break
-				}
-			}
-			if !found && g["use"] == nil {
-				continue
-			}
-		}
-		out[gName] = want
-	}
-	return out
 }
 
 func intFromYAML(v any) int {

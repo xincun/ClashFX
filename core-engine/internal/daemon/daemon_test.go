@@ -357,3 +357,57 @@ func TestFetchProxyGroupsHiddenFilterTimeoutAndProviderQuota(t *testing.T) {
 		t.Fatalf("unexpected provider subscription info: %+v", provInfo)
 	}
 }
+
+func TestLoadProviderSnapshotsFromDiskAndUninstallCleanup(t *testing.T) {
+	appData := t.TempDir()
+	eng, err := NewEngine(Config{AppDataDir: appData}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Shutdown()
+
+	cfgDir := eng.store.ActiveConfigDir()
+	provDir := filepath.Join(cfgDir, "proxies")
+	if err := os.MkdirAll(provDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	provYAML := `proxies:
+  - name: ProviderNode-JP
+    type: socks5
+    server: 198.51.100.77
+    port: 1080
+`
+	if err := os.WriteFile(filepath.Join(provDir, "airport.yaml"), []byte(provYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	rawRoot := map[string]any{
+		"proxy-providers": map[string]any{
+			"airport": map[string]any{
+				"type": "http",
+				"path": "./proxies/airport.yaml",
+			},
+		},
+		"proxy-groups": []any{
+			map[string]any{
+				"name": "Proxy",
+				"type": "select",
+				"use":  []any{"airport"},
+			},
+		},
+		"rules": []any{"MATCH,Proxy"},
+	}
+
+	snaps := eng.loadProviderSnapshots(rawRoot)
+	if len(snaps) != 1 || snaps[0].Name != "airport" || len(snaps[0].Proxies) != 1 {
+		t.Fatalf("expected 1 provider snapshot with 1 proxy, got %+v", snaps)
+	}
+
+	if rpcTimeoutForMethod("benchmark_all") < 120*time.Second || rpcTimeoutForMethod("update_geo_databases") < 120*time.Second {
+		t.Fatal("expected >=120s RPC timeout for heavy network methods")
+	}
+
+	if err := CleanupUninstallState(appData); err != nil {
+		t.Fatalf("CleanupUninstallState failed: %v", err)
+	}
+}

@@ -121,4 +121,28 @@ func TestSystemProxyLifecycleCrashRecoveryAILockAndWakeHeal(t *testing.T) {
 	if cleared.ProxyEnable != 0 || cleared.HasProxyServer || cleared.HasAutoConfigURL {
 		t.Fatalf("ForceClearAll left residual proxy settings: %+v", cleared)
 	}
+
+	// 6. Simulate uninstall after AI Lock Shutdown(true): CleanupForUninstall must restore unconditionally!
+	_ = backend.WriteState(initial)
+	if err := mgrAfterCrash.Apply(7890, ""); err != nil {
+		t.Fatal(err)
+	}
+	_ = mgrAfterCrash.Shutdown(true) // leaves 127.0.0.1:7890 enabled
+	if err := mgrAfterCrash.CleanupForUninstall(); err != nil {
+		t.Fatal(err)
+	}
+	afterUninstall, _ := backend.ReadState()
+	if afterUninstall != initial {
+		t.Fatalf("CleanupForUninstall restored %+v, want %+v", afterUninstall, initial)
+	}
+
+	// 7. Even if snapshot was already deleted, CleanupForUninstall disables lingering loopback proxy
+	// while preserving non-loopback corporate proxies!
+	_ = backend.WriteState(OSProxyState{ProxyEnable: 1, HasProxyServer: true, ProxyServer: "http=127.0.0.1:7890;https=127.0.0.1:7890"})
+	if err := mgrAfterCrash.CleanupForUninstall(); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := backend.ReadState(); st.ProxyEnable != 0 {
+		t.Fatalf("expected lingering loopback proxy disabled, got %+v", st)
+	}
 }

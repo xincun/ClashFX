@@ -109,6 +109,10 @@ func (s *Server) Wait() {
 }
 
 func (s *Server) Stop() {
+	s.StopWithOptions(false)
+}
+
+func (s *Server) StopWithOptions(forceRestoreProxy bool) {
 	s.quitOnce.Do(func() {
 		s.pushMu.Lock()
 		if s.pushTimer != nil {
@@ -127,7 +131,7 @@ func (s *Server) Stop() {
 		s.clients = map[*clientConn]struct{}{}
 		s.clientsMu.Unlock()
 
-		s.engine.Shutdown()
+		s.engine.ShutdownWithForceRestore(forceRestoreProxy)
 		close(s.quitCh)
 	})
 }
@@ -206,8 +210,24 @@ func (s *Server) serveClient(cc *clientConn) {
 	}
 }
 
+func rpcTimeoutForMethod(method string) time.Duration {
+	switch method {
+	case "benchmark_all",
+		"benchmark_group",
+		"update_geo_databases",
+		"upsert_subscription",
+		"refresh_subscription",
+		"import_url_scheme",
+		"node_refresh_direct",
+		"check_updates":
+		return 120 * time.Second
+	default:
+		return 35 * time.Second
+	}
+}
+
 func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeoutForMethod(req.Method))
 	defer cancel()
 
 	okResp := func(data any) RPCResponse {
@@ -520,9 +540,16 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		}
 		return okResp(res)
 	case "quit_daemon":
+		var p struct {
+			ForceRestoreProxy bool `json:"force_restore_proxy"`
+		}
+		if len(req.Params) > 0 {
+			_ = json.Unmarshal(req.Params, &p)
+		}
+		forceRestore := p.ForceRestoreProxy
 		go func() {
 			time.Sleep(80 * time.Millisecond)
-			s.Stop()
+			s.StopWithOptions(forceRestore)
 		}()
 		return okResp(map[string]bool{"quitting": true})
 	default:

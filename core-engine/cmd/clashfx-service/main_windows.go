@@ -63,6 +63,10 @@ func acceptLoop(ln net.Listener, runner *service.Runner) {
 		go func(c net.Conn) {
 			defer c.Close()
 			_ = c.SetDeadline(time.Now().Add(20 * time.Second))
+			if err := service.VerifyPipePeer(c, runner.TrustedDir()); err != nil {
+				_ = json.NewEncoder(c).Encode(service.Response{OK: false, Message: err.Error()})
+				return
+			}
 			var req service.Request
 			if err := json.NewDecoder(c).Decode(&req); err != nil {
 				_ = json.NewEncoder(c).Encode(service.Response{OK: false, Message: err.Error()})

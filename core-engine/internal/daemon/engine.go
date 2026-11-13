@@ -26,6 +26,7 @@ import (
 	"github.com/clashfx/core-engine/internal/subscription"
 	"github.com/clashfx/core-engine/internal/sysproxy"
 	"github.com/clashfx/core-engine/internal/transaction"
+	mihomoutils "github.com/metacubex/mihomo/common/utils"
 )
 
 const AppVersion = "1.19.24-win.1"
@@ -189,7 +190,16 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 		store,
 		eng,
 		cfg.DashboardUIDir,
-		ailock.TransformHookForController(nil),
+		func(root map[string]any, settings profile.AppSettings) error {
+			if !settings.AILockEnabled {
+				return nil
+			}
+			outcome := ailock.Apply(root, settings.AILockTarget, eng.loadProviderSnapshots(root))
+			if !outcome.Applied {
+				return fmt.Errorf("AI Proxy Lock rejected target %q: %s", settings.AILockTarget, outcome.RejectionReason)
+			}
+			return nil
+		},
 		features.TransformHookForCNApps(),
 		nodeStore.TransformHookForController(eng.IsCoreRunning),
 	)
@@ -233,6 +243,12 @@ func (e *Engine) Start(ctx context.Context) error {
 	// Recover previous crashed session's system proxy if user doesn't want system proxy now
 	_, _ = e.sysProxy.RecoverAfterUncleanShutdown(settings.SystemProxyEnabled)
 
+	// Self-heal HKCU Run\ClashFX path if the user moved or reinstalled ClashFX
+	if settings.LaunchAtLogin {
+		uiExe := filepath.Join(e.cfg.BinDir, "clashfx-ui.exe")
+		_ = SetLaunchAtLogin(true, uiExe)
+	}
+
 	// If EnhancedMode was persisted from last session, verify service is still installed;
 	// if uninstalled externally while offline (and AI Lock isn't forcing it), fall back cleanly to normal mode.
 	if settings.EnhancedMode && runtime.GOOS == "windows" && !IsPrivilegedServiceInstalled(service.ServiceName) && !settings.AILockEnabled {
@@ -261,6 +277,10 @@ func (e *Engine) Start(ctx context.Context) error {
 }
 
 func (e *Engine) Shutdown() {
+	e.ShutdownWithForceRestore(false)
+}
+
+func (e *Engine) ShutdownWithForceRestore(forceRestore bool) {
 	select {
 	case <-e.stopBgCh:
 		return
@@ -272,15 +292,44 @@ func (e *Engine) Shutdown() {
 		e.stopPower()
 	}
 	e.nodeCoord.Stop()
-	e.store.Close()
 
 	settings := e.store.Settings()
-	_ = e.sysProxy.Shutdown(settings.AILockEnabled)
+	e.store.Close()
+
+	if forceRestore {
+		_ = e.sysProxy.CleanupForUninstall()
+		_ = SetLaunchAtLogin(false, "")
+	} else {
+		_ = e.sysProxy.Shutdown(settings.AILockEnabled)
+	}
 
 	_ = e.localRunner.Stop()
-	if e.coreViaService {
+	e.opMu.Lock()
+	viaSvc := e.coreViaService
+	e.opMu.Unlock()
+	if viaSvc {
 		_, _ = callService(5*time.Second, service.Request{Action: "stop_core"})
 	}
+}
+
+// CleanupUninstallState unconditionally clears any ClashFX-managed system proxy snapshot,
+// lingering loopback proxy settings, and HKCU auto-start registry entry during uninstall.
+func CleanupUninstallState(appDataDir string) error {
+	resolvedDir := strings.TrimSpace(appDataDir)
+	if store, err := profile.NewStore(resolvedDir, ""); err == nil {
+		resolvedDir = store.AppDataDir()
+		store.Close()
+	}
+	var firstErr error
+	if resolvedDir != "" {
+		if err := sysproxy.NewManager(resolvedDir, nil).CleanupForUninstall(); err != nil {
+			firstErr = err
+		}
+	}
+	if err := SetLaunchAtLogin(false, ""); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }
 
 func callService(timeout time.Duration, req service.Request) (service.Response, error) {
@@ -467,9 +516,14 @@ func (e *Engine) backgroundMaintenanceLoop() {
 		case <-coreSyncTicker.C:
 			e.syncFromLiveCore(context.Background())
 		case <-netTicker.C:
+			e.opMu.Lock()
 			prevSuspended := e.suspendedByNet
+			e.opMu.Unlock()
 			e.reconcileSystemProxy()
-			if e.suspendedByNet != prevSuspended {
+			e.opMu.Lock()
+			currSuspended := e.suspendedByNet
+			e.opMu.Unlock()
+			if currSuspended != prevSuspended {
 				e.notifyStateChanged()
 			}
 		case <-subTicker.C:
@@ -493,17 +547,18 @@ func (e *Engine) syncFromLiveCore(ctx context.Context) {
 	if !e.opMu.TryLock() {
 		return
 	}
-	e.opMu.Unlock()
 
 	rt := e.ctrl.LastState()
 	if rt.APIPort <= 0 || !e.IsCoreRunning() {
+		e.opMu.Unlock()
 		return
 	}
 
 	settings := e.store.Settings()
 	anyChanged := false
+	needReconcileProxy := false
 
-	// 1. Reconcile outbound mode if user changed it inside MetaCubeXD WebView
+	// 1. Reconcile outbound mode under opMu so concurrent user applyAndSync calls never race
 	if liveMode := fetchCoreOutboundMode(ctx, rt.APIPort, rt.APISecret); liveMode != "" {
 		if settings.AILockEnabled && liveMode != "rule" {
 			// Enforce AI Proxy Lock invariant if WebView tried to switch away from Rule mode
@@ -515,10 +570,15 @@ func (e *Engine) syncFromLiveCore(ctx context.Context) {
 				return nil
 			}); err == nil {
 				settings = e.store.Settings()
-				e.reconcileSystemProxy()
+				needReconcileProxy = true
 				anyChanged = true
 			}
 		}
+	}
+	e.opMu.Unlock()
+
+	if needReconcileProxy {
+		e.reconcileSystemProxy()
 	}
 
 	// 2. Reconcile live proxy group selections & delays from WebView / auto-URLTest
@@ -747,7 +807,7 @@ func (e *Engine) refreshLiveCoreMetadata(ctx context.Context) {
 	rt := e.ctrl.LastState()
 	settings := e.store.Settings()
 
-	// Load candidate targets + relay from selected profile YAML even if core isn't up
+	// Load candidate targets + relay from selected profile YAML (+ proxy-providers) even if core isn't up
 	var rawRoot map[string]any
 	if data, err := os.ReadFile(e.store.ProfilePath(settings.SelectedProfile)); err == nil {
 		rawRoot, _ = profile.UnmarshalYAMLMap(data)
@@ -756,10 +816,11 @@ func (e *Engine) refreshLiveCoreMetadata(ctx context.Context) {
 	var relay string
 	defTarget := "DIRECT"
 	if rawRoot != nil {
-		cands = ailock.ListCandidateTargets(rawRoot, nil)
+		providers := e.loadProviderSnapshots(rawRoot)
+		cands = ailock.ListCandidateTargets(rawRoot, providers)
 		defTarget = profile.ResolveDefaultRuleTarget(rawRoot)
 		if settings.AILockEnabled {
-			relay = ailock.RelayName(rawRoot, settings.AILockTarget, nil)
+			relay = ailock.RelayName(rawRoot, settings.AILockTarget, providers)
 		}
 	}
 
@@ -777,6 +838,172 @@ func (e *Engine) refreshLiveCoreMetadata(ctx context.Context) {
 	e.aiRelay = relay
 	e.providerSubInfo = provInfo
 	e.proxyGroupsMu.Unlock()
+}
+
+func (e *Engine) activeLocalProxyPort() int {
+	rt := e.ctrl.LastState()
+	if rt.MixedPort > 0 && e.IsCoreRunning() {
+		return rt.MixedPort
+	}
+	return 0
+}
+
+func (e *Engine) loadProviderSnapshots(rawRoot map[string]any) []ailock.ProviderSnapshot {
+	if rawRoot == nil {
+		return nil
+	}
+	defs, ok := rawRoot["proxy-providers"].(map[string]any)
+	if !ok || len(defs) == 0 {
+		return nil
+	}
+
+	var names []string
+	for k := range defs {
+		if strings.TrimSpace(k) != "" && k != "default" {
+			names = append(names, k)
+		}
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return nil
+	}
+
+	var liveMap map[string][]map[string]any
+	if rt := e.ctrl.LastState(); rt.APIPort > 0 && e.IsCoreRunning() {
+		liveMap = fetchLiveProviderProxies(rt.APIPort, rt.APISecret)
+	}
+
+	cfgDir := filepath.Clean(e.store.ActiveConfigDir())
+	out := make([]ailock.ProviderSnapshot, 0, len(names))
+	for _, name := range names {
+		defMap, _ := defs[name].(map[string]any)
+		var dialerProxy, overrideDialer string
+		if defMap != nil {
+			dialerProxy, _ = defMap["dialer-proxy"].(string)
+			if ov, ok := defMap["override"].(map[string]any); ok {
+				overrideDialer, _ = ov["dialer-proxy"].(string)
+			}
+		}
+
+		// Prefer full outbound definitions from inline payload or on-disk provider cache
+		// so server host & dialer-proxy materialization remain complete.
+		proxies := loadProviderProxiesFromDef(cfgDir, defMap)
+		if len(proxies) == 0 && liveMap != nil {
+			proxies = liveMap[name]
+		}
+		if len(proxies) == 0 {
+			continue
+		}
+		out = append(out, ailock.ProviderSnapshot{
+			Name:                name,
+			DialerProxy:         strings.TrimSpace(dialerProxy),
+			OverrideDialerProxy: strings.TrimSpace(overrideDialer),
+			Proxies:             proxies,
+		})
+	}
+	return out
+}
+
+func loadProviderProxiesFromDef(cfgDir string, defMap map[string]any) []map[string]any {
+	if defMap == nil {
+		return nil
+	}
+	if inline := extractProxyMaps(defMap["payload"]); len(inline) > 0 {
+		return inline
+	}
+
+	var candPath string
+	relPath, _ := defMap["path"].(string)
+	relPath = strings.TrimSpace(relPath)
+	if relPath != "" {
+		if filepath.IsAbs(relPath) {
+			candPath = filepath.Clean(relPath)
+		} else {
+			candPath = filepath.Clean(filepath.Join(cfgDir, relPath))
+		}
+	} else if rawURL, _ := defMap["url"].(string); strings.TrimSpace(rawURL) != "" {
+		hash := mihomoutils.MakeHash([]byte(strings.TrimSpace(rawURL))).String()
+		candPath = filepath.Join(cfgDir, "proxies", hash)
+	}
+	if candPath == "" {
+		return nil
+	}
+	if rel, err := filepath.Rel(cfgDir, candPath); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil
+	}
+	f, err := os.Open(candPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 16<<20))
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	if doc, err := profile.UnmarshalYAMLMap(data); err == nil {
+		if list := extractProxyMaps(doc["proxies"]); len(list) > 0 {
+			return list
+		}
+	}
+	if converted, err := subscription.ConvertShareLinksPayload(data); err == nil {
+		if doc, err := profile.UnmarshalYAMLMap(converted); err == nil {
+			return extractProxyMaps(doc["proxies"])
+		}
+	}
+	return nil
+}
+
+func extractProxyMaps(v any) []map[string]any {
+	switch typed := v.(type) {
+	case []map[string]any:
+		return typed
+	case []any:
+		var out []map[string]any
+		for _, item := range typed {
+			if m, ok := item.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func fetchLiveProviderProxies(apiPort int, secret string) map[string][]map[string]any {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/providers/proxies", apiPort), nil)
+	if err != nil {
+		return nil
+	}
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var payload struct {
+		Providers map[string]struct {
+			VehicleType string           `json:"vehicleType"`
+			Proxies     []map[string]any `json:"proxies"`
+		} `json:"providers"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if json.Unmarshal(body, &payload) != nil {
+		return nil
+	}
+	out := make(map[string][]map[string]any, len(payload.Providers))
+	for k, prov := range payload.Providers {
+		if k == "default" || strings.EqualFold(prov.VehicleType, "Compatible") || len(prov.Proxies) == 0 {
+			continue
+		}
+		out[k] = prov.Proxies
+	}
+	return out
 }
 
 func fetchProxyGroupsFromCore(
@@ -955,13 +1182,13 @@ func (e *Engine) SetEnhancedMode(ctx context.Context, enabled bool, allowUAC boo
 	}); err != nil {
 		return err
 	}
-	if _, err := e.applyAndSync(ctx, false, allowUAC); err != nil {
+	if _, err := e.applyAndSync(ctx, true, allowUAC); err != nil {
 		// Roll back EnhancedMode setting if UAC cancelled or TUN failed!
 		_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
 			s.EnhancedMode = prev
 			return nil
 		})
-		_, _ = e.applyAndSync(ctx, false, false)
+		_, _ = e.applyAndSync(ctx, true, false)
 		return err
 	}
 	return nil
@@ -1047,10 +1274,8 @@ func (e *Engine) RestoreAutoSelection(ctx context.Context, group string) error {
 			}
 		}
 	}
-	if _, err := e.applyAndSync(ctx, false, false); err != nil {
-		return err
-	}
-	e.closeAllConnections(ctx)
+	e.refreshLiveCoreMetadata(ctx)
+	e.notifyStateChanged()
 	return nil
 }
 
@@ -1105,20 +1330,69 @@ func (e *Engine) BenchmarkAll(ctx context.Context) error {
 		benchURL = "https://cp.cloudflare.com/generate_204"
 	}
 
+	e.refreshLiveCoreMetadata(ctx)
 	e.proxyGroupsMu.RLock()
+	groups := append([]ProxyGroupView(nil), e.proxyGroups...)
 	cands := append([]ailock.CandidateNode(nil), e.aiCandidates...)
 	e.proxyGroupsMu.RUnlock()
 
-	sem := make(chan struct{}, 5)
+	covered := map[string]bool{}
+	groupSem := make(chan struct{}, 6)
+	var groupWG sync.WaitGroup
+	var coveredMu sync.Mutex
+	for _, g := range groups {
+		if g.Name == "GLOBAL" && len(groups) > 1 {
+			continue
+		}
+		gURL := strings.TrimSpace(g.TestURL)
+		if gURL == "" {
+			gURL = benchURL
+		}
+		groupWG.Add(1)
+		go func(group ProxyGroupView, targetURL string) {
+			defer groupWG.Done()
+			groupSem <- struct{}{}
+			defer func() { <-groupSem }()
+			u := fmt.Sprintf("http://127.0.0.1:%d/group/%s/delay?url=%s&timeout=5000",
+				rt.APIPort, url.PathEscape(group.Name), url.QueryEscape(targetURL))
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+			if err != nil {
+				return
+			}
+			if rt.APISecret != "" {
+				req.Header.Set("Authorization", "Bearer "+rt.APISecret)
+			}
+			resp, doErr := (&http.Client{Timeout: 12 * time.Second}).Do(req)
+			if doErr != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				coveredMu.Lock()
+				for _, it := range group.Items {
+					covered[it.Name] = true
+				}
+				coveredMu.Unlock()
+			}
+		}(g, gURL)
+	}
+	groupWG.Wait()
+
+	// Probe any standalone/provider nodes that weren't already covered by a group batch test
+	sem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
 	for _, cand := range cands {
+		if covered[cand.Name] {
+			continue
+		}
 		wg.Add(1)
-		go func(nodeName string) {
+		go func(node ailock.CandidateNode) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			_, _ = features.ProbeSingleNode(ctx, rt.APIPort, rt.APISecret, nodeName, "", benchURL, 5000, "en")
-		}(cand.Name)
+			_, _ = features.ProbeSingleNode(ctx, rt.APIPort, rt.APISecret, node.Name, node.Provider, benchURL, 5000, "en")
+		}(cand)
 	}
 	wg.Wait()
 	e.refreshLiveCoreMetadata(ctx)
@@ -1282,11 +1556,16 @@ func (e *Engine) ImportURLScheme(ctx context.Context, rawURI string) (subscripti
 
 func (e *Engine) UpdateGeoDatabases(ctx context.Context) error {
 	settings := e.store.Settings()
-	if err := e.subMgr.UpdateExternalResource(ctx, settings.MMDBDownloadURL, "Country.mmdb", 1024); err != nil {
+	proxyPort := e.activeLocalProxyPort()
+	if err := e.subMgr.UpdateExternalResourceViaProxy(ctx, settings.MMDBDownloadURL, "Country.mmdb", 1024, proxyPort); err != nil {
 		return fmt.Errorf("update Country.mmdb: %w", err)
 	}
-	if err := e.subMgr.UpdateExternalResource(ctx, settings.GeoSiteDownloadURL, "geosite.dat", 1024); err != nil {
+	if err := e.subMgr.UpdateExternalResourceViaProxy(ctx, settings.GeoSiteDownloadURL, "geosite.dat", 1024, proxyPort); err != nil {
 		return fmt.Errorf("update geosite.dat: %w", err)
+	}
+	if e.IsCoreRunning() {
+		_, err := e.applyAndSync(ctx, true, false)
+		return err
 	}
 	return nil
 }
@@ -1299,7 +1578,14 @@ func (e *Engine) UpdateNodeServices(ctx context.Context, nextSettings *nodeservi
 		}
 	}
 	if len(ports) > 0 || len(enabled) > 0 {
-		if err := e.nodeStore.UpdateProfileBindings(prof, ports, enabled); err != nil {
+		rt := e.ctrl.LastState()
+		reserved := map[int]bool{7890: true}
+		for _, p := range []int{rt.MixedPort, rt.HTTPPort, rt.SocksPort, rt.APIPort, rt.DNSPort} {
+			if p > 0 {
+				reserved[p] = true
+			}
+		}
+		if err := e.nodeStore.UpdateProfileBindingsWithReserved(prof, ports, enabled, reserved); err != nil {
 			return err
 		}
 	}
@@ -1309,6 +1595,9 @@ func (e *Engine) UpdateNodeServices(ctx context.Context, nextSettings *nodeservi
 
 func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSettings) error {
 	cur := e.store.Settings()
+	if strings.TrimSpace(next.SelectedProfile) == "" {
+		next.SelectedProfile = cur.SelectedProfile
+	}
 	if cur.AILockEnabled {
 		next.AILockEnabled = cur.AILockEnabled
 		next.AILockTarget = cur.AILockTarget
@@ -1319,7 +1608,9 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 
 	if next.LaunchAtLogin != cur.LaunchAtLogin {
 		uiExe := filepath.Join(e.cfg.BinDir, "clashfx-ui.exe")
-		_ = SetLaunchAtLogin(next.LaunchAtLogin, uiExe)
+		if err := SetLaunchAtLogin(next.LaunchAtLogin, uiExe); err != nil {
+			return fmt.Errorf("update Launch at Login: %w", err)
+		}
 	}
 
 	if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
@@ -1865,8 +2156,13 @@ func (e *Engine) SetRuleDisabled(ctx context.Context, indices []int, disabled bo
 func (e *Engine) DiagnosticInfo() string {
 	rt := e.ctrl.LastState()
 	osState, _ := e.sysProxy.CurrentOSState()
+	e.opMu.Lock()
+	viaSvc := e.coreViaService
+	suspendedNet := e.suspendedByNet
+	e.opMu.Unlock()
+
 	var recentLogs []string
-	if e.coreViaService {
+	if viaSvc {
 		if resp, err := callService(2*time.Second, service.Request{Action: "status"}); err == nil && resp.Status != nil {
 			recentLogs = resp.Status.RecentLogs
 		}
@@ -1876,7 +2172,7 @@ func (e *Engine) DiagnosticInfo() string {
 	return features.BuildRedactedDiagnosticReport(features.DiagnosticBundleInput{
 		AppVersion:       AppVersion,
 		CoreRunning:      e.IsCoreRunning(),
-		CoreViaService:   e.coreViaService,
+		CoreViaService:   viaSvc,
 		ServiceInstalled: IsPrivilegedServiceInstalled(service.ServiceName),
 		MixedPort:        rt.MixedPort,
 		APIPort:          rt.APIPort,
@@ -1884,7 +2180,7 @@ func (e *Engine) DiagnosticInfo() string {
 		Settings:         e.store.Settings(),
 		SysProxyServer:   osState.ProxyServer,
 		SysProxyEnabled:  osState.ProxyEnable == 1,
-		SuspendedNet:     e.suspendedByNet,
+		SuspendedNet:     suspendedNet,
 		RecentCoreLogs:   recentLogs,
 	})
 }
@@ -1892,7 +2188,7 @@ func (e *Engine) DiagnosticInfo() string {
 func (e *Engine) CheckUpdates(ctx context.Context) (features.UpdateCheckResult, error) {
 	ch := e.store.Settings().UpdateChannel
 	apiURL := os.Getenv("CLASHFX_UPDATE_API_URL")
-	return features.CheckForUpdates(ctx, "v"+AppVersion, ch, apiURL)
+	return features.CheckForUpdatesWithProxy(ctx, "v"+AppVersion, ch, apiURL, e.activeLocalProxyPort())
 }
 
 func (e *Engine) notifyStateChanged() {

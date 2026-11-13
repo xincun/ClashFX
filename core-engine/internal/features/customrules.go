@@ -191,23 +191,43 @@ func parseMixinRuleLine(rawLine string) (MixinRuleItem, bool) {
 	}
 	tp := strings.ToUpper(strings.TrimSpace(parts[0]))
 	if tp == "MATCH" {
+		tgt := strings.TrimSpace(parts[1])
+		if strings.EqualFold(tgt, "@DEFAULT") {
+			tgt = profile.ProxyTargetPlaceholder
+		}
 		return MixinRuleItem{
 			Type:   "MATCH",
-			Target: strings.TrimSpace(parts[1]),
+			Target: tgt,
 		}, true
 	}
 	if len(parts) < 3 {
 		return MixinRuleItem{}, false
 	}
-	tgt := strings.TrimSpace(parts[2])
+	// Parse optional trailing parameters (e.g. "no-resolve", "src") from the right
+	// so regex rules containing commas like {1,3} preserve their full payload!
+	endIdx := len(parts) - 1
+	for endIdx >= 3 && isTrailingRuleOption(parts[endIdx]) {
+		endIdx--
+	}
+	tgt := strings.TrimSpace(parts[endIdx])
 	if strings.EqualFold(tgt, "@DEFAULT") {
 		tgt = profile.ProxyTargetPlaceholder
 	}
+	payload := strings.TrimSpace(strings.Join(parts[1:endIdx], ","))
 	return MixinRuleItem{
 		Type:    tp,
-		Payload: strings.TrimSpace(parts[1]),
+		Payload: payload,
 		Target:  tgt,
 	}, true
+}
+
+func isTrailingRuleOption(tok string) bool {
+	switch strings.ToLower(strings.TrimSpace(tok)) {
+	case "no-resolve", "src":
+		return true
+	default:
+		return false
+	}
 }
 
 func isCNGeositeDirect(line string) bool {

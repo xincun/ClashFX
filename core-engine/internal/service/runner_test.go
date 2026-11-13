@@ -27,6 +27,10 @@ func TestRunnerHelperProcess(t *testing.T) {
 	}
 	switch mode {
 	case "ok":
+		if sp := os.Getenv("SAFE_PATHS"); sp == "" {
+			fmt.Fprintln(os.Stderr, "SAFE_PATHS was not injected into child process")
+			os.Exit(3)
+		}
 		ctrlAddr := os.Getenv("CLASHFX_TEST_CTRL_ADDR")
 		if ctrlAddr != "" {
 			mux := http.NewServeMux()
@@ -91,6 +95,12 @@ func TestRunnerLifecycleAndValidation(t *testing.T) {
 	}
 	if resp := runner.Handle(Request{Action: "start_core", HomeDir: `\\evil\share`, ConfigFile: cfgPath}); resp.OK {
 		t.Fatal("expected UNC path to be rejected")
+	}
+	otherDir := t.TempDir()
+	outsideCfg := filepath.Join(otherDir, "outside.yaml")
+	_ = os.WriteFile(outsideCfg, []byte(cfgYAML), 0600)
+	if resp := runner.Handle(Request{Action: "start_core", HomeDir: homeDir, ConfigFile: outsideCfg}); resp.OK {
+		t.Fatal("expected config_file outside home_dir to be rejected")
 	}
 
 	// Startup failure surfaces stderr cleanly

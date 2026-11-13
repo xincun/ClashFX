@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const DefaultGitHubReleasesURL = "https://api.github.com/repos/yichengchen/clashX/releases"
+const DefaultGitHubReleasesURL = "https://api.github.com/repos/Clash-FX/ClashFX/releases"
 
 type UpdateCheckResult struct {
 	CurrentVersion  string `json:"current_version"`
@@ -39,6 +40,10 @@ type githubRelease struct {
 }
 
 func CheckForUpdates(ctx context.Context, currentVersion, channel, apiURL string) (UpdateCheckResult, error) {
+	return CheckForUpdatesWithProxy(ctx, currentVersion, channel, apiURL, 0)
+}
+
+func CheckForUpdatesWithProxy(ctx context.Context, currentVersion, channel, apiURL string, localProxyPort int) (UpdateCheckResult, error) {
 	channel = strings.ToLower(strings.TrimSpace(channel))
 	if channel != "lab" {
 		channel = "stable"
@@ -52,26 +57,20 @@ func CheckForUpdates(ctx context.Context, currentVersion, channel, apiURL string
 		Channel:        channel,
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	bodyBytes, statusCode, err := fetchReleasesFeed(ctx, apiURL, currentVersion, localProxyPort)
 	if err != nil {
 		return res, err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "ClashFX-Windows/"+currentVersion)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return res, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return res, fmt.Errorf("releases endpoint returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	if statusCode != http.StatusOK {
+		snippet := string(bodyBytes)
+		if len(snippet) > 2048 {
+			snippet = snippet[:2048]
+		}
+		return res, fmt.Errorf("releases endpoint returned HTTP %d: %s", statusCode, strings.TrimSpace(snippet))
 	}
 
 	var releases []githubRelease
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&releases); err != nil {
+	if err := json.Unmarshal(bodyBytes, &releases); err != nil {
 		return res, fmt.Errorf("parse releases feed: %w", err)
 	}
 
@@ -82,6 +81,9 @@ func CheckForUpdates(ctx context.Context, currentVersion, channel, apiURL string
 			continue
 		}
 		if channel == "stable" && rel.Prerelease {
+			continue
+		}
+		if !isWindowsCompatibleRelease(rel) {
 			continue
 		}
 		if chosen == nil || compareSemver(rel.TagName, chosen.TagName) > 0 {
@@ -101,7 +103,10 @@ func CheckForUpdates(ctx context.Context, currentVersion, channel, apiURL string
 	archTag := runtime.GOARCH // "arm64" or "amd64"
 	for _, asset := range chosen.Assets {
 		lower := strings.ToLower(asset.Name)
-		if !strings.HasSuffix(lower, ".exe") && !strings.HasSuffix(lower, ".zip") {
+		if strings.HasSuffix(lower, ".dsym.zip") || strings.HasSuffix(lower, ".dmg") {
+			continue
+		}
+		if !strings.HasSuffix(lower, ".exe") && !strings.HasSuffix(lower, ".msi") && !strings.HasSuffix(lower, ".zip") {
 			continue
 		}
 		if strings.Contains(lower, archTag) || (archTag == "amd64" && strings.Contains(lower, "x64")) {
@@ -110,6 +115,58 @@ func CheckForUpdates(ctx context.Context, currentVersion, channel, apiURL string
 		}
 	}
 	return res, nil
+}
+
+func fetchReleasesFeed(ctx context.Context, apiURL, currentVersion string, localProxyPort int) ([]byte, int, error) {
+	doOnce := func(proxyPort int, timeout time.Duration) ([]byte, int, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		if err != nil {
+			return nil, 0, err
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "ClashFX-Windows/"+currentVersion)
+
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		if proxyPort > 0 && proxyPort <= 65535 {
+			pURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
+			transport.Proxy = http.ProxyURL(pURL)
+		}
+		client := &http.Client{
+			Transport: transport,
+			Timeout:   timeout,
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer resp.Body.Close()
+		data, rErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		return data, resp.StatusCode, rErr
+	}
+
+	if localProxyPort > 0 {
+		if data, code, err := doOnce(localProxyPort, 10*time.Second); err == nil {
+			return data, code, nil
+		}
+	}
+	return doOnce(0, 10*time.Second)
+}
+
+func isWindowsCompatibleRelease(rel *githubRelease) bool {
+	if strings.Contains(strings.ToLower(rel.TagName), "win") {
+		return true
+	}
+	for _, asset := range rel.Assets {
+		lower := strings.ToLower(strings.TrimSpace(asset.Name))
+		if strings.HasSuffix(lower, ".dsym.zip") || strings.HasSuffix(lower, ".dmg") || strings.HasSuffix(lower, ".pkg") {
+			continue
+		}
+		if strings.HasSuffix(lower, ".exe") || strings.HasSuffix(lower, ".msi") ||
+			(strings.HasSuffix(lower, ".zip") && (strings.Contains(lower, "win") || strings.Contains(lower, "portable") || strings.Contains(lower, "amd64") || strings.Contains(lower, "arm64") || strings.Contains(lower, "x64"))) {
+			return true
+		}
+	}
+	return false
 }
 
 func compareSemver(a, b string) int {
@@ -141,8 +198,8 @@ func splitSemver(raw string) ([3]int, string) {
 	s = strings.TrimPrefix(s, "V")
 	var pre string
 	if idx := strings.IndexByte(s, '-'); idx >= 0 {
-		pre = s[idx+1:]
-		s = s[:idx]
+		pre = s[:idx]
+		pre, s = s[idx+1:], pre
 	}
 	parts := strings.Split(s, ".")
 	var nums [3]int

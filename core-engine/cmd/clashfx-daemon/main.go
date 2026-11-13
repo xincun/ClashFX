@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/clashfx/core-engine/internal/daemon"
 )
@@ -20,14 +23,20 @@ func main() {
 	}
 
 	var (
-		pipeEndpoint = flag.String("pipe", "", "Named Pipe or Unix socket endpoint override")
-		dataDir      = flag.String("data-dir", "", "Application data directory override")
-		binDir       = flag.String("bin-dir", "", "Trusted binary directory override")
-		resourceDir  = flag.String("resource-dir", "", "Bundled resources directory override")
-		dashboardDir = flag.String("dashboard-dir", "", "Bundled MetaCubeXD dashboard directory override")
-		mutexKey     = flag.String("mutex-key", "", "Single-instance mutex key override")
+		pipeEndpoint     = flag.String("pipe", "", "Named Pipe or Unix socket endpoint override")
+		dataDir          = flag.String("data-dir", "", "Application data directory override")
+		binDir           = flag.String("bin-dir", "", "Trusted binary directory override")
+		resourceDir      = flag.String("resource-dir", "", "Bundled resources directory override")
+		dashboardDir     = flag.String("dashboard-dir", "", "Bundled MetaCubeXD dashboard directory override")
+		mutexKey         = flag.String("mutex-key", "", "Single-instance mutex key override")
+		cleanupUninstall = flag.Bool("cleanup-uninstall", false, "Gracefully stop running daemon if active, force-restore OS proxy, and remove auto-start entry")
 	)
 	flag.Parse()
+
+	if *cleanupUninstall {
+		runUninstallCleanup(*pipeEndpoint, *dataDir)
+		return
+	}
 
 	exePath, err := os.Executable()
 	if err != nil {
@@ -83,4 +92,24 @@ func main() {
 	}()
 
 	srv.Wait()
+}
+
+func runUninstallCleanup(endpoint, dataDir string) {
+	if conn, err := daemon.DialIPC(endpoint); err == nil {
+		_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+		params, _ := json.Marshal(map[string]bool{"force_restore_proxy": true})
+		req, _ := json.Marshal(daemon.RPCRequest{
+			ID:     1,
+			Method: "quit_daemon",
+			Params: params,
+		})
+		req = append(req, '\n')
+		_, _ = conn.Write(req)
+		_, _ = bufio.NewReader(conn).ReadBytes('\n')
+		_ = conn.Close()
+		time.Sleep(300 * time.Millisecond)
+	}
+	if err := daemon.CleanupUninstallState(dataDir); err != nil {
+		fmt.Fprintf(os.Stderr, "[clashfx-daemon] uninstall cleanup warning: %v\n", err)
+	}
 }

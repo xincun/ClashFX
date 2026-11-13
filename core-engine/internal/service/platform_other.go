@@ -67,3 +67,7 @@ func Call(_ context.Context, _ Request) (Response, error) {
 func ListenSecurePipe() (net.Listener, error) {
 	return nil, errors.New("Windows service pipe is only supported on Windows")
 }
+
+func VerifyPipePeer(_ net.Conn, _ string) error {
+	return nil
+}

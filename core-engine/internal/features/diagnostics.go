@@ -14,11 +14,6 @@ import (
 	"github.com/clashfx/core-engine/internal/profile"
 )
 
-type ProbeErrorDetail struct {
-	Kind string `json:"kind"`
-	Code string `json:"code"`
-}
-
 type SingleNodeProbeReport struct {
 	NodeName     string `json:"node_name"`
 	ProviderName string `json:"provider_name,omitempty"`
@@ -27,6 +22,7 @@ type SingleNodeProbeReport struct {
 	DelayMs      int    `json:"delay_ms,omitempty"`
 	Kind         string `json:"kind,omitempty"`
 	Code         string `json:"code,omitempty"`
+	RawMessage   string `json:"raw_message,omitempty"`
 	SummaryZH    string `json:"summary_zh"`
 	SummaryEN    string `json:"summary_en"`
 	AdviceZH     string `json:"advice_zh,omitempty"`
@@ -35,8 +31,8 @@ type SingleNodeProbeReport struct {
 }
 
 // ProbeSingleNode executes a non-intrusive single-node benchmark probe against
-// Mihomo's delay endpoint (without changing any proxy group selection) and
-// decodes ClashFX's structured clashfx_probe_error classification.
+// stock Mihomo's delay endpoint (without changing any proxy group selection)
+// and classifies the returned error message into actionable guidance.
 func ProbeSingleNode(
 	ctx context.Context,
 	apiPort int,
@@ -124,27 +120,50 @@ func ProbeSingleNode(
 	}
 
 	var failPayload struct {
-		Message           string           `json:"message"`
-		ClashFXProbeError ProbeErrorDetail `json:"clashfx_probe_error"`
+		Message string `json:"message"`
 	}
 	_ = json.Unmarshal(body, &failPayload)
-	report.Kind = failPayload.ClashFXProbeError.Kind
-	report.Code = failPayload.ClashFXProbeError.Code
-	if report.Kind == "" {
-		report.Kind = "unknown"
+	rawMsg := strings.TrimSpace(failPayload.Message)
+	if rawMsg == "" {
+		rawMsg = strings.TrimSpace(string(body))
 	}
-	if report.Code == "" {
-		if resp.StatusCode == http.StatusGatewayTimeout {
-			report.Kind = "timeout"
-			report.Code = "probe_timeout"
-		} else {
-			report.Code = "probe_failed"
-		}
-	}
+	report.RawMessage = redactLogLine(rawMsg)
+	report.Kind, report.Code = classifyStockMihomoError(resp.StatusCode, rawMsg)
 
 	report.SummaryZH, report.AdviceZH, report.SummaryEN, report.AdviceEN = explainProbeCode(report.Code)
 	report.Formatted = formatSingleNodeReport(report, lang)
 	return report, nil
+}
+
+func classifyStockMihomoError(statusCode int, msg string) (kind, code string) {
+	lower := strings.ToLower(strings.TrimSpace(msg))
+	switch {
+	case strings.Contains(lower, "x509: certificate is valid for") || strings.Contains(lower, "hostname") || strings.Contains(lower, "doesn't match"):
+		return "tls", "tls_name_mismatch"
+	case strings.Contains(lower, "x509: certificate signed by unknown authority") || strings.Contains(lower, "unknown authority"):
+		return "tls", "tls_unknown_authority"
+	case strings.Contains(lower, "x509: certificate has expired") || strings.Contains(lower, "not yet valid"):
+		return "tls", "tls_expired"
+	case strings.Contains(lower, "tls") || strings.Contains(lower, "x509") || strings.Contains(lower, "remote error:"):
+		return "tls", "tls_failure"
+	case strings.Contains(lower, "no such host") || strings.Contains(lower, "nxdomain") || strings.Contains(lower, "server misbehaving") || strings.Contains(lower, "dns"):
+		if strings.Contains(lower, "timeout") || strings.Contains(lower, "i/o timeout") {
+			return "dns", "dns_timeout"
+		}
+		return "dns", "dns_resolution_failed"
+	case strings.Contains(lower, "quic") || strings.Contains(lower, "hysteria") || strings.Contains(lower, "tuic"):
+		return "quic", "quic_handshake_failed"
+	case strings.Contains(lower, "auth") || strings.Contains(lower, "password") || strings.Contains(lower, "407") || strings.Contains(lower, "invalid user"):
+		return "auth", "authentication_failed"
+	case strings.Contains(lower, "connection refused") || strings.Contains(lower, "actively refused") || strings.Contains(lower, "network is unreachable") || strings.Contains(lower, "no route to host"):
+		return "network", "dial_failed"
+	case strings.Contains(lower, "connection reset") || strings.Contains(lower, "forcibly closed") || strings.Contains(lower, "unexpected eof") || strings.Contains(lower, "eof"):
+		return "http", "http_request_failed"
+	case statusCode == http.StatusGatewayTimeout || strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded"):
+		return "timeout", "probe_timeout"
+	default:
+		return "probe", "probe_failed"
+	}
 }
 
 func explainProbeCode(code string) (sumZH, advZH, sumEN, advEN string) {
@@ -203,6 +222,9 @@ func formatSingleNodeReport(r SingleNodeProbeReport, lang string) string {
 		fmt.Fprintf(&b, "Result: %s\n", r.SummaryEN)
 		if !r.Healthy {
 			fmt.Fprintf(&b, "Classification: %s / %s\n", r.Kind, r.Code)
+			if r.RawMessage != "" {
+				fmt.Fprintf(&b, "Core Detail: %s\n", r.RawMessage)
+			}
 			if r.AdviceEN != "" {
 				fmt.Fprintf(&b, "Suggestion: %s\n", r.AdviceEN)
 			}
@@ -216,6 +238,9 @@ func formatSingleNodeReport(r SingleNodeProbeReport, lang string) string {
 		fmt.Fprintf(&b, "诊断结论: %s\n", r.SummaryZH)
 		if !r.Healthy {
 			fmt.Fprintf(&b, "错误分类: %s / %s\n", r.Kind, r.Code)
+			if r.RawMessage != "" {
+				fmt.Fprintf(&b, "内核返回: %s\n", r.RawMessage)
+			}
 			if r.AdviceZH != "" {
 				fmt.Fprintf(&b, "排查建议: %s\n", r.AdviceZH)
 			}

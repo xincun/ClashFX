@@ -8,6 +8,7 @@ import (
 	"net"
 	"os/user"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -20,11 +21,19 @@ import (
 const runRegistryKeyPath = `Software\Microsoft\Windows\CurrentVersion\Run`
 const runRegistryValueName = "ClashFX"
 
+type deviceNotifySubscribeParams struct {
+	callback uintptr
+	context  uintptr
+}
+
 var (
-	modshell32                                = windows.NewLazySystemDLL("shell32.dll")
-	procShellExecuteExW                       = modshell32.NewProc("ShellExecuteExW")
-	modpowrprof                               = windows.NewLazySystemDLL("powrprof.dll")
+	modshell32                                 = windows.NewLazySystemDLL("shell32.dll")
+	procShellExecuteExW                        = modshell32.NewProc("ShellExecuteExW")
+	modpowrprof                                = windows.NewLazySystemDLL("powrprof.dll")
 	procPowerRegisterSuspendResumeNotification = modpowrprof.NewProc("PowerRegisterSuspendResumeNotification")
+
+	powerNotifyMu   sync.Mutex
+	activePowerSubs = map[uintptr]*deviceNotifySubscribeParams{}
 )
 
 func DefaultEndpointName() string {
@@ -235,10 +244,6 @@ func StartPowerResumeMonitor(onWake func()) func() {
 	if err := procPowerRegisterSuspendResumeNotification.Find(); err != nil {
 		return func() {}
 	}
-	type deviceNotifySubscribeParams struct {
-		callback uintptr
-		context  uintptr
-	}
 	const (
 		deviceNotifyCallback = 2
 		pbtApmResumeAuto     = 0x0012
@@ -249,20 +254,32 @@ func StartPowerResumeMonitor(onWake func()) func() {
 		}
 		return 0
 	})
-	params := deviceNotifySubscribeParams{callback: cb}
+	// Pin params in activePowerSubs so Go GC never collects the struct referenced by powrprof.dll.
+	params := &deviceNotifySubscribeParams{callback: cb}
 	var regHandle uintptr
+	powerNotifyMu.Lock()
 	ret, _, _ := procPowerRegisterSuspendResumeNotification.Call(
 		deviceNotifyCallback,
-		uintptr(unsafe.Pointer(&params)),
+		uintptr(unsafe.Pointer(params)),
 		uintptr(unsafe.Pointer(&regHandle)),
 	)
-	if ret != 0 {
+	if ret != 0 || regHandle == 0 {
+		powerNotifyMu.Unlock()
 		return func() {}
 	}
+	activePowerSubs[regHandle] = params
+	powerNotifyMu.Unlock()
+
+	var once sync.Once
 	return func() {
-		unreg := modpowrprof.NewProc("PowerUnregisterSuspendResumeNotification")
-		if unreg.Find() == nil && regHandle != 0 {
-			_, _, _ = unreg.Call(regHandle)
-		}
+		once.Do(func() {
+			unreg := modpowrprof.NewProc("PowerUnregisterSuspendResumeNotification")
+			if unreg.Find() == nil && regHandle != 0 {
+				_, _, _ = unreg.Call(regHandle)
+			}
+			powerNotifyMu.Lock()
+			delete(activePowerSubs, regHandle)
+			powerNotifyMu.Unlock()
+		})
 	}
 }

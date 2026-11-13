@@ -217,6 +217,15 @@ func Apply(root map[string]any, target string, providers []ProviderSnapshot) App
 		}
 	}
 
+	effectiveRuleTarget := trimmed
+	if appliedRelay == "" && located != nil && located.providerName != "" {
+		effectiveRuleTarget = ensureProviderTargetResolvable(finalRoot, trimmed, located)
+	}
+	injected = Rules(effectiveRuleTarget)
+	if len(injected) == 0 {
+		return rejected("The locked proxy target is invalid.")
+	}
+
 	existingRules, _ := extractStringListStrict(finalRoot["rules"])
 
 	// Keep ClashFX's own internal executables ahead of PROCESS-PATH/DOMAIN rules so
@@ -277,6 +286,46 @@ func Apply(root map[string]any, target string, providers []ProviderSnapshot) App
 		ServerHost: serverHost,
 		RelayProxy: appliedRelay,
 	}
+}
+
+// ensureProviderTargetResolvable ensures a locked proxy that lives exclusively inside a
+// proxy-provider is resolvable by top-level Mihomo rules (which only look up inline proxies
+// and proxy-groups) when assignRelay did not lift it into root["proxies"].
+func ensureProviderTargetResolvable(root map[string]any, target string, loc *locatedProxy) string {
+	for _, px := range extractMapList(root["proxies"]) {
+		if n, _ := px["name"].(string); n == target {
+			return target
+		}
+	}
+	const hiddenWrapperName = "__clashfx_ai_lock_target__"
+	if !strings.Contains(target, "`") {
+		rawGroups := extractMapList(root["proxy-groups"])
+		outGroups := make([]any, 0, len(rawGroups)+1)
+		for _, g := range rawGroups {
+			if n, _ := g["name"].(string); n == hiddenWrapperName {
+				continue
+			}
+			outGroups = append(outGroups, g)
+		}
+		outGroups = append(outGroups, map[string]any{
+			"name":   hiddenWrapperName,
+			"type":   "select",
+			"hidden": true,
+			"use":    []any{loc.providerName},
+			"filter": "^" + regexp.QuoteMeta(target) + "$",
+		})
+		root["proxy-groups"] = outGroups
+		return hiddenWrapperName
+	}
+	copyPx := deepCopyMap(loc.proxy)
+	proxies := extractMapList(root["proxies"])
+	outProxies := make([]any, 0, len(proxies)+1)
+	for _, px := range proxies {
+		outProxies = append(outProxies, px)
+	}
+	outProxies = append(outProxies, copyPx)
+	root["proxies"] = outProxies
+	return target
 }
 
 // TransformHookForController returns a transaction.TransformHook-compatible closure.
@@ -976,6 +1025,9 @@ func assignRelay(root map[string]any, target string, loc *locatedProxy, relay st
 		return true
 	}
 	if loc == nil || loc.providerName == "" || strings.Contains(target, "`") {
+		return false
+	}
+	if srv, _ := loc.proxy["server"].(string); strings.TrimSpace(srv) == "" {
 		return false
 	}
 	proxies := extractMapList(root["proxies"])

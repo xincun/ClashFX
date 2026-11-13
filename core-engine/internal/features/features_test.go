@@ -18,6 +18,7 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 	baseMixin := []byte("ipv6: true\n")
 	builtYAML, err := BuildProfileMixinYAML(baseMixin, true, true, []MixinRuleItem{
 		{Type: "domain-suffix", Payload: "https://.scholar.org/papers?q=1", Target: "proxy"},
+		{Type: "domain-regex", Payload: `^api\d{1,3}\.scholar\.org$`, Target: "proxy"},
 		{Type: "ip-cidr", Payload: "10.99.0.5", Target: "DIRECT"},
 	})
 	if err != nil {
@@ -27,14 +28,17 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !parsedDoc.BypassCNWeb || !parsedDoc.BypassLAN || !parsedDoc.HasExtraKeys || len(parsedDoc.Rules) != 2 {
+	if !parsedDoc.BypassCNWeb || !parsedDoc.BypassLAN || !parsedDoc.HasExtraKeys || len(parsedDoc.Rules) != 3 {
 		t.Fatalf("unexpected parsed ProfileMixinDocument: %+v", parsedDoc)
 	}
 	if parsedDoc.Rules[0].Payload != "scholar.org" || parsedDoc.Rules[0].Target != "PROXY" {
 		t.Fatalf("expected cleaned domain + PROXY placeholder, got %+v", parsedDoc.Rules[0])
 	}
-	if parsedDoc.Rules[1].Payload != "10.99.0.5/32" {
-		t.Fatalf("expected /32 auto-mask on bare IPv4, got %+v", parsedDoc.Rules[1])
+	if parsedDoc.Rules[1].Payload != `^api\d{1,3}\.scholar\.org$` || parsedDoc.Rules[1].Target != "PROXY" {
+		t.Fatalf("expected comma-containing regex payload preserved intact, got %+v", parsedDoc.Rules[1])
+	}
+	if parsedDoc.Rules[2].Payload != "10.99.0.5/32" {
+		t.Fatalf("expected /32 auto-mask on bare IPv4, got %+v", parsedDoc.Rules[2])
 	}
 
 	root := map[string]any{
@@ -74,6 +78,7 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 		"RULE-SET,clashfx-ai-lock,REJECT",
 		"RULE-SET,clashfx-cn-apps-direct,DIRECT",
 		"DOMAIN-SUFFIX,scholar.org,JMS",
+		`DOMAIN-REGEX,^api\d{1,3}\.scholar\.org$,JMS`,
 		"IP-CIDR,10.99.0.5/32,DIRECT,no-resolve",
 		"GEOSITE,private,DIRECT",
 		"GEOIP,LAN,DIRECT,no-resolve",
@@ -94,15 +99,11 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 		t.Fatalf("expected inline rule-provider %s in root", profile.CNAppsRuleProviderName)
 	}
 
-	// 2. Single-node diagnostic decode of clashfx_probe_error
+	// 2. Single-node diagnostic classification from stock Mihomo error message
 	mockCore := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"message": "An error occurred in the delay test",
-			"clashfx_probe_error": map[string]string{
-				"kind": "tls",
-				"code": "tls_name_mismatch",
-			},
+			"message": "Get \"https://cp.cloudflare.com/generate_204\": x509: certificate is valid for wrong.example.com, not cp.cloudflare.com",
 		})
 	}))
 	defer mockCore.Close()
@@ -114,7 +115,7 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.Healthy || rep.Code != "tls_name_mismatch" || strings.Contains(rep.Formatted, "secret") {
+	if rep.Healthy || rep.Code != "tls_name_mismatch" || strings.Contains(rep.Formatted, "secret") || !strings.Contains(rep.Formatted, "x509:") {
 		t.Fatalf("unexpected diagnostic report: %+v", rep)
 	}
 
@@ -127,9 +128,18 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 		t.Fatalf("MatchSuspendNetwork = (%q, %v), want (10.211.55.1, true)", rule, ok)
 	}
 
-	// 4. Updater stable vs lab channel
+	// 4. Updater stable vs lab channel + ignores macOS-only DMG releases
 	relSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"tag_name":   "v9.9.9",
+				"prerelease": false,
+				"html_url":   "https://example.com/macos-only",
+				"assets": []map[string]string{
+					{"name": "ClashFX.dmg", "browser_download_url": "https://example.com/ClashFX.dmg"},
+					{"name": "ClashFX.app.dSYM.zip", "browser_download_url": "https://example.com/ClashFX.app.dSYM.zip"},
+				},
+			},
 			{
 				"tag_name":   "v2.1.0-beta.1",
 				"prerelease": true,
