@@ -427,6 +427,23 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			return errResp(err)
 		}
 		return okResp(s.engine.Snapshot())
+	case "update_custom_rules":
+		var p struct {
+			Rules []profile.CustomRule `json:"rules"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return errResp(err)
+		}
+		if err := s.engine.UpdateCustomRules(ctx, p.Rules); err != nil {
+			return errResp(err)
+		}
+		return okResp(s.engine.Snapshot())
+	case "get_effective_rules":
+		view, err := s.engine.GetEffectiveRules(ctx)
+		if err != nil {
+			return errResp(err)
+		}
+		return okResp(view)
 	case "get_diagnostic_info":
 		return okResp(map[string]string{"report": s.engine.DiagnosticInfo()})
 	case "check_updates":

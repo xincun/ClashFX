@@ -17,6 +17,7 @@ class DaemonClient;
 class HotkeyManager;
 class MultiNodeDialog;
 class NodeDiagnosticDialog;
+class RuleEditorDialog;
 class SettingsDialog;
 class SubscriptionsDialog;
 
@@ -36,6 +37,7 @@ public slots:
     void openConsole();
     void openAiLockDialog();
     void openMultiNodeDialog();
+    void openRuleEditorDialog();
     void openSubscriptionsDialog();
     void openDiagnosticsDialog(const QString& preselectNode = QString());
     void openSettingsDialog();
@@ -74,6 +76,7 @@ private:
 
     QPointer<AiLockDialog> aiLockDlg_;
     QPointer<MultiNodeDialog> multiNodeDlg_;
+    QPointer<RuleEditorDialog> rulesDlg_;
     QPointer<SubscriptionsDialog> subsDlg_;
     QPointer<NodeDiagnosticDialog> diagDlg_;
     QPointer<SettingsDialog> settingsDlg_;

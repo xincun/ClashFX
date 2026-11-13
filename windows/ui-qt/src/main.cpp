@@ -66,6 +66,7 @@ int main(int argc, char* argv[]) {
         } else if (a == QStringLiteral("--open-console") ||
                    a == QStringLiteral("--open-ai-lock") ||
                    a == QStringLiteral("--open-multi-node") ||
+                   a == QStringLiteral("--open-rules") ||
                    a == QStringLiteral("--open-subscriptions") ||
                    a == QStringLiteral("--open-diagnostics") ||
                    a == QStringLiteral("--open-settings") ||

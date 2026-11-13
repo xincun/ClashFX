@@ -55,6 +55,34 @@ type ProxyGroupView struct {
 	Items             []ProxyItemView `json:"items"`
 }
 
+type EffectiveRuleItem struct {
+	Index     int    `json:"index"`
+	Type      string `json:"type"`
+	Payload   string `json:"payload"`
+	Proxy     string `json:"proxy"`
+	Size      int    `json:"size"`
+	HitCount  uint64 `json:"hit_count"`
+	MissCount uint64 `json:"miss_count"`
+	Disabled  bool   `json:"disabled"`
+	Source    string `json:"source,omitempty"`
+}
+
+type RuleProviderView struct {
+	Name        string   `json:"name"`
+	Behavior    string   `json:"behavior"`
+	VehicleType string   `json:"vehicle_type"`
+	RuleCount   int      `json:"rule_count"`
+	Payload     []string `json:"payload,omitempty"`
+}
+
+type EffectiveRulesView struct {
+	OutboundMode  string                      `json:"outbound_mode"`
+	DefaultTarget string                      `json:"default_target"`
+	TotalRules    int                         `json:"total_rules"`
+	Rules         []EffectiveRuleItem         `json:"rules"`
+	RuleProviders map[string]RuleProviderView `json:"rule_providers"`
+}
+
 type DaemonSnapshot struct {
 	Version                string                             `json:"version"`
 	Arch                   string                             `json:"arch"`
@@ -69,6 +97,7 @@ type DaemonSnapshot struct {
 	ConfigDir              string                             `json:"config_dir"`
 	LogsDir                string                             `json:"logs_dir"`
 	ProxyGroups            []ProxyGroupView                   `json:"proxy_groups"`
+	DefaultRuleTarget      string                             `json:"default_rule_target,omitempty"`
 	AILockCandidates       []ailock.CandidateNode             `json:"ai_lock_candidates"`
 	AILockRelay            string                             `json:"ai_lock_relay,omitempty"`
 	Subscriptions          []subscription.ManagedSubscription `json:"subscriptions"`
@@ -90,16 +119,17 @@ type Engine struct {
 	localRunner  *service.Runner
 	coreHelper   subscription.BinaryCoreHelper
 
-	opMu            sync.Mutex
-	coreViaService  bool
-	allowPromptUAC  bool
-	suspendedByNet  string
-	lastApplyErr    string
-	proxyGroupsMu   sync.RWMutex
-	proxyGroups     []ProxyGroupView
-	aiCandidates    []ailock.CandidateNode
-	aiRelay         string
-	providerSubInfo *subscription.UserInfo
+	opMu              sync.Mutex
+	coreViaService    bool
+	allowPromptUAC    bool
+	suspendedByNet    string
+	lastApplyErr      string
+	proxyGroupsMu     sync.RWMutex
+	proxyGroups       []ProxyGroupView
+	defaultRuleTarget string
+	aiCandidates      []ailock.CandidateNode
+	aiRelay           string
+	providerSubInfo   *subscription.UserInfo
 
 	stopBgCh   chan struct{}
 	stopPower  func()
@@ -157,6 +187,7 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 		cfg.DashboardUIDir,
 		ailock.TransformHookForController(nil),
 		features.TransformHookForCNApps(),
+		features.TransformHookForCustomRules(store.ActiveConfigDir),
 		nodeStore.TransformHookForController(eng.IsCoreRunning),
 	)
 
@@ -648,6 +679,7 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 
 	e.proxyGroupsMu.RLock()
 	groups := append([]ProxyGroupView(nil), e.proxyGroups...)
+	defTarget := e.defaultRuleTarget
 	cands := append([]ailock.CandidateNode(nil), e.aiCandidates...)
 	relay := e.aiRelay
 	provSubInfo := e.providerSubInfo
@@ -685,6 +717,7 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 		ConfigDir:              e.store.ActiveConfigDir(),
 		LogsDir:                logsDir,
 		ProxyGroups:            groups,
+		DefaultRuleTarget:      defTarget,
 		AILockCandidates:       cands,
 		AILockRelay:            relay,
 		Subscriptions:          e.subMgr.List(),
@@ -718,8 +751,10 @@ func (e *Engine) refreshLiveCoreMetadata(ctx context.Context) {
 	}
 	var cands []ailock.CandidateNode
 	var relay string
+	defTarget := "DIRECT"
 	if rawRoot != nil {
 		cands = ailock.ListCandidateTargets(rawRoot, nil)
+		defTarget = features.ResolveDefaultRuleTarget(rawRoot)
 		if settings.AILockEnabled {
 			relay = ailock.RelayName(rawRoot, settings.AILockTarget, nil)
 		}
@@ -734,6 +769,7 @@ func (e *Engine) refreshLiveCoreMetadata(ctx context.Context) {
 
 	e.proxyGroupsMu.Lock()
 	e.proxyGroups = groups
+	e.defaultRuleTarget = defTarget
 	e.aiCandidates = cands
 	e.aiRelay = relay
 	e.providerSubInfo = provInfo
@@ -1276,6 +1312,7 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 		ailock.EnforceProtectedSettings(&next)
 	}
 	next.AILockSavedState = cur.AILockSavedState
+	next.CustomRules = cur.CustomRules
 	next.SavedSelections = cur.SavedSelections
 
 	if next.LaunchAtLogin != cur.LaunchAtLogin {
@@ -1298,6 +1335,234 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 
 	_, err := e.applyAndSync(ctx, false, true)
 	return err
+}
+
+func (e *Engine) UpdateCustomRules(ctx context.Context, rules []profile.CustomRule) error {
+	normalized, err := features.NormalizeAndValidateCustomRules(rules)
+	if err != nil {
+		return err
+	}
+	prev := e.store.Settings().CustomRules
+	if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.CustomRules = normalized
+		return nil
+	}); err != nil {
+		return err
+	}
+	if _, err := e.applyAndSync(ctx, false, false); err != nil {
+		_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
+			s.CustomRules = prev
+			return nil
+		})
+		_, _ = e.applyAndSync(ctx, false, false)
+		return err
+	}
+	e.closeAllConnections(ctx)
+	return nil
+}
+
+func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, error) {
+	settings := e.store.Settings()
+	rt := e.ctrl.LastState()
+
+	var rawRoot map[string]any
+	if data, err := os.ReadFile(e.ctrl.RuntimeConfigPath()); err == nil {
+		rawRoot, _ = profile.UnmarshalYAMLMap(data)
+	}
+	if rawRoot == nil {
+		if data, err := os.ReadFile(e.store.ProfilePath(settings.SelectedProfile)); err == nil {
+			rawRoot, _ = profile.UnmarshalYAMLMap(data)
+		}
+	}
+
+	defTarget := "DIRECT"
+	if rawRoot != nil {
+		defTarget = features.ResolveDefaultRuleTarget(rawRoot)
+	}
+
+	normRuleKey := func(tp, payload, proxy string) string {
+		cleanType := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(tp)), "-", "")
+		return cleanType + "|" + strings.TrimSpace(payload) + "|" + strings.TrimSpace(proxy)
+	}
+	customKeys := make(map[string]bool, len(settings.CustomRules))
+	for _, cr := range settings.CustomRules {
+		if !cr.Enabled {
+			continue
+		}
+		tgt := strings.TrimSpace(cr.Target)
+		if strings.EqualFold(tgt, profile.DefaultProxyTargetToken) {
+			tgt = defTarget
+		}
+		customKeys[normRuleKey(cr.Type, cr.Payload, tgt)] = true
+	}
+
+	classifySource := func(tp, payload, proxy string) string {
+		switch strings.TrimSpace(payload) {
+		case profile.InternalDirectRuleProviderName:
+			return "system"
+		case profile.AILockRuleProviderName:
+			return "ai_lock"
+		case profile.CNAppsRuleProviderName:
+			return "cn_apps"
+		}
+		if customKeys[normRuleKey(tp, payload, proxy)] {
+			return "custom"
+		}
+		return "profile"
+	}
+
+	out := EffectiveRulesView{
+		OutboundMode:  settings.OutboundMode,
+		DefaultTarget: defTarget,
+		RuleProviders: map[string]RuleProviderView{},
+	}
+
+	// Seed inline rule-providers from runtime YAML as fallback
+	if rawRoot != nil {
+		if rpMap, ok := rawRoot["rule-providers"].(map[string]any); ok {
+			for name, rawDef := range rpMap {
+				dm, ok := rawDef.(map[string]any)
+				if !ok {
+					continue
+				}
+				pList := profile.ExtractStringRules(dm["payload"])
+				vType, _ := dm["type"].(string)
+				beh, _ := dm["behavior"].(string)
+				out.RuleProviders[name] = RuleProviderView{
+					Name:        name,
+					Behavior:    beh,
+					VehicleType: vType,
+					RuleCount:   len(pList),
+					Payload:     pList,
+				}
+			}
+		}
+	}
+
+	if rt.APIPort > 0 && e.IsCoreRunning() {
+		client := &http.Client{Timeout: 3 * time.Second}
+		doGet := func(path string) ([]byte, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", rt.APIPort, path), nil)
+			if err != nil {
+				return nil, err
+			}
+			if rt.APISecret != "" {
+				req.Header.Set("Authorization", "Bearer "+rt.APISecret)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+			}
+			return io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		}
+
+		if provBody, err := doGet("/providers/rules"); err == nil {
+			var provDoc struct {
+				Providers map[string]struct {
+					Name        string   `json:"name"`
+					Behavior    string   `json:"behavior"`
+					VehicleType string   `json:"vehicleType"`
+					RuleCount   int      `json:"ruleCount"`
+					Payload     []string `json:"payload"`
+				} `json:"providers"`
+			}
+			if json.Unmarshal(provBody, &provDoc) == nil {
+				for k, p := range provDoc.Providers {
+					payload := p.Payload
+					if len(payload) == 0 {
+						payload = out.RuleProviders[k].Payload
+					}
+					out.RuleProviders[k] = RuleProviderView{
+						Name:        k,
+						Behavior:    p.Behavior,
+						VehicleType: p.VehicleType,
+						RuleCount:   p.RuleCount,
+						Payload:     payload,
+					}
+				}
+			}
+		}
+
+		if rulesBody, err := doGet("/rules"); err == nil {
+			var rulesDoc struct {
+				Rules []struct {
+					Index   int    `json:"index"`
+					Type    string `json:"type"`
+					Payload string `json:"payload"`
+					Proxy   string `json:"proxy"`
+					Size    int    `json:"size"`
+					Extra   *struct {
+						Disabled  bool   `json:"disabled"`
+						HitCount  uint64 `json:"hitCount"`
+						MissCount uint64 `json:"missCount"`
+					} `json:"extra"`
+				} `json:"rules"`
+			}
+			if json.Unmarshal(rulesBody, &rulesDoc) == nil {
+				out.Rules = make([]EffectiveRuleItem, 0, len(rulesDoc.Rules))
+				for _, r := range rulesDoc.Rules {
+					sz := r.Size
+					if sz < 0 {
+						if rp, ok := out.RuleProviders[r.Payload]; ok {
+							sz = rp.RuleCount
+						}
+					}
+					item := EffectiveRuleItem{
+						Index:   r.Index,
+						Type:    r.Type,
+						Payload: r.Payload,
+						Proxy:   r.Proxy,
+						Size:    sz,
+						Source:  classifySource(r.Type, r.Payload, r.Proxy),
+					}
+					if r.Extra != nil {
+						item.Disabled = r.Extra.Disabled
+						item.HitCount = r.Extra.HitCount
+						item.MissCount = r.Extra.MissCount
+					}
+					out.Rules = append(out.Rules, item)
+				}
+				out.TotalRules = len(out.Rules)
+				return out, nil
+			}
+		}
+	}
+
+	// Offline fallback: parse rules list from runtime/profile YAML
+	if rawRoot != nil {
+		lines := profile.ExtractStringRules(rawRoot["rules"])
+		out.Rules = make([]EffectiveRuleItem, 0, len(lines))
+		for idx, line := range lines {
+			parts := strings.SplitN(strings.TrimSpace(line), ",", 4)
+			var tp, payload, proxy string
+			if len(parts) >= 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "MATCH") {
+				tp = "MATCH"
+				proxy = strings.TrimSpace(parts[1])
+			} else if len(parts) >= 3 {
+				tp = strings.TrimSpace(parts[0])
+				payload = strings.TrimSpace(parts[1])
+				proxy = strings.TrimSpace(parts[2])
+			}
+			sz := -1
+			if rp, ok := out.RuleProviders[payload]; ok {
+				sz = rp.RuleCount
+			}
+			out.Rules = append(out.Rules, EffectiveRuleItem{
+				Index:   idx,
+				Type:    tp,
+				Payload: payload,
+				Proxy:   proxy,
+				Size:    sz,
+				Source:  classifySource(tp, payload, proxy),
+			})
+		}
+		out.TotalRules = len(out.Rules)
+	}
+	return out, nil
 }
 
 func (e *Engine) DiagnosticInfo() string {

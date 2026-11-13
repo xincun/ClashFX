@@ -46,7 +46,12 @@ rules:
 	}))
 	defer subSrv.Close()
 
-	endpoint := filepath.Join(t.TempDir(), "daemon-test.sock")
+	sockDir, err := os.MkdirTemp("", "cfx-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+	endpoint := filepath.Join(sockDir, "d.sock")
 	if runtime.GOOS == "windows" {
 		endpoint = fmt.Sprintf(`\\.\pipe\ClashFXDaemonTest-%d`, time.Now().UnixNano())
 	}
@@ -171,6 +176,36 @@ rules:
 	bundleStr := fmt.Sprint(diagBundle.Data)
 	if !strings.Contains(bundleStr, "ClashFX Windows Diagnostic Report") {
 		t.Fatalf("unexpected diagnostic bundle: %s", bundleStr)
+	}
+
+	// 6. Custom rules update + live effective rules inspection via Mihomo REST API
+	updRulesResp := callRPC(6, "update_custom_rules", map[string]any{
+		"rules": []map[string]any{
+			{
+				"enabled":  true,
+				"type":     "DOMAIN-SUFFIX",
+				"payload":  "scholar.google.com",
+				"target":   "@DEFAULT",
+				"position": "prepend",
+				"note":     "academic",
+			},
+		},
+	})
+	if !updRulesResp.OK {
+		t.Fatalf("update_custom_rules failed: %s", updRulesResp.Error)
+	}
+	effResp := callRPC(7, "get_effective_rules", nil)
+	if !effResp.OK {
+		t.Fatalf("get_effective_rules failed: %s", effResp.Error)
+	}
+	rawEff, _ := json.Marshal(effResp.Data)
+	var effView EffectiveRulesView
+	_ = json.Unmarshal(rawEff, &effView)
+	if effView.DefaultTarget != "Proxy" || len(effView.Rules) != 2 {
+		t.Fatalf("unexpected effective rules view: %+v", effView)
+	}
+	if effView.Rules[0].Payload != "scholar.google.com" || effView.Rules[0].Proxy != "Proxy" || effView.Rules[0].Source != "custom" {
+		t.Fatalf("expected custom rule #0 -> Proxy, got %+v", effView.Rules[0])
 	}
 }
 

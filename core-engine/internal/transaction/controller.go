@@ -384,11 +384,14 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 			}
 		}
 		root["tun"] = tunMap
-		// Prevent proxy loops from core/daemon executables under Windows TUN
+		// Prevent proxy loops from core/daemon executables under Windows TUN via inline rule-set
+		profile.SetInlineClassicalRuleProvider(root, profile.InternalDirectRuleProviderName, []string{
+			"PROCESS-NAME,mihomo_core.exe",
+			"PROCESS-NAME,clashfx-daemon.exe",
+			"PROCESS-NAME,clashfx-service.exe",
+		})
 		PrependUniqueRules(root, []string{
-			"PROCESS-NAME,mihomo_core.exe,DIRECT",
-			"PROCESS-NAME,clashfx-daemon.exe,DIRECT",
-			"PROCESS-NAME,clashfx-service.exe,DIRECT",
+			"RULE-SET," + profile.InternalDirectRuleProviderName + ",DIRECT",
 		})
 	} else {
 		root["tun"] = map[string]any{"enable": false}

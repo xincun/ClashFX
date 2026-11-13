@@ -4,6 +4,7 @@
 #include "DaemonClient.h"
 #include "HotkeyManager.h"
 #include "I18n.h"
+#include "RuleEditorDialog.h"
 #include "SubscriptionsAndSettingsDialogs.h"
 #include "TrayIconGenerator.h"
 
@@ -121,6 +122,7 @@ TrayController::TrayController(DaemonClient* client,
 
     connect(consoleWindow_, &ConsoleWindow::openAiLockRequested, this, &TrayController::openAiLockDialog);
     connect(consoleWindow_, &ConsoleWindow::openMultiNodeRequested, this, &TrayController::openMultiNodeDialog);
+    connect(consoleWindow_, &ConsoleWindow::openRulesRequested, this, &TrayController::openRuleEditorDialog);
     connect(consoleWindow_, &ConsoleWindow::openSubscriptionsRequested, this, &TrayController::openSubscriptionsDialog);
     connect(consoleWindow_, &ConsoleWindow::openDiagnosticsRequested, this, [this]() { openDiagnosticsDialog(); });
     connect(consoleWindow_, &ConsoleWindow::openSettingsRequested, this, &TrayController::openSettingsDialog);
@@ -181,6 +183,8 @@ void TrayController::handleExternalCommand(const QString& message) {
         openAiLockDialog();
     } else if (message == QStringLiteral("CMD:--open-multi-node")) {
         openMultiNodeDialog();
+    } else if (message == QStringLiteral("CMD:--open-rules")) {
+        openRuleEditorDialog();
     } else if (message == QStringLiteral("CMD:--open-subscriptions")) {
         openSubscriptionsDialog();
     } else if (message == QStringLiteral("CMD:--open-diagnostics")) {
@@ -292,6 +296,7 @@ QByteArray TrayController::buildMenuSignature() const {
     sig.insert(QStringLiteral("profiles"), snapshot_.value(QStringLiteral("profiles")));
     sig.insert(QStringLiteral("groups"), snapshot_.value(QStringLiteral("proxy_groups")));
     sig.insert(QStringLiteral("sub_info"), snapshot_.value(QStringLiteral("active_subscription_info")));
+    sig.insert(QStringLiteral("custom_rules"), settings.value(QStringLiteral("custom_rules")));
     return QJsonDocument(sig).toJson(QJsonDocument::Compact);
 }
 
@@ -583,6 +588,17 @@ void TrayController::rebuildMenuContents() {
     }
     trayMenu_->addAction(aiMenuTitle, this, &TrayController::openAiLockDialog);
     trayMenu_->addAction(L("多节点固定端口代理…", "Multiple Node Proxies…"), this, &TrayController::openMultiNodeDialog);
+    int enabledCustomCount = 0;
+    for (const QJsonValue& rv : settings.value(QStringLiteral("custom_rules")).toArray()) {
+        if (rv.toObject().value(QStringLiteral("enabled")).toBool(false)) {
+            ++enabledCustomCount;
+        }
+    }
+    QString rulesMenuTitle = L("分流规则编辑器…", "Routing Rules Editor…");
+    if (enabledCustomCount > 0) {
+        rulesMenuTitle += L("  [%1 条自定义]", "  [%1 Custom]").arg(enabledCustomCount);
+    }
+    trayMenu_->addAction(rulesMenuTitle, this, &TrayController::openRuleEditorDialog);
 
     trayMenu_->addSeparator();
 
@@ -622,6 +638,7 @@ void TrayController::rebuildMenuContents() {
                 err);
         });
     });
+    cfgMenu->addAction(L("分流规则编辑器…", "Routing Rules Editor…"), this, &TrayController::openRuleEditorDialog);
     cfgMenu->addAction(L("编辑 Profile Mixin…", "Edit Profile Mixin…"), this, [this]() {
         client_->call(QStringLiteral("ensure_profile_mixin"), QJsonObject(), [](bool ok, const QJsonValue& data, const QString&, const QString&) {
             if (ok && data.isObject()) {
@@ -860,6 +877,16 @@ void TrayController::openMultiNodeDialog() {
     multiNodeDlg_->show();
     multiNodeDlg_->raise();
     multiNodeDlg_->activateWindow();
+}
+
+void TrayController::openRuleEditorDialog() {
+    if (!rulesDlg_) {
+        rulesDlg_ = new RuleEditorDialog(client_, consoleWindow_);
+        rulesDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
+    }
+    rulesDlg_->show();
+    rulesDlg_->raise();
+    rulesDlg_->activateWindow();
 }
 
 void TrayController::openSubscriptionsDialog() {

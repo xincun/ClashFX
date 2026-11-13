@@ -51,6 +51,8 @@ set(CLASHFX_UI_SOURCES
     src/ConsoleWindow.cpp
     src/AiLockAndNodeDialogs.h
     src/AiLockAndNodeDialogs.cpp
+    src/RuleEditorDialog.h
+    src/RuleEditorDialog.cpp
     src/SubscriptionsAndSettingsDialogs.h
     src/SubscriptionsAndSettingsDialogs.cpp
     src/TrayController.h

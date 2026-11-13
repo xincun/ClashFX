@@ -8,9 +8,12 @@ import (
 )
 
 const (
-	ProfileMixinDotFile   = ".profile_mixin.yaml"
-	ProfileMixinNamedFile = "Profile Mixin.yaml"
-	RecoverySelectionsKey = "x-clashfx-recovery-selections"
+	ProfileMixinDotFile            = ".profile_mixin.yaml"
+	ProfileMixinNamedFile          = "Profile Mixin.yaml"
+	RecoverySelectionsKey          = "x-clashfx-recovery-selections"
+	InternalDirectRuleProviderName = "clashfx-internal-direct"
+	AILockRuleProviderName         = "clashfx-ai-lock"
+	CNAppsRuleProviderName         = "clashfx-cn-apps-direct"
 )
 
 const DefaultProfileMixinTemplate = `# Profile Mixin is merged into the selected profile at runtime.
@@ -135,6 +138,53 @@ func takeProfileRuleDirectives(root map[string]any) (prepend []string, appendRul
 		root["profile"] = prof
 	}
 	return prepend, appendRules
+}
+
+func ExtractStringRules(v any) []string {
+	return extractStringRules(v)
+}
+
+func SetInlineClassicalRuleProvider(root map[string]any, name string, payload []string) {
+	rpMap, ok := root["rule-providers"].(map[string]any)
+	if !ok || rpMap == nil {
+		if norm, normOK := NormalizeYAMLValue(root["rule-providers"]).(map[string]any); normOK && norm != nil {
+			rpMap = norm
+		} else {
+			rpMap = map[string]any{}
+		}
+	}
+	rpMap[name] = map[string]any{
+		"type":     "inline",
+		"behavior": "classical",
+		"payload":  append([]string(nil), payload...),
+	}
+	root["rule-providers"] = rpMap
+}
+
+// SystemGuardPrefixCount returns how many leading top-level rules belong to
+// ClashFX's system guards (internal core loop bypass + AI Proxy Lock).
+func SystemGuardPrefixCount(rules []string) int {
+	idx := 0
+	for idx < len(rules) {
+		trimmed := strings.TrimSpace(rules[idx])
+		if trimmed == "RULE-SET,"+InternalDirectRuleProviderName+",DIRECT" ||
+			strings.HasPrefix(trimmed, "RULE-SET,"+AILockRuleProviderName+",") ||
+			trimmed == "PROCESS-NAME,mihomo_core.exe,DIRECT" ||
+			trimmed == "PROCESS-NAME,clashfx-daemon.exe,DIRECT" ||
+			trimmed == "PROCESS-NAME,clashfx-service.exe,DIRECT" {
+			idx++
+			continue
+		}
+		if idx+1 < len(rules) {
+			comma := strings.LastIndex(trimmed, ",")
+			if comma > 0 && strings.TrimSpace(rules[idx+1]) == trimmed[:comma]+",REJECT" {
+				idx += 2
+				continue
+			}
+		}
+		break
+	}
+	return idx
 }
 
 func extractStringRules(v any) []string {

@@ -24,20 +24,13 @@ import (
 )
 
 func TestWindowsProcessAndPathMatchersAndDependencySafety(t *testing.T) {
-	var nameRegexes, pathRegexes []*regexp.Regexp
-	for _, pat := range append([]string{ProcessNamePrimaryPattern}, AdditionalProcessPatterns...) {
-		re, err := regexp.Compile(pat)
-		if err != nil {
-			t.Fatalf("compile process name regex %q: %v", pat, err)
-		}
-		nameRegexes = append(nameRegexes, re)
+	nameRe, err := regexp.Compile(ProcessNamePattern)
+	if err != nil {
+		t.Fatalf("compile process name regex %q: %v", ProcessNamePattern, err)
 	}
-	for _, pat := range ProcessPathPatterns {
-		re, err := regexp.Compile(pat)
-		if err != nil {
-			t.Fatalf("compile process path regex %q: %v", pat, err)
-		}
-		pathRegexes = append(pathRegexes, re)
+	pathRe, err := regexp.Compile(WindowsProcessPathPattern)
+	if err != nil {
+		t.Fatalf("compile process path regex %q: %v", WindowsProcessPathPattern, err)
 	}
 
 	mustMatchName := []string{
@@ -46,22 +39,13 @@ func TestWindowsProcessAndPathMatchersAndDependencySafety(t *testing.T) {
 		"Antigravity.exe", "antigravity-cli.exe", "agy.exe",
 	}
 	for _, exe := range mustMatchName {
-		matched := false
-		for _, re := range nameRegexes {
-			if re.MatchString(exe) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			t.Fatalf("expected Windows/macOS AI executable %q to match PROCESS-NAME-REGEX", exe)
+		if !nameRe.MatchString(exe) {
+			t.Fatalf("expected AI executable %q to match PROCESS-NAME-REGEX", exe)
 		}
 	}
-	for _, nonAI := range []string{"chrome.exe", "explorer.exe", "mihomo_core.exe", "powershell.exe"} {
-		for _, re := range nameRegexes {
-			if re.MatchString(nonAI) {
-				t.Fatalf("non-AI executable %q unexpectedly matched %s", nonAI, re.String())
-			}
+	for _, nonAI := range []string{"chrome.exe", "explorer.exe", "mihomo_core.exe", "powershell.exe", "node.exe"} {
+		if nameRe.MatchString(nonAI) {
+			t.Fatalf("non-AI executable %q unexpectedly matched %s", nonAI, nameRe.String())
 		}
 	}
 
@@ -69,27 +53,28 @@ func TestWindowsProcessAndPathMatchersAndDependencySafety(t *testing.T) {
 		`C:\Users\devtest\AppData\Local\Programs\Claude\Claude.exe`,
 		`C:\Users\devtest\AppData\Local\AnthropicClaude\app-0.8.1\claude.exe`,
 		`C:\Program Files\Antigravity\Antigravity.exe`,
+		`C:\Program Files (x86)\Codex\Codex.exe`,
 		`C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2025_arm64__2p2nqsd0c76g0\app\ChatGPT.exe`,
-		`C:\Users\devtest\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js`,
-		`C:\Users\devtest\AppData\Roaming\npm\codex.cmd`,
 		`C:\Users\devtest\.local\bin\claude.exe`,
+		`C:\Users\devtest\.local\share\claude\versions\2.1.0\claude.exe`,
 		`C:\Users\devtest\.gemini\antigravity-cli\bin\agy.exe`,
-		`/Applications/Claude.app/Contents/MacOS/Claude`,
+		`C:\Users\devtest\.antigravity\bin\antigravity.exe`,
 	}
 	for _, p := range mustMatchPath {
-		matched := false
-		for _, re := range pathRegexes {
-			if re.MatchString(p) {
-				matched = true
-				break
-			}
+		if !pathRe.MatchString(p) {
+			t.Fatalf("expected Windows AI install path %q to match PROCESS-PATH-REGEX", p)
 		}
-		if !matched {
-			t.Fatalf("expected AI install path %q to match PROCESS-PATH-REGEX", p)
+	}
+	for _, nonMatchPath := range []string{
+		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+		`/Applications/Claude.app/Contents/MacOS/Claude`,
+	} {
+		if pathRe.MatchString(nonMatchPath) {
+			t.Fatalf("unexpected match for non-Windows/non-AI path %q", nonMatchPath)
 		}
 	}
 
-	// Verify safe relay assignment vs cycle avoidance + concrete node filtering
+	// Verify safe relay assignment vs cycle avoidance + concrete node filtering + inline rule-provider
 	root := map[string]any{
 		"proxies": []any{
 			map[string]any{"name": "GeneralHK", "type": "socks5", "server": "127.0.0.1", "port": 1081},
@@ -99,7 +84,7 @@ func TestWindowsProcessAndPathMatchersAndDependencySafety(t *testing.T) {
 			map[string]any{"name": "Proxy", "type": "select", "proxies": []any{"GeneralHK"}},
 		},
 		"rules": []any{
-			"PROCESS-NAME,mihomo_core.exe,DIRECT",
+			"RULE-SET,clashfx-internal-direct,DIRECT",
 			"MATCH,Proxy",
 		},
 	}
@@ -120,11 +105,28 @@ func TestWindowsProcessAndPathMatchersAndDependencySafety(t *testing.T) {
 		t.Fatalf("unexpected Apply outcome: %+v", out)
 	}
 	rules, _ := extractStringListStrict(root["rules"])
-	if len(rules) < 5 || rules[0] != "PROCESS-NAME,mihomo_core.exe,DIRECT" {
-		t.Fatalf("expected internal core bypass rule to remain first, got %v", rules[:3])
+	wantRules := []string{
+		"RULE-SET,clashfx-internal-direct,DIRECT",
+		"RULE-SET,clashfx-ai-lock,DedicatedUS",
+		"RULE-SET,clashfx-ai-lock,REJECT",
+		"MATCH,Proxy",
 	}
-	if !strings.HasSuffix(rules[2], ",REJECT") {
-		t.Fatalf("expected fail-closed REJECT rule pair at index 2, got %q", rules[2])
+	if len(rules) != len(wantRules) {
+		t.Fatalf("rules = %v, want %v", rules, wantRules)
+	}
+	for i := range wantRules {
+		if rules[i] != wantRules[i] {
+			t.Fatalf("rules[%d] = %q, want %q", i, rules[i], wantRules[i])
+		}
+	}
+	rpMap, _ := toStringMap(root["rule-providers"])
+	aiProv, _ := toStringMap(rpMap[InlineRuleProviderName])
+	if aiProv["type"] != "inline" || aiProv["behavior"] != "classical" {
+		t.Fatalf("unexpected inline rule-provider: %+v", aiProv)
+	}
+	payload, _ := aiProv["payload"].([]string)
+	if len(payload) != 2+len(ProtectedDomains)+len(ProtectedExactDomains) {
+		t.Fatalf("payload len = %d, want %d", len(payload), 2+len(ProtectedDomains)+len(ProtectedExactDomains))
 	}
 
 	// GeneralHK IS inside Proxy -> relay must NOT be assigned (would create dialer cycle!)

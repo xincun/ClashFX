@@ -10,21 +10,14 @@ import (
 	"github.com/clashfx/core-engine/internal/profile"
 )
 
-const ProcessNamePrimaryPattern = `(?i)^claude( helper.*)?(\.exe)?$`
+const (
+	InlineRuleProviderName         = "clashfx-ai-lock"
+	InternalDirectRuleProviderName = "clashfx-internal-direct"
+)
 
-var AdditionalProcessPatterns = []string{
-	`(?i)^(claude|codex|codex-app-server|chatgpt|antigravity|antigravity-cli|agy)( helper.*)?(\.exe)?$`,
-}
+const ProcessNamePattern = `(?i)^(claude|codex|codex-app-server|chatgpt|antigravity|antigravity-cli|agy)( helper.*)?(\.exe)?$`
 
-var ProcessPathPatterns = []string{
-	`(?i)(^|[\\/])(Claude|Codex|CodexCLI|ChatGPT|Antigravity)\.app[\\/]Contents[\\/].*$`,
-	`(?i)[\\/](Programs|Program Files( \(x86\))?)[\\/](Claude|AnthropicClaude|Codex|ChatGPT|Antigravity)[\\/].*$`,
-	`(?i)[\\/]AppData[\\/]Local[\\/]AnthropicClaude[\\/].*$`,
-	`(?i)[\\/]WindowsApps[\\/][^\\/]*(Claude|Anthropic|OpenAI|ChatGPT|Codex|Antigravity)[^\\/]*[\\/].*$`,
-	`(?i)[\\/]AppData[\\/]Roaming[\\/]npm[\\/](node_modules[\\/])?(@anthropic-ai[\\/]|@openai[\\/]|claude|codex).*$`,
-	`(?i)(^|[\\/])\.local[\\/](bin|share)[\\/]claude([\\/].*|\.exe)?$`,
-	`(?i)(^|[\\/])(\.antigravity|\.gemini[\\/]antigravity-cli)[\\/].*$`,
-}
+const WindowsProcessPathPattern = `(?i)([\\/](Programs|Program Files( \(x86\))?)[\\/](Claude|AnthropicClaude|Codex|ChatGPT|Antigravity)[\\/].*|[\\/]AppData[\\/]Local[\\/]AnthropicClaude[\\/].*|[\\/]WindowsApps[\\/][^\\/]*(Claude|Anthropic|OpenAI|ChatGPT|Codex|Antigravity)[^\\/]*[\\/].*|(^|[\\/])\.local[\\/](bin|share)[\\/]claude([\\/].*|\.exe)?|(^|[\\/])(\.antigravity|\.gemini[\\/]antigravity-cli)[\\/].*)$`
 
 var ProtectedDomains = []string{
 	"claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
@@ -90,38 +83,33 @@ func IsValidTarget(target string) bool {
 	return true
 }
 
-// Rules returns fail-closed [matcher + "," + target, matcher + ",REJECT"] pairs
-// so AI traffic never falls through to DIRECT/general rules even when UDP lacks support.
+// RuleProviderPayload returns the deduplicated classical matchers (without target)
+// registered inside the inline clashfx-ai-lock rule-provider.
+func RuleProviderPayload() []string {
+	out := make([]string, 0, 2+len(ProtectedDomains)+len(ProtectedExactDomains))
+	out = append(out, "PROCESS-NAME-REGEX,"+ProcessNamePattern)
+	out = append(out, "PROCESS-PATH-REGEX,"+WindowsProcessPathPattern)
+	for _, dom := range ProtectedDomains {
+		out = append(out, "DOMAIN-SUFFIX,"+dom)
+	}
+	for _, exact := range ProtectedExactDomains {
+		out = append(out, "DOMAIN,"+exact)
+	}
+	return out
+}
+
+// Rules returns fail-closed [RULE-SET -> target, RULE-SET -> REJECT] top-level rules
+// backed by InlineRuleProviderName so AI traffic never falls through to DIRECT/general rules
+// even when UDP lacks support.
 func Rules(target string) []string {
 	if !IsValidTarget(target) {
 		return nil
 	}
 	trimmed := strings.TrimSpace(target)
-	var base []string
-	base = append(base, fmt.Sprintf("PROCESS-NAME-REGEX,%s,%s", ProcessNamePrimaryPattern, trimmed))
-	for _, pat := range AdditionalProcessPatterns {
-		base = append(base, fmt.Sprintf("PROCESS-NAME-REGEX,%s,%s", pat, trimmed))
+	return []string{
+		fmt.Sprintf("RULE-SET,%s,%s", InlineRuleProviderName, trimmed),
+		fmt.Sprintf("RULE-SET,%s,REJECT", InlineRuleProviderName),
 	}
-	for _, pat := range ProcessPathPatterns {
-		base = append(base, fmt.Sprintf("PROCESS-PATH-REGEX,%s,%s", pat, trimmed))
-	}
-	for _, dom := range ProtectedDomains {
-		base = append(base, fmt.Sprintf("DOMAIN-SUFFIX,%s,%s", dom, trimmed))
-	}
-	for _, exact := range ProtectedExactDomains {
-		base = append(base, fmt.Sprintf("DOMAIN,%s,%s", exact, trimmed))
-	}
-
-	paired := make([]string, 0, len(base)*2)
-	for _, rule := range base {
-		idx := strings.LastIndex(rule, ",")
-		if idx < 0 {
-			paired = append(paired, rule)
-			continue
-		}
-		paired = append(paired, rule, rule[:idx]+",REJECT")
-	}
-	return paired
 }
 
 // ListCandidateTargets enumerates concrete proxy nodes (excluding proxy-groups
@@ -280,6 +268,16 @@ func Apply(root map[string]any, target string, providers []ProviderSnapshot) App
 		}
 	}
 
+	rpMap, ok := toStringMap(finalRoot["rule-providers"])
+	if !ok || rpMap == nil {
+		rpMap = map[string]any{}
+	}
+	rpMap[InlineRuleProviderName] = map[string]any{
+		"type":     "inline",
+		"behavior": "classical",
+		"payload":  RuleProviderPayload(),
+	}
+	finalRoot["rule-providers"] = rpMap
 	finalRoot["mode"] = "rule"
 	finalRoot["find-process-mode"] = "always"
 	finalRoot["rules"] = outRules
@@ -322,7 +320,8 @@ func TransformHookForController(providerLoader func() []ProviderSnapshot) func(r
 
 func isInternalCoreDirectRule(rule string) bool {
 	switch strings.TrimSpace(rule) {
-	case "PROCESS-NAME,mihomo_core.exe,DIRECT",
+	case "RULE-SET," + InternalDirectRuleProviderName + ",DIRECT",
+		"PROCESS-NAME,mihomo_core.exe,DIRECT",
 		"PROCESS-NAME,clashfx-daemon.exe,DIRECT",
 		"PROCESS-NAME,clashfx-service.exe,DIRECT":
 		return true

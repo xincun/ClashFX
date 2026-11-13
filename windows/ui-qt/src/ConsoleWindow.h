@@ -21,6 +21,7 @@ public:
 signals:
     void openAiLockRequested();
     void openMultiNodeRequested();
+    void openRulesRequested();
     void openSubscriptionsRequested();
     void openDiagnosticsRequested();
     void openSettingsRequested();
@@ -39,6 +40,7 @@ private:
     QLabel* detailLabel_ = nullptr;
     QPushButton* aiLockBtn_ = nullptr;
     QPushButton* multiNodeBtn_ = nullptr;
+    QPushButton* rulesBtn_ = nullptr;
     QPushButton* subsBtn_ = nullptr;
     QPushButton* diagBtn_ = nullptr;
     QPushButton* settingsBtn_ = nullptr;

@@ -14,25 +14,61 @@ import (
 )
 
 func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
-	// 1. CN Apps bypass rule ordering (after AI Lock + internal rules, before general rules)
+	// 1. CN Apps bypass + Custom Rules ordering & @DEFAULT cross-profile resolution
 	root := map[string]any{
+		"proxy-groups": []any{
+			map[string]any{"name": "JMS", "type": "select", "proxies": []any{"DIRECT"}},
+		},
 		"rules": []any{
-			"PROCESS-NAME,mihomo_core.exe,DIRECT",
-			"DOMAIN-SUFFIX,claude.ai,LockedNode",
-			"DOMAIN-SUFFIX,claude.ai,REJECT",
-			"MATCH,Proxy",
+			"RULE-SET,clashfx-internal-direct,DIRECT",
+			"RULE-SET,clashfx-ai-lock,LockedNode",
+			"RULE-SET,clashfx-ai-lock,REJECT",
+			"DOMAIN-SUFFIX,sub-rule.example,JMS",
+			"MATCH,JMS",
 		},
 	}
-	hook := TransformHookForCNApps()
-	if err := hook(root, profile.AppSettings{EnhancedMode: true, BypassCNApps: true}); err != nil {
+	customRules, err := NormalizeAndValidateCustomRules([]profile.CustomRule{
+		{Enabled: true, Type: "domain-suffix", Payload: "scholar.google.com", Target: "@default", Position: "prepend"},
+		{Enabled: true, Type: "ip-cidr", Payload: "10.99.0.0/16", Target: "DIRECT", Position: "before_match", NoResolve: true},
+		{Enabled: true, Type: "domain", Payload: "other-profile-only.test", Target: "NonExistentGroup", Position: "prepend"},
+		{Enabled: false, Type: "domain", Payload: "disabled.test", Target: "DIRECT", Position: "prepend"},
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	rules := root["rules"].([]any)
-	if rules[0] != "PROCESS-NAME,mihomo_core.exe,DIRECT" || rules[2] != "DOMAIN-SUFFIX,claude.ai,REJECT" {
-		t.Fatalf("AI Lock rules displaced by CN apps: %v", rules[:4])
+	settings := profile.AppSettings{
+		EnhancedMode: true,
+		BypassCNApps: true,
+		CustomRules:  customRules,
 	}
-	if !strings.HasPrefix(rules[3].(string), "PROCESS-NAME,Weixin.exe,DIRECT") {
-		t.Fatalf("expected Weixin.exe bypass after AI Lock, got %v", rules[3])
+	if err := TransformHookForCNApps()(root, settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := TransformHookForCustomRules(nil)(root, settings); err != nil {
+		t.Fatal(err)
+	}
+	rules := profile.ExtractStringRules(root["rules"])
+	wantOrder := []string{
+		"RULE-SET,clashfx-internal-direct,DIRECT",
+		"RULE-SET,clashfx-ai-lock,LockedNode",
+		"RULE-SET,clashfx-ai-lock,REJECT",
+		"DOMAIN-SUFFIX,scholar.google.com,JMS",
+		"RULE-SET,clashfx-cn-apps-direct,DIRECT",
+		"DOMAIN-SUFFIX,sub-rule.example,JMS",
+		"IP-CIDR,10.99.0.0/16,DIRECT,no-resolve",
+		"MATCH,JMS",
+	}
+	if len(rules) != len(wantOrder) {
+		t.Fatalf("rules = %v, want %v", rules, wantOrder)
+	}
+	for i := range wantOrder {
+		if rules[i] != wantOrder[i] {
+			t.Fatalf("rules[%d] = %q, want %q", i, rules[i], wantOrder[i])
+		}
+	}
+	rpMap, _ := root["rule-providers"].(map[string]any)
+	if _, ok := rpMap[profile.CNAppsRuleProviderName]; !ok {
+		t.Fatalf("expected inline rule-provider %s in root", profile.CNAppsRuleProviderName)
 	}
 
 	// 2. Single-node diagnostic decode of clashfx_probe_error

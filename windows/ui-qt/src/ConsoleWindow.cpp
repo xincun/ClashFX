@@ -42,6 +42,7 @@ ConsoleWindow::ConsoleWindow(QWidget* parent)
 
     aiLockBtn_ = new QPushButton(headerBar);
     multiNodeBtn_ = new QPushButton(headerBar);
+    rulesBtn_ = new QPushButton(headerBar);
     subsBtn_ = new QPushButton(headerBar);
     diagBtn_ = new QPushButton(headerBar);
     settingsBtn_ = new QPushButton(headerBar);
@@ -51,6 +52,7 @@ ConsoleWindow::ConsoleWindow(QWidget* parent)
     barLayout->addWidget(detailLabel_, 1);
     barLayout->addWidget(aiLockBtn_);
     barLayout->addWidget(multiNodeBtn_);
+    barLayout->addWidget(rulesBtn_);
     barLayout->addWidget(subsBtn_);
     barLayout->addWidget(diagBtn_);
     barLayout->addWidget(settingsBtn_);
@@ -64,6 +66,7 @@ ConsoleWindow::ConsoleWindow(QWidget* parent)
 
     connect(aiLockBtn_, &QPushButton::clicked, this, &ConsoleWindow::openAiLockRequested);
     connect(multiNodeBtn_, &QPushButton::clicked, this, &ConsoleWindow::openMultiNodeRequested);
+    connect(rulesBtn_, &QPushButton::clicked, this, &ConsoleWindow::openRulesRequested);
     connect(subsBtn_, &QPushButton::clicked, this, &ConsoleWindow::openSubscriptionsRequested);
     connect(diagBtn_, &QPushButton::clicked, this, &ConsoleWindow::openDiagnosticsRequested);
     connect(settingsBtn_, &QPushButton::clicked, this, &ConsoleWindow::openSettingsRequested);
@@ -77,6 +80,7 @@ void ConsoleWindow::retranslateUi() {
     setWindowTitle(L("ClashFX 控制台", "ClashFX Console"));
     aiLockBtn_->setText(L("AI 专用锁定", "AI Proxy Lock"));
     multiNodeBtn_->setText(L("多节点固定端口", "Multi-Node Ports"));
+    rulesBtn_->setText(L("分流规则", "Rules"));
     subsBtn_->setText(L("托管订阅", "Subscriptions"));
     diagBtn_->setText(L("单节点诊断", "Node Diagnostic"));
     settingsBtn_->setText(L("设置", "Settings"));
