@@ -125,8 +125,8 @@ func TestWindowsProcessAndPathMatchersAndDependencySafety(t *testing.T) {
 		t.Fatalf("unexpected inline rule-provider: %+v", aiProv)
 	}
 	payload, _ := aiProv["payload"].([]string)
-	if len(payload) != 2+len(ProtectedDomains)+len(ProtectedExactDomains) {
-		t.Fatalf("payload len = %d, want %d", len(payload), 2+len(ProtectedDomains)+len(ProtectedExactDomains))
+	if len(payload) != 2+len(ProtectedDomains) {
+		t.Fatalf("payload len = %d, want %d", len(payload), 2+len(ProtectedDomains))
 	}
 
 	// GeneralHK IS inside Proxy -> relay must NOT be assigned (would create dialer cycle!)
@@ -245,8 +245,8 @@ rules:
 		},
 	}
 
-	// 1. Protected AI domains & exact Google AI endpoints MUST route through LockedAINode (NOT MATCH,DIRECT!)
-	for _, aiHost := range []string{"api.anthropic.com", "chatgpt.com", "generativelanguage.googleapis.com", "antigravity.google"} {
+	// 1. Protected AI & Google domains MUST route through LockedAINode (NOT MATCH,DIRECT!)
+	for _, aiHost := range []string{"api.anthropic.com", "chatgpt.com", "gemini.google.com", "generativelanguage.googleapis.com", "antigravity.google"} {
 		body, reqErr := fetchViaProxy(client, fmt.Sprintf("http://%s/v1/test", aiHost))
 		if reqErr != nil {
 			t.Fatalf("AI host %s request failed while LockedAINode healthy: %v", aiHost, reqErr)
@@ -255,14 +255,14 @@ rules:
 			t.Fatalf("AI host %s routed unexpectedly: %q", aiHost, body)
 		}
 	}
-	if lockedHits.Load() < 4 {
-		t.Fatalf("expected >= 4 hits on LockedAINode, got %d", lockedHits.Load())
+	if lockedHits.Load() < 5 {
+		t.Fatalf("expected >= 5 hits on LockedAINode, got %d", lockedHits.Load())
 	}
 
-	// 2. Unrelated Google domain (www.google.com) is NOT captured by AI Lock -> follows MATCH,Proxy (GeneralNode)!
-	nonAIBody, err := fetchViaProxy(client, "http://www.google.com/search")
+	// 2. Unrelated domain (github.com) is NOT captured by AI Lock -> follows MATCH,Proxy (GeneralNode)!
+	nonAIBody, err := fetchViaProxy(client, "http://github.com/explore")
 	if err != nil || !strings.Contains(nonAIBody, "via=GENERAL_NODE") {
-		t.Fatalf("expected www.google.com via GENERAL_NODE, got body=%q err=%v", nonAIBody, err)
+		t.Fatalf("expected github.com via GENERAL_NODE, got body=%q err=%v", nonAIBody, err)
 	}
 
 	// 3. Kill LockedAINode while GeneralNode (Proxy) remains healthy -> AI hosts MUST FAIL CLOSED!

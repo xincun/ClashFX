@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/clashfx/core-engine/internal/features"
 	"github.com/clashfx/core-engine/internal/nodeservices"
 	"github.com/clashfx/core-engine/internal/profile"
 )
@@ -427,17 +428,45 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			return errResp(err)
 		}
 		return okResp(s.engine.Snapshot())
-	case "update_custom_rules":
+	case "get_profile_mixin":
+		doc, err := s.engine.GetProfileMixin()
+		if err != nil {
+			return errResp(err)
+		}
+		return okResp(doc)
+	case "convert_profile_mixin":
 		var p struct {
-			Rules []profile.CustomRule `json:"rules"`
+			Direction   string                   `json:"direction"`
+			YAML        string                   `json:"yaml"`
+			BypassCNWeb bool                     `json:"bypass_cn_web"`
+			BypassLAN   bool                     `json:"bypass_lan"`
+			Rules       []features.MixinRuleItem `json:"rules"`
 		}
 		if err := json.Unmarshal(req.Params, &p); err != nil {
 			return errResp(err)
 		}
-		if err := s.engine.UpdateCustomRules(ctx, p.Rules); err != nil {
+		doc, err := s.engine.ConvertProfileMixin(p.Direction, p.YAML, p.BypassCNWeb, p.BypassLAN, p.Rules)
+		if err != nil {
 			return errResp(err)
 		}
-		return okResp(s.engine.Snapshot())
+		return okResp(doc)
+	case "save_profile_mixin":
+		var p struct {
+			Mode        string                   `json:"mode"`
+			YAML        string                   `json:"yaml"`
+			BaseYAML    string                   `json:"base_yaml"`
+			BypassCNWeb bool                     `json:"bypass_cn_web"`
+			BypassLAN   bool                     `json:"bypass_lan"`
+			Rules       []features.MixinRuleItem `json:"rules"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return errResp(err)
+		}
+		doc, err := s.engine.SaveProfileMixin(ctx, p.Mode, p.YAML, p.BaseYAML, p.BypassCNWeb, p.BypassLAN, p.Rules)
+		if err != nil {
+			return errResp(err)
+		}
+		return okResp(doc)
 	case "get_effective_rules":
 		view, err := s.engine.GetEffectiveRules(ctx)
 		if err != nil {

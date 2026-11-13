@@ -57,18 +57,6 @@ type HotkeySettings struct {
 	SwitchOutboundMode string `json:"switch_outbound_mode"`
 }
 
-const DefaultProxyTargetToken = "@DEFAULT"
-
-type CustomRule struct {
-	Enabled   bool   `json:"enabled"`
-	Type      string `json:"type"`
-	Payload   string `json:"payload"`
-	Target    string `json:"target"`
-	Position  string `json:"position,omitempty"` // "prepend" (default) or "before_match"
-	NoResolve bool   `json:"no_resolve,omitempty"`
-	Note      string `json:"note,omitempty"`
-}
-
 type AILockPreLockState struct {
 	OutboundMode       string `json:"outbound_mode"`
 	EnhancedMode       bool   `json:"enhanced_mode"`
@@ -108,7 +96,6 @@ type AppSettings struct {
 	BenchmarkURL          string                       `json:"benchmark_url"`
 	MMDBDownloadURL       string                       `json:"mmdb_download_url"`
 	GeoSiteDownloadURL    string                       `json:"geosite_download_url"`
-	CustomRules           []CustomRule                 `json:"custom_rules,omitempty"`
 	SavedSelections       map[string]map[string]string `json:"saved_selections"`
 }
 
@@ -210,7 +197,6 @@ func (s *Store) Settings() AppSettings {
 	defer s.mu.RUnlock()
 	clone := s.settings
 	clone.SuspendNetworks = append([]string(nil), s.settings.SuspendNetworks...)
-	clone.CustomRules = append([]CustomRule(nil), s.settings.CustomRules...)
 	clone.SavedSelections = make(map[string]map[string]string, len(s.settings.SavedSelections))
 	for prof, groups := range s.settings.SavedSelections {
 		m := make(map[string]string, len(groups))

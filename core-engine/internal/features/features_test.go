@@ -14,37 +14,57 @@ import (
 )
 
 func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
-	// 1. CN Apps bypass + Custom Rules ordering & @DEFAULT cross-profile resolution
+	// 1. Profile Mixin visual <-> YAML lossless round-trip + CNApps + PROXY target resolution
+	baseMixin := []byte("ipv6: true\n")
+	builtYAML, err := BuildProfileMixinYAML(baseMixin, true, true, []MixinRuleItem{
+		{Type: "domain-suffix", Payload: "https://.scholar.org/papers?q=1", Target: "proxy"},
+		{Type: "ip-cidr", Payload: "10.99.0.5", Target: "DIRECT"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedDoc, err := ParseProfileMixinDocument(builtYAML, "JMS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parsedDoc.BypassCNWeb || !parsedDoc.BypassLAN || !parsedDoc.HasExtraKeys || len(parsedDoc.Rules) != 2 {
+		t.Fatalf("unexpected parsed ProfileMixinDocument: %+v", parsedDoc)
+	}
+	if parsedDoc.Rules[0].Payload != "scholar.org" || parsedDoc.Rules[0].Target != "PROXY" {
+		t.Fatalf("expected cleaned domain + PROXY placeholder, got %+v", parsedDoc.Rules[0])
+	}
+	if parsedDoc.Rules[1].Payload != "10.99.0.5/32" {
+		t.Fatalf("expected /32 auto-mask on bare IPv4, got %+v", parsedDoc.Rules[1])
+	}
+
 	root := map[string]any{
 		"proxy-groups": []any{
 			map[string]any{"name": "JMS", "type": "select", "proxies": []any{"DIRECT"}},
 		},
 		"rules": []any{
-			"RULE-SET,clashfx-internal-direct,DIRECT",
-			"RULE-SET,clashfx-ai-lock,LockedNode",
-			"RULE-SET,clashfx-ai-lock,REJECT",
-			"DOMAIN-SUFFIX,sub-rule.example,JMS",
 			"MATCH,JMS",
 		},
 	}
-	customRules, err := NormalizeAndValidateCustomRules([]profile.CustomRule{
-		{Enabled: true, Type: "domain-suffix", Payload: "scholar.google.com", Target: "@default", Position: "prepend"},
-		{Enabled: true, Type: "ip-cidr", Payload: "10.99.0.0/16", Target: "DIRECT", Position: "before_match", NoResolve: true},
-		{Enabled: true, Type: "domain", Payload: "other-profile-only.test", Target: "NonExistentGroup", Position: "prepend"},
-		{Enabled: false, Type: "domain", Payload: "disabled.test", Target: "DIRECT", Position: "prepend"},
-	})
+	root, err = profile.ApplyProfileMixin(root, builtYAML)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if root["ipv6"] != true {
+		t.Fatalf("expected extra YAML key ipv6:true preserved, got %v", root["ipv6"])
+	}
+	// Simulate system guards + CN apps injected after ApplyProfileMixin (matching controller.go)
+	existing := profile.ExtractStringRules(root["rules"])
+	root["rules"] = append([]string{
+		"RULE-SET,clashfx-internal-direct,DIRECT",
+		"RULE-SET,clashfx-ai-lock,LockedNode",
+		"RULE-SET,clashfx-ai-lock,REJECT",
+	}, existing...)
+
 	settings := profile.AppSettings{
 		EnhancedMode: true,
 		BypassCNApps: true,
-		CustomRules:  customRules,
 	}
 	if err := TransformHookForCNApps()(root, settings); err != nil {
-		t.Fatal(err)
-	}
-	if err := TransformHookForCustomRules(nil)(root, settings); err != nil {
 		t.Fatal(err)
 	}
 	rules := profile.ExtractStringRules(root["rules"])
@@ -52,10 +72,13 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 		"RULE-SET,clashfx-internal-direct,DIRECT",
 		"RULE-SET,clashfx-ai-lock,LockedNode",
 		"RULE-SET,clashfx-ai-lock,REJECT",
-		"DOMAIN-SUFFIX,scholar.google.com,JMS",
 		"RULE-SET,clashfx-cn-apps-direct,DIRECT",
-		"DOMAIN-SUFFIX,sub-rule.example,JMS",
-		"IP-CIDR,10.99.0.0/16,DIRECT,no-resolve",
+		"DOMAIN-SUFFIX,scholar.org,JMS",
+		"IP-CIDR,10.99.0.5/32,DIRECT,no-resolve",
+		"GEOSITE,private,DIRECT",
+		"GEOIP,LAN,DIRECT,no-resolve",
+		"GEOSITE,cn,DIRECT",
+		"GEOIP,CN,DIRECT,no-resolve",
 		"MATCH,JMS",
 	}
 	if len(rules) != len(wantOrder) {

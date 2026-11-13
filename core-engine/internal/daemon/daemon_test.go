@@ -178,21 +178,26 @@ rules:
 		t.Fatalf("unexpected diagnostic bundle: %s", bundleStr)
 	}
 
-	// 6. Custom rules update + live effective rules inspection via Mihomo REST API
-	updRulesResp := callRPC(6, "update_custom_rules", map[string]any{
+	// 6. Profile Mixin visual save + live effective rules inspection via Mihomo REST API
+	saveMixinResp := callRPC(6, "save_profile_mixin", map[string]any{
+		"mode":          "visual",
+		"bypass_cn_web": false,
+		"bypass_lan":    false,
 		"rules": []map[string]any{
 			{
-				"enabled":  true,
-				"type":     "DOMAIN-SUFFIX",
-				"payload":  "scholar.google.com",
-				"target":   "@DEFAULT",
-				"position": "prepend",
-				"note":     "academic",
+				"type":    "DOMAIN-SUFFIX",
+				"payload": "https://scholar.org/search",
+				"target":  "PROXY",
+			},
+			{
+				"type":    "IP-CIDR",
+				"payload": "10.99.0.1",
+				"target":  "DIRECT",
 			},
 		},
 	})
-	if !updRulesResp.OK {
-		t.Fatalf("update_custom_rules failed: %s", updRulesResp.Error)
+	if !saveMixinResp.OK {
+		t.Fatalf("save_profile_mixin failed: %s", saveMixinResp.Error)
 	}
 	effResp := callRPC(7, "get_effective_rules", nil)
 	if !effResp.OK {
@@ -201,11 +206,11 @@ rules:
 	rawEff, _ := json.Marshal(effResp.Data)
 	var effView EffectiveRulesView
 	_ = json.Unmarshal(rawEff, &effView)
-	if effView.DefaultTarget != "Proxy" || len(effView.Rules) != 2 {
+	if effView.DefaultTarget != "Proxy" || len(effView.Rules) < 2 {
 		t.Fatalf("unexpected effective rules view: %+v", effView)
 	}
-	if effView.Rules[0].Payload != "scholar.google.com" || effView.Rules[0].Proxy != "Proxy" || effView.Rules[0].Source != "custom" {
-		t.Fatalf("expected custom rule #0 -> Proxy, got %+v", effView.Rules[0])
+	if effView.Rules[0].Payload != "scholar.org" || effView.Rules[0].Proxy != "Proxy" || effView.Rules[0].Source != "mixin" {
+		t.Fatalf("expected mixin rule #0 -> Proxy, got %+v", effView.Rules[0])
 	}
 }
 

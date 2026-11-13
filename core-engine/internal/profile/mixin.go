@@ -14,6 +14,7 @@ const (
 	InternalDirectRuleProviderName = "clashfx-internal-direct"
 	AILockRuleProviderName         = "clashfx-ai-lock"
 	CNAppsRuleProviderName         = "clashfx-cn-apps-direct"
+	ProxyTargetPlaceholder         = "PROXY"
 )
 
 const DefaultProfileMixinTemplate = `# Profile Mixin is merged into the selected profile at runtime.
@@ -82,6 +83,7 @@ func UnmarshalYAMLMap(data []byte) (map[string]any, error) {
 // ApplyProfileMixin merges mixin YAML into base map following ClashFX's exact rules:
 // 1. Extract profile.prepend-rules / profile.append-rules from base and mixin.
 // 2. Recursively merge maps, merge named object slices by "name", and deduplicate string slices.
+// 3. Resolve placeholder target "PROXY" in mixin rule directives to the merged profile's primary group.
 func ApplyProfileMixin(base map[string]any, mixinYAML []byte) (map[string]any, error) {
 	ApplyRuleDirectivesInPlace(base)
 	if len(strings.TrimSpace(string(mixinYAML))) == 0 {
@@ -95,15 +97,109 @@ func ApplyProfileMixin(base map[string]any, mixinYAML []byte) (map[string]any, e
 		return base, nil
 	}
 	prepend, appendRules := takeProfileRuleDirectives(mixin)
+	merged := mergeMixinMap(mixin, base)
 	if len(prepend) > 0 || len(appendRules) > 0 {
-		existing := extractStringRules(base["rules"])
+		defTarget := ResolveDefaultRuleTarget(merged)
+		literalPROXY := hasNamedOutbound(merged, ProxyTargetPlaceholder)
+		existing := extractStringRules(merged["rules"])
 		combined := make([]string, 0, len(prepend)+len(existing)+len(appendRules))
-		combined = append(combined, prepend...)
+		for _, r := range prepend {
+			combined = append(combined, ResolveMixinRuleLine(r, defTarget, literalPROXY))
+		}
 		combined = append(combined, existing...)
-		combined = append(combined, appendRules...)
-		base["rules"] = uniqueStringsToAny(combined)
+		for _, r := range appendRules {
+			combined = append(combined, ResolveMixinRuleLine(r, defTarget, literalPROXY))
+		}
+		merged["rules"] = uniqueStringsToAny(combined)
 	}
-	return mergeMixinMap(mixin, base), nil
+	return merged, nil
+}
+
+// ResolveDefaultRuleTarget finds the active profile's primary proxy group:
+// 1. Final MATCH,<target> if <target> is a proxy/group (not DIRECT/REJECT)
+// 2. First non-GLOBAL proxy-group name
+// 3. Fallback "DIRECT"
+func ResolveDefaultRuleTarget(root map[string]any) string {
+	rules := extractStringRules(root["rules"])
+	for i := len(rules) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(rules[i])
+		parts := strings.SplitN(line, ",", 3)
+		if len(parts) >= 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "MATCH") {
+			cand := strings.TrimSpace(parts[1])
+			upper := strings.ToUpper(cand)
+			if cand != "" && upper != "DIRECT" && upper != "REJECT" && upper != "REJECT-DROP" {
+				return cand
+			}
+			break
+		}
+	}
+	for _, m := range extractNamedMaps(root["proxy-groups"]) {
+		name, _ := m["name"].(string)
+		name = strings.TrimSpace(name)
+		if name != "" && !strings.EqualFold(name, "GLOBAL") {
+			return name
+		}
+	}
+	return "DIRECT"
+}
+
+// ResolveMixinRuleLine rewrites placeholder target "PROXY" (when no literal "PROXY"
+// group/node exists in the profile) to defTarget so Profile Mixin rules work across
+// arbitrary subscriptions without manual target renaming.
+func ResolveMixinRuleLine(rawLine, defTarget string, literalPROXYExists bool) string {
+	trimmed := strings.TrimSpace(rawLine)
+	if trimmed == "" || defTarget == "" {
+		return trimmed
+	}
+	parts := strings.Split(trimmed, ",")
+	if len(parts) < 2 {
+		return trimmed
+	}
+	tp := strings.ToUpper(strings.TrimSpace(parts[0]))
+	targetIdx := 2
+	if tp == "MATCH" {
+		targetIdx = 1
+	}
+	if targetIdx >= len(parts) {
+		return trimmed
+	}
+	tgt := strings.TrimSpace(parts[targetIdx])
+	if (tgt == ProxyTargetPlaceholder && !literalPROXYExists) || strings.EqualFold(tgt, "@DEFAULT") {
+		parts[targetIdx] = defTarget
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		return strings.Join(parts, ",")
+	}
+	return trimmed
+}
+
+func hasNamedOutbound(root map[string]any, exactName string) bool {
+	for _, key := range []string{"proxy-groups", "proxies"} {
+		for _, m := range extractNamedMaps(root[key]) {
+			if n, _ := m["name"].(string); strings.TrimSpace(n) == exactName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func extractNamedMaps(v any) []map[string]any {
+	switch list := v.(type) {
+	case []map[string]any:
+		return list
+	case []any:
+		out := make([]map[string]any, 0, len(list))
+		for _, item := range list {
+			if m, ok := item.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func ApplyRuleDirectivesInPlace(root map[string]any) bool {

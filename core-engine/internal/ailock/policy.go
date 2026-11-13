@@ -22,16 +22,7 @@ const WindowsProcessPathPattern = `(?i)([\\/](Programs|Program Files( \(x86\))?)
 var ProtectedDomains = []string{
 	"claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
 	"openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com", "oaistatsig.com", "openaimerge.com",
-	"antigravity.google",
-}
-
-var ProtectedExactDomains = []string{
-	"accounts.google.com", "oauth2.googleapis.com", "generativelanguage.googleapis.com",
-	"cloudcode-pa.googleapis.com", "businessaicode.googleapis.com",
-	"businessaicode.us.rep.googleapis.com", "businessaicode.eu.rep.googleapis.com", "businessaicode.mtls.googleapis.com",
-	"aiplatform.googleapis.com", "aiplatform.us.rep.googleapis.com", "aiplatform.eu.rep.googleapis.com", "aiplatform.mtls.googleapis.com",
-	"discoveryengine.googleapis.com", "us-discoveryengine.googleapis.com", "eu-discoveryengine.googleapis.com",
-	"discoveryengine.mtls.googleapis.com", "us-discoveryengine.mtls.googleapis.com", "eu-discoveryengine.mtls.googleapis.com",
+	"antigravity.google", "google.com", "googleapis.com",
 }
 
 type ProviderSnapshot struct {
@@ -86,14 +77,11 @@ func IsValidTarget(target string) bool {
 // RuleProviderPayload returns the deduplicated classical matchers (without target)
 // registered inside the inline clashfx-ai-lock rule-provider.
 func RuleProviderPayload() []string {
-	out := make([]string, 0, 2+len(ProtectedDomains)+len(ProtectedExactDomains))
+	out := make([]string, 0, 2+len(ProtectedDomains))
 	out = append(out, "PROCESS-NAME-REGEX,"+ProcessNamePattern)
 	out = append(out, "PROCESS-PATH-REGEX,"+WindowsProcessPathPattern)
 	for _, dom := range ProtectedDomains {
 		out = append(out, "DOMAIN-SUFFIX,"+dom)
-	}
-	for _, exact := range ProtectedExactDomains {
-		out = append(out, "DOMAIN,"+exact)
 	}
 	return out
 }

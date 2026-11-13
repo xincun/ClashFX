@@ -80,7 +80,7 @@ void ConsoleWindow::retranslateUi() {
     setWindowTitle(L("ClashFX 控制台", "ClashFX Console"));
     aiLockBtn_->setText(L("AI 专用锁定", "AI Proxy Lock"));
     multiNodeBtn_->setText(L("多节点固定端口", "Multi-Node Ports"));
-    rulesBtn_->setText(L("分流规则", "Rules"));
+    rulesBtn_->setText(L("配置补丁 / 分流", "Config Patch / Rules"));
     subsBtn_->setText(L("托管订阅", "Subscriptions"));
     diagBtn_->setText(L("单节点诊断", "Node Diagnostic"));
     settingsBtn_->setText(L("设置", "Settings"));

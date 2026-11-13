@@ -187,7 +187,6 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 		cfg.DashboardUIDir,
 		ailock.TransformHookForController(nil),
 		features.TransformHookForCNApps(),
-		features.TransformHookForCustomRules(store.ActiveConfigDir),
 		nodeStore.TransformHookForController(eng.IsCoreRunning),
 	)
 
@@ -754,7 +753,7 @@ func (e *Engine) refreshLiveCoreMetadata(ctx context.Context) {
 	defTarget := "DIRECT"
 	if rawRoot != nil {
 		cands = ailock.ListCandidateTargets(rawRoot, nil)
-		defTarget = features.ResolveDefaultRuleTarget(rawRoot)
+		defTarget = profile.ResolveDefaultRuleTarget(rawRoot)
 		if settings.AILockEnabled {
 			relay = ailock.RelayName(rawRoot, settings.AILockTarget, nil)
 		}
@@ -1312,7 +1311,6 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 		ailock.EnforceProtectedSettings(&next)
 	}
 	next.AILockSavedState = cur.AILockSavedState
-	next.CustomRules = cur.CustomRules
 	next.SavedSelections = cur.SavedSelections
 
 	if next.LaunchAtLogin != cur.LaunchAtLogin {
@@ -1337,28 +1335,110 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 	return err
 }
 
-func (e *Engine) UpdateCustomRules(ctx context.Context, rules []profile.CustomRule) error {
-	normalized, err := features.NormalizeAndValidateCustomRules(rules)
+func (e *Engine) currentProfileDefaultTarget() (string, bool) {
+	settings := e.store.Settings()
+	var rawRoot map[string]any
+	if data, err := os.ReadFile(e.store.ProfilePath(settings.SelectedProfile)); err == nil {
+		rawRoot, _ = profile.UnmarshalYAMLMap(data)
+	}
+	if rawRoot == nil {
+		if data, err := os.ReadFile(e.ctrl.RuntimeConfigPath()); err == nil {
+			rawRoot, _ = profile.UnmarshalYAMLMap(data)
+		}
+	}
+	if rawRoot == nil {
+		return "DIRECT", false
+	}
+	defTarget := profile.ResolveDefaultRuleTarget(rawRoot)
+	literalPROXY := false
+	for _, key := range []string{"proxy-groups", "proxies"} {
+		if list, ok := rawRoot[key].([]any); ok {
+			for _, item := range list {
+				if m, ok := item.(map[string]any); ok {
+					if n, _ := m["name"].(string); strings.TrimSpace(n) == profile.ProxyTargetPlaceholder {
+						literalPROXY = true
+					}
+				}
+			}
+		}
+	}
+	return defTarget, literalPROXY
+}
+
+func (e *Engine) GetProfileMixin() (features.ProfileMixinDocument, error) {
+	path, err := e.store.EnsureProfileMixinFile()
 	if err != nil {
-		return err
+		return features.ProfileMixinDocument{}, err
 	}
-	prev := e.store.Settings().CustomRules
-	if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
-		s.CustomRules = normalized
-		return nil
-	}); err != nil {
-		return err
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return features.ProfileMixinDocument{}, err
 	}
+	defTarget, _ := e.currentProfileDefaultTarget()
+	doc, err := features.ParseProfileMixinDocument(raw, defTarget)
+	if err != nil {
+		// Still return raw YAML if file has syntax errors so user can fix it in Raw tab
+		return features.ProfileMixinDocument{
+			Path:          path,
+			YAML:          string(raw),
+			Rules:         []features.MixinRuleItem{},
+			DefaultTarget: defTarget,
+		}, nil
+	}
+	doc.Path = path
+	return doc, nil
+}
+
+func (e *Engine) ConvertProfileMixin(direction, rawYAML string, bypassCNWeb, bypassLAN bool, rules []features.MixinRuleItem) (features.ProfileMixinDocument, error) {
+	defTarget, _ := e.currentProfileDefaultTarget()
+	if strings.EqualFold(strings.TrimSpace(direction), "from_yaml") {
+		return features.ParseProfileMixinDocument([]byte(rawYAML), defTarget)
+	}
+	built, err := features.BuildProfileMixinYAML([]byte(rawYAML), bypassCNWeb, bypassLAN, rules)
+	if err != nil {
+		return features.ProfileMixinDocument{}, err
+	}
+	return features.ParseProfileMixinDocument(built, defTarget)
+}
+
+func (e *Engine) SaveProfileMixin(ctx context.Context, mode, rawYAML, baseYAML string, bypassCNWeb, bypassLAN bool, rules []features.MixinRuleItem) (features.ProfileMixinDocument, error) {
+	var finalYAML []byte
+	var err error
+	if strings.EqualFold(strings.TrimSpace(mode), "yaml") {
+		if _, parseErr := profile.UnmarshalYAMLMap([]byte(rawYAML)); parseErr != nil {
+			return features.ProfileMixinDocument{}, fmt.Errorf("YAML 格式错误: %w", parseErr)
+		}
+		finalYAML = []byte(rawYAML)
+	} else {
+		base := []byte(baseYAML)
+		if len(strings.TrimSpace(baseYAML)) == 0 {
+			base, _ = e.store.ReadProfileMixinBytes()
+		}
+		finalYAML, err = features.BuildProfileMixinYAML(base, bypassCNWeb, bypassLAN, rules)
+		if err != nil {
+			return features.ProfileMixinDocument{}, err
+		}
+	}
+
+	path, err := e.store.EnsureProfileMixinFile()
+	if err != nil {
+		return features.ProfileMixinDocument{}, err
+	}
+	prevBytes, prevErr := os.ReadFile(path)
+
+	if err := profile.WriteFileAtomic(path, finalYAML, 0600); err != nil {
+		return features.ProfileMixinDocument{}, err
+	}
+
 	if _, err := e.applyAndSync(ctx, false, false); err != nil {
-		_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
-			s.CustomRules = prev
-			return nil
-		})
-		_, _ = e.applyAndSync(ctx, false, false)
-		return err
+		if prevErr == nil {
+			_ = profile.WriteFileAtomic(path, prevBytes, 0600)
+			_, _ = e.applyAndSync(ctx, false, false)
+		}
+		return features.ProfileMixinDocument{}, err
 	}
 	e.closeAllConnections(ctx)
-	return nil
+	return e.GetProfileMixin()
 }
 
 func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, error) {
@@ -1375,25 +1455,17 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 		}
 	}
 
-	defTarget := "DIRECT"
-	if rawRoot != nil {
-		defTarget = features.ResolveDefaultRuleTarget(rawRoot)
+	defTarget, literalPROXY := e.currentProfileDefaultTarget()
+	if rawRoot != nil && defTarget == "DIRECT" {
+		defTarget = profile.ResolveDefaultRuleTarget(rawRoot)
 	}
+
+	mixinBytes, _ := e.store.ReadProfileMixinBytes()
+	mixinKeys := features.ExtractMixinRuleKeys(mixinBytes, defTarget, literalPROXY)
 
 	normRuleKey := func(tp, payload, proxy string) string {
 		cleanType := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(tp)), "-", "")
-		return cleanType + "|" + strings.TrimSpace(payload) + "|" + strings.TrimSpace(proxy)
-	}
-	customKeys := make(map[string]bool, len(settings.CustomRules))
-	for _, cr := range settings.CustomRules {
-		if !cr.Enabled {
-			continue
-		}
-		tgt := strings.TrimSpace(cr.Target)
-		if strings.EqualFold(tgt, profile.DefaultProxyTargetToken) {
-			tgt = defTarget
-		}
-		customKeys[normRuleKey(cr.Type, cr.Payload, tgt)] = true
+		return cleanType + "|" + strings.ToLower(strings.TrimSpace(payload)) + "|" + strings.TrimSpace(proxy)
 	}
 
 	classifySource := func(tp, payload, proxy string) string {
@@ -1405,8 +1477,8 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 		case profile.CNAppsRuleProviderName:
 			return "cn_apps"
 		}
-		if customKeys[normRuleKey(tp, payload, proxy)] {
-			return "custom"
+		if mixinKeys[normRuleKey(tp, payload, proxy)] {
+			return "mixin"
 		}
 		return "profile"
 	}

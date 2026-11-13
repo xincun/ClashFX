@@ -588,17 +588,6 @@ void TrayController::rebuildMenuContents() {
     }
     trayMenu_->addAction(aiMenuTitle, this, &TrayController::openAiLockDialog);
     trayMenu_->addAction(L("多节点固定端口代理…", "Multiple Node Proxies…"), this, &TrayController::openMultiNodeDialog);
-    int enabledCustomCount = 0;
-    for (const QJsonValue& rv : settings.value(QStringLiteral("custom_rules")).toArray()) {
-        if (rv.toObject().value(QStringLiteral("enabled")).toBool(false)) {
-            ++enabledCustomCount;
-        }
-    }
-    QString rulesMenuTitle = L("分流规则编辑器…", "Routing Rules Editor…");
-    if (enabledCustomCount > 0) {
-        rulesMenuTitle += L("  [%1 条自定义]", "  [%1 Custom]").arg(enabledCustomCount);
-    }
-    trayMenu_->addAction(rulesMenuTitle, this, &TrayController::openRuleEditorDialog);
 
     trayMenu_->addSeparator();
 
@@ -638,17 +627,7 @@ void TrayController::rebuildMenuContents() {
                 err);
         });
     });
-    cfgMenu->addAction(L("分流规则编辑器…", "Routing Rules Editor…"), this, &TrayController::openRuleEditorDialog);
-    cfgMenu->addAction(L("编辑 Profile Mixin…", "Edit Profile Mixin…"), this, [this]() {
-        client_->call(QStringLiteral("ensure_profile_mixin"), QJsonObject(), [](bool ok, const QJsonValue& data, const QString&, const QString&) {
-            if (ok && data.isObject()) {
-                const QString path = data.toObject().value(QStringLiteral("path")).toString();
-                if (!path.isEmpty()) {
-                    QDesktopServices::openUrl(QUrl::fromLocalFile(path));
-                }
-            }
-        });
-    });
+    cfgMenu->addAction(L("配置补丁 (Profile Mixin)…", "Config Patch (Profile Mixin)…"), this, &TrayController::openRuleEditorDialog);
     cfgMenu->addAction(L("打开配置文件夹", "Open Config Folder"), this, [this]() {
         const QString dir = snapshot_.value(QStringLiteral("config_dir")).toString();
         if (!dir.isEmpty()) {
@@ -883,6 +862,8 @@ void TrayController::openRuleEditorDialog() {
     if (!rulesDlg_) {
         rulesDlg_ = new RuleEditorDialog(client_, consoleWindow_);
         rulesDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
+    } else {
+        rulesDlg_->reloadMixinFromDaemon();
     }
     rulesDlg_->show();
     rulesDlg_->raise();

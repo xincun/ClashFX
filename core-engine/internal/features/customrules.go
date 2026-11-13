@@ -2,14 +2,16 @@ package features
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
+	"net"
 	"strings"
 
 	"github.com/clashfx/core-engine/internal/profile"
+	"gopkg.in/yaml.v3"
 )
 
-var SupportedCustomRuleTypes = []string{
+const ProfileMixinHeaderComment = "# ClashFX Profile Mixin — merged into every profile at runtime.\n"
+
+var SupportedMixinRuleTypes = []string{
 	"DOMAIN-SUFFIX",
 	"DOMAIN",
 	"DOMAIN-KEYWORD",
@@ -27,7 +29,25 @@ var SupportedCustomRuleTypes = []string{
 	"PROCESS-PATH",
 	"PROCESS-NAME-REGEX",
 	"PROCESS-PATH-REGEX",
+	"RULE-SET",
 	"NETWORK",
+	"MATCH",
+}
+
+type MixinRuleItem struct {
+	Type    string `json:"type"`
+	Payload string `json:"payload"`
+	Target  string `json:"target"`
+}
+
+type ProfileMixinDocument struct {
+	Path          string          `json:"path,omitempty"`
+	YAML          string          `json:"yaml"`
+	BypassCNWeb   bool            `json:"bypass_cn_web"`
+	BypassLAN     bool            `json:"bypass_lan"`
+	Rules         []MixinRuleItem `json:"rules"`
+	HasExtraKeys  bool            `json:"has_extra_keys"`
+	DefaultTarget string          `json:"default_target,omitempty"`
 }
 
 func SupportsNoResolveParam(ruleType string) bool {
@@ -48,242 +68,334 @@ func allowsCommaInPayload(ruleType string) bool {
 	}
 }
 
-// NormalizeAndValidateCustomRules validates and normalizes user-defined routing rules.
-func NormalizeAndValidateCustomRules(rules []profile.CustomRule) ([]profile.CustomRule, error) {
-	if len(rules) == 0 {
-		return nil, nil
+func cleanDomainInput(raw string, stripLeadingDot bool) string {
+	s := strings.TrimSpace(raw)
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "https://") {
+		s = s[len("https://"):]
+	} else if strings.HasPrefix(lower, "http://") {
+		s = s[len("http://"):]
 	}
-	validTypes := make(map[string]bool, len(SupportedCustomRuleTypes))
-	for _, t := range SupportedCustomRuleTypes {
+	if slash := strings.IndexAny(s, "/?#"); slash >= 0 {
+		s = s[:slash]
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil && host != "" {
+		s = host
+	}
+	if stripLeadingDot {
+		s = strings.TrimLeft(s, ".")
+	}
+	return strings.TrimSpace(s)
+}
+
+// NormalizeAndValidateMixinRules validates and cleans visual rule items before writing YAML.
+func NormalizeAndValidateMixinRules(items []MixinRuleItem) ([]MixinRuleItem, error) {
+	if len(items) == 0 {
+		return []MixinRuleItem{}, nil
+	}
+	validTypes := make(map[string]bool, len(SupportedMixinRuleTypes))
+	for _, t := range SupportedMixinRuleTypes {
 		validTypes[t] = true
 	}
 
-	out := make([]profile.CustomRule, 0, len(rules))
-	for i, r := range rules {
-		tp := strings.ToUpper(strings.TrimSpace(r.Type))
+	out := make([]MixinRuleItem, 0, len(items))
+	for i, item := range items {
+		tp := strings.ToUpper(strings.TrimSpace(item.Type))
 		if !validTypes[tp] {
-			return nil, fmt.Errorf("rule #%d: unsupported rule type %q", i+1, r.Type)
-		}
-		payload := strings.TrimSpace(r.Payload)
-		if payload == "" {
-			return nil, fmt.Errorf("rule #%d (%s): payload is required", i+1, tp)
-		}
-		if strings.ContainsAny(payload, "\r\n") {
-			return nil, fmt.Errorf("rule #%d (%s): payload must not contain line breaks", i+1, tp)
-		}
-		if !allowsCommaInPayload(tp) && strings.Contains(payload, ",") {
-			return nil, fmt.Errorf("rule #%d (%s): payload must not contain commas", i+1, tp)
+			return nil, fmt.Errorf("第 %d 条规则类型不支持: %q", i+1, item.Type)
 		}
 
-		target := strings.TrimSpace(r.Target)
+		payload := strings.TrimSpace(item.Payload)
+		target := strings.TrimSpace(item.Target)
+		if strings.EqualFold(target, profile.ProxyTargetPlaceholder) || strings.EqualFold(target, "@DEFAULT") {
+			target = profile.ProxyTargetPlaceholder
+		}
 		if target == "" {
-			return nil, fmt.Errorf("rule #%d (%s): target outbound is required", i+1, tp)
+			return nil, fmt.Errorf("第 %d 条规则未选择出口策略", i+1)
 		}
 		if strings.ContainsAny(target, ",\r\n") {
-			return nil, fmt.Errorf("rule #%d (%s): target must not contain commas or line breaks", i+1, tp)
-		}
-		if strings.EqualFold(target, profile.DefaultProxyTargetToken) {
-			target = profile.DefaultProxyTargetToken
+			return nil, fmt.Errorf("第 %d 条规则出口名称不合法", i+1)
 		}
 
-		pos := strings.ToLower(strings.TrimSpace(r.Position))
-		if pos == "" || pos == "prepend" {
-			pos = "prepend"
-		} else if pos != "before_match" {
-			return nil, fmt.Errorf("rule #%d (%s): invalid position %q", i+1, tp, r.Position)
+		if tp == "MATCH" {
+			out = append(out, MixinRuleItem{Type: "MATCH", Payload: "", Target: target})
+			continue
 		}
 
-		noResolve := r.NoResolve && SupportsNoResolveParam(tp)
-		note := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(r.Note, "\r", " "), "\n", " "))
+		switch tp {
+		case "DOMAIN-SUFFIX":
+			payload = cleanDomainInput(payload, true)
+		case "DOMAIN", "DOMAIN-KEYWORD":
+			payload = cleanDomainInput(payload, false)
+		case "PROCESS-NAME":
+			if strings.ContainsAny(payload, `\/`) {
+				tp = "PROCESS-PATH"
+			}
+		case "IP-CIDR", "IP-CIDR6":
+			if !strings.Contains(payload, "/") {
+				if ip := net.ParseIP(payload); ip != nil {
+					if strings.Contains(payload, ":") {
+						payload += "/128"
+					} else {
+						payload += "/32"
+					}
+				}
+			}
+			if strings.Contains(payload, ":") {
+				tp = "IP-CIDR6"
+			} else {
+				tp = "IP-CIDR"
+			}
+		}
 
-		out = append(out, profile.CustomRule{
-			Enabled:   r.Enabled,
-			Type:      tp,
-			Payload:   payload,
-			Target:    target,
-			Position:  pos,
-			NoResolve: noResolve,
-			Note:      note,
+		if payload == "" {
+			return nil, fmt.Errorf("第 %d 条规则（%s）内容不能为空", i+1, tp)
+		}
+		if strings.ContainsAny(payload, "\r\n") {
+			return nil, fmt.Errorf("第 %d 条规则内容不能包含换行", i+1)
+		}
+		if !allowsCommaInPayload(tp) && strings.Contains(payload, ",") {
+			return nil, fmt.Errorf("第 %d 条规则内容不能包含逗号", i+1)
+		}
+
+		out = append(out, MixinRuleItem{
+			Type:    tp,
+			Payload: payload,
+			Target:  target,
 		})
 	}
 	return out, nil
 }
 
-// ResolveDefaultRuleTarget finds the active profile's primary proxy group:
-// 1. Final MATCH,<target> if <target> is a proxy/group (not DIRECT/REJECT)
-// 2. First non-GLOBAL proxy-group name
-// 3. Fallback "DIRECT"
-func ResolveDefaultRuleTarget(root map[string]any) string {
-	rules := profile.ExtractStringRules(root["rules"])
-	for i := len(rules) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(rules[i])
-		parts := strings.SplitN(line, ",", 3)
-		if len(parts) >= 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "MATCH") {
-			cand := strings.TrimSpace(parts[1])
-			upper := strings.ToUpper(cand)
-			if cand != "" && upper != "DIRECT" && upper != "REJECT" && upper != "REJECT-DROP" {
-				return cand
-			}
-			break
-		}
+func FormatMixinRuleItem(item MixinRuleItem) string {
+	tp := strings.ToUpper(strings.TrimSpace(item.Type))
+	target := strings.TrimSpace(item.Target)
+	if tp == "MATCH" {
+		return "MATCH," + target
 	}
-	if groups, ok := root["proxy-groups"].([]any); ok {
-		for _, gRaw := range groups {
-			gm, ok := gRaw.(map[string]any)
-			if !ok {
-				continue
-			}
-			name, _ := gm["name"].(string)
-			name = strings.TrimSpace(name)
-			if name != "" && !strings.EqualFold(name, "GLOBAL") {
-				return name
-			}
-		}
-	}
-	return "DIRECT"
-}
-
-// CollectValidRuleTargets returns all outbound/group/proxy names valid in root.
-func CollectValidRuleTargets(root map[string]any, cfgDir string) map[string]bool {
-	valid := map[string]bool{
-		"DIRECT":      true,
-		"REJECT":      true,
-		"REJECT-DROP": true,
-		"PASS":        true,
-		"COMPATIBLE":  true,
-		"GLOBAL":      true,
-	}
-	addNamedSlice := func(v any) {
-		items, ok := v.([]any)
-		if !ok {
-			return
-		}
-		for _, raw := range items {
-			if m, ok := raw.(map[string]any); ok {
-				if n, _ := m["name"].(string); strings.TrimSpace(n) != "" {
-					valid[strings.TrimSpace(n)] = true
-				}
-			}
-		}
-	}
-	addNamedSlice(root["proxies"])
-	addNamedSlice(root["proxy-groups"])
-
-	if cfgDir != "" {
-		if provs, ok := root["proxy-providers"].(map[string]any); ok {
-			for _, pRaw := range provs {
-				pm, ok := pRaw.(map[string]any)
-				if !ok {
-					continue
-				}
-				relPath, _ := pm["path"].(string)
-				relPath = strings.TrimSpace(relPath)
-				if relPath == "" {
-					continue
-				}
-				fullPath := relPath
-				if !filepath.IsAbs(fullPath) {
-					fullPath = filepath.Join(cfgDir, relPath)
-				}
-				if data, err := os.ReadFile(fullPath); err == nil {
-					if provDoc, pErr := profile.UnmarshalYAMLMap(data); pErr == nil {
-						addNamedSlice(provDoc["proxies"])
-					}
-				}
-			}
-		}
-	}
-	return valid
-}
-
-// FormatCustomRuleLine renders an enabled CustomRule into a Mihomo top-level rule line.
-func FormatCustomRuleLine(r profile.CustomRule, resolvedTarget string) string {
-	tp := strings.ToUpper(strings.TrimSpace(r.Type))
-	payload := strings.TrimSpace(r.Payload)
-	line := fmt.Sprintf("%s,%s,%s", tp, payload, resolvedTarget)
-	if r.NoResolve && SupportsNoResolveParam(tp) {
+	line := fmt.Sprintf("%s,%s,%s", tp, strings.TrimSpace(item.Payload), target)
+	if SupportsNoResolveParam(tp) {
 		line += ",no-resolve"
 	}
 	return line
 }
 
-// TransformHookForCustomRules compiles enabled user CustomRules into root["rules"]:
-// - "prepend" rules are placed immediately after system guards (ahead of CN apps & profile rules).
-// - "before_match" rules are placed immediately before the trailing MATCH rule.
-// Rules targeting a concrete group/node absent from the selected profile are safely skipped
-// so switching profiles never fails startup; @DEFAULT adapts automatically to every profile.
-func TransformHookForCustomRules(cfgDirLoader func() string) func(root map[string]any, settings profile.AppSettings) error {
-	return func(root map[string]any, settings profile.AppSettings) error {
-		if (settings.EnhancedMode && settings.CustomConfigAsIs) || len(settings.CustomRules) == 0 {
-			return nil
-		}
-		var cfgDir string
-		if cfgDirLoader != nil {
-			cfgDir = cfgDirLoader()
-		}
-		validTargets := CollectValidRuleTargets(root, cfgDir)
-		defaultTarget := ResolveDefaultRuleTarget(root)
-
-		var prependLines []string
-		var beforeMatchLines []string
-		for _, r := range settings.CustomRules {
-			if !r.Enabled {
-				continue
-			}
-			target := strings.TrimSpace(r.Target)
-			if strings.EqualFold(target, profile.DefaultProxyTargetToken) {
-				target = defaultTarget
-			}
-			if !validTargets[target] {
-				continue
-			}
-			line := FormatCustomRuleLine(r, target)
-			if strings.EqualFold(strings.TrimSpace(r.Position), "before_match") {
-				beforeMatchLines = append(beforeMatchLines, line)
-			} else {
-				prependLines = append(prependLines, line)
-			}
-		}
-		if len(prependLines) == 0 && len(beforeMatchLines) == 0 {
-			return nil
-		}
-
-		existing := profile.ExtractStringRules(root["rules"])
-		guardCount := profile.SystemGuardPrefixCount(existing)
-
-		// Find final MATCH rule index (>= guardCount) for before_match insertion
-		matchIdx := -1
-		for i := len(existing) - 1; i >= guardCount; i-- {
-			trimmed := strings.TrimSpace(existing[i])
-			if strings.HasPrefix(strings.ToUpper(trimmed), "MATCH,") {
-				matchIdx = i
-				break
-			}
-		}
-
-		seen := make(map[string]bool, len(existing)+len(prependLines)+len(beforeMatchLines))
-		out := make([]any, 0, len(existing)+len(prependLines)+len(beforeMatchLines))
-		appendUnique := func(list []string) {
-			for _, s := range list {
-				if !seen[s] {
-					seen[s] = true
-					out = append(out, s)
-				}
-			}
-		}
-
-		appendUnique(existing[:guardCount])
-		appendUnique(prependLines)
-		if matchIdx >= 0 {
-			appendUnique(existing[guardCount:matchIdx])
-			appendUnique(beforeMatchLines)
-			appendUnique(existing[matchIdx:])
-		} else {
-			appendUnique(existing[guardCount:])
-			appendUnique(beforeMatchLines)
-		}
-
-		root["rules"] = out
-		return nil
+func parseMixinRuleLine(rawLine string) (MixinRuleItem, bool) {
+	trimmed := strings.TrimSpace(rawLine)
+	if trimmed == "" {
+		return MixinRuleItem{}, false
 	}
+	parts := strings.Split(trimmed, ",")
+	if len(parts) < 2 {
+		return MixinRuleItem{}, false
+	}
+	tp := strings.ToUpper(strings.TrimSpace(parts[0]))
+	if tp == "MATCH" {
+		return MixinRuleItem{
+			Type:   "MATCH",
+			Target: strings.TrimSpace(parts[1]),
+		}, true
+	}
+	if len(parts) < 3 {
+		return MixinRuleItem{}, false
+	}
+	tgt := strings.TrimSpace(parts[2])
+	if strings.EqualFold(tgt, "@DEFAULT") {
+		tgt = profile.ProxyTargetPlaceholder
+	}
+	return MixinRuleItem{
+		Type:    tp,
+		Payload: strings.TrimSpace(parts[1]),
+		Target:  tgt,
+	}, true
+}
+
+func isCNGeositeDirect(line string) bool {
+	item, ok := parseMixinRuleLine(line)
+	return ok && item.Type == "GEOSITE" && strings.EqualFold(item.Payload, "cn") && strings.EqualFold(item.Target, "DIRECT")
+}
+
+func isCNGeoipDirect(line string) bool {
+	item, ok := parseMixinRuleLine(line)
+	return ok && item.Type == "GEOIP" && strings.EqualFold(item.Payload, "cn") && strings.EqualFold(item.Target, "DIRECT")
+}
+
+func isLANGeositeDirect(line string) bool {
+	item, ok := parseMixinRuleLine(line)
+	return ok && item.Type == "GEOSITE" && strings.EqualFold(item.Payload, "private") && strings.EqualFold(item.Target, "DIRECT")
+}
+
+func isLANGeoipDirect(line string) bool {
+	item, ok := parseMixinRuleLine(line)
+	return ok && item.Type == "GEOIP" && strings.EqualFold(item.Payload, "lan") && strings.EqualFold(item.Target, "DIRECT")
+}
+
+// ParseProfileMixinDocument parses .profile_mixin.yaml into visual toggles + rule rows.
+func ParseProfileMixinDocument(rawYAML []byte, defaultTarget string) (ProfileMixinDocument, error) {
+	text := string(rawYAML)
+	if strings.TrimSpace(text) == "" {
+		text = profile.DefaultProfileMixinTemplate
+	}
+	doc, err := profile.UnmarshalYAMLMap([]byte(text))
+	if err != nil {
+		return ProfileMixinDocument{}, err
+	}
+
+	var prepend []string
+	hasExtra := false
+	for k, v := range doc {
+		if k != "profile" {
+			hasExtra = true
+			continue
+		}
+		pm, ok := v.(map[string]any)
+		if !ok {
+			hasExtra = true
+			continue
+		}
+		prepend = profile.ExtractStringRules(pm["prepend-rules"])
+		for pk := range pm {
+			if pk != "prepend-rules" {
+				hasExtra = true
+			}
+		}
+	}
+
+	hasCNGeosite, hasCNGeoip := false, false
+	hasLANGeosite, hasLANGeoip := false, false
+	for _, r := range prepend {
+		if isCNGeositeDirect(r) {
+			hasCNGeosite = true
+		}
+		if isCNGeoipDirect(r) {
+			hasCNGeoip = true
+		}
+		if isLANGeositeDirect(r) {
+			hasLANGeosite = true
+		}
+		if isLANGeoipDirect(r) {
+			hasLANGeoip = true
+		}
+	}
+	bypassCNWeb := hasCNGeosite && hasCNGeoip
+	bypassLAN := hasLANGeosite && hasLANGeoip
+
+	rules := make([]MixinRuleItem, 0, len(prepend))
+	for _, r := range prepend {
+		if bypassCNWeb && (isCNGeositeDirect(r) || isCNGeoipDirect(r)) {
+			continue
+		}
+		if bypassLAN && (isLANGeositeDirect(r) || isLANGeoipDirect(r)) {
+			continue
+		}
+		if item, ok := parseMixinRuleLine(r); ok {
+			rules = append(rules, item)
+		}
+	}
+
+	return ProfileMixinDocument{
+		YAML:          text,
+		BypassCNWeb:   bypassCNWeb,
+		BypassLAN:     bypassLAN,
+		Rules:         rules,
+		HasExtraKeys:  hasExtra,
+		DefaultTarget: defaultTarget,
+	}, nil
+}
+
+// BuildProfileMixinYAML updates profile.prepend-rules inside baseYAML while preserving
+// any other top-level or profile keys (such as dns, proxy-groups, or append-rules).
+func BuildProfileMixinYAML(baseYAML []byte, bypassCNWeb, bypassLAN bool, items []MixinRuleItem) ([]byte, error) {
+	normalized, err := NormalizeAndValidateMixinRules(items)
+	if err != nil {
+		return nil, err
+	}
+
+	var doc map[string]any
+	if len(strings.TrimSpace(string(baseYAML))) > 0 {
+		doc, err = profile.UnmarshalYAMLMap(baseYAML)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if doc == nil {
+		doc = map[string]any{}
+	}
+
+	var lines []string
+	seen := map[string]bool{}
+	addLine := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			lines = append(lines, s)
+		}
+	}
+
+	for _, item := range normalized {
+		addLine(FormatMixinRuleItem(item))
+	}
+	if bypassLAN {
+		addLine("GEOSITE,private,DIRECT")
+		addLine("GEOIP,LAN,DIRECT,no-resolve")
+	}
+	if bypassCNWeb {
+		addLine("GEOSITE,cn,DIRECT")
+		addLine("GEOIP,CN,DIRECT,no-resolve")
+	}
+
+	profMap, _ := doc["profile"].(map[string]any)
+	if len(lines) > 0 {
+		if profMap == nil {
+			profMap = map[string]any{}
+		}
+		profMap["prepend-rules"] = lines
+		doc["profile"] = profMap
+	} else if profMap != nil {
+		delete(profMap, "prepend-rules")
+		if len(profMap) == 0 {
+			delete(doc, "profile")
+		} else {
+			doc["profile"] = profMap
+		}
+	}
+
+	if len(doc) == 0 {
+		return []byte(profile.DefaultProfileMixinTemplate), nil
+	}
+
+	marshaled, err := yaml.Marshal(doc)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(ProfileMixinHeaderComment), marshaled...), nil
+}
+
+// ExtractMixinRuleKeys returns normalized lookup keys ("type|payload|target") for all
+// rules defined in mixinYAML (after resolving PROXY placeholder) so GetEffectiveRules
+// can tag them as coming from Profile Mixin.
+func ExtractMixinRuleKeys(mixinYAML []byte, defTarget string, literalPROXYExists bool) map[string]bool {
+	out := map[string]bool{}
+	if len(strings.TrimSpace(string(mixinYAML))) == 0 {
+		return out
+	}
+	doc, err := profile.UnmarshalYAMLMap(mixinYAML)
+	if err != nil {
+		return out
+	}
+	var allLines []string
+	if prof, ok := doc["profile"].(map[string]any); ok {
+		allLines = append(allLines, profile.ExtractStringRules(prof["prepend-rules"])...)
+		allLines = append(allLines, profile.ExtractStringRules(prof["append-rules"])...)
+	}
+	allLines = append(allLines, profile.ExtractStringRules(doc["rules"])...)
+
+	for _, raw := range allLines {
+		resolved := profile.ResolveMixinRuleLine(raw, defTarget, literalPROXYExists)
+		if item, ok := parseMixinRuleLine(resolved); ok {
+			cleanType := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(item.Type)), "-", "")
+			key := cleanType + "|" + strings.ToLower(strings.TrimSpace(item.Payload)) + "|" + strings.TrimSpace(item.Target)
+			out[key] = true
+		}
+	}
+	return out
 }

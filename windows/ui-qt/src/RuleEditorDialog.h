@@ -10,7 +10,6 @@
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QPushButton>
-#include <QSet>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QVector>
@@ -19,14 +18,10 @@ namespace clashfx {
 
 class DaemonClient;
 
-struct CustomRuleEntry {
-    bool enabled = true;
+struct MixinRuleRow {
     QString type = QStringLiteral("DOMAIN-SUFFIX");
     QString payload;
-    QString target = QStringLiteral("@DEFAULT");
-    QString position = QStringLiteral("prepend");
-    bool noResolve = false;
-    QString note;
+    QString target = QStringLiteral("DIRECT");
 };
 
 class RuleEditorDialog final : public QDialog {
@@ -34,73 +29,76 @@ class RuleEditorDialog final : public QDialog {
 public:
     explicit RuleEditorDialog(DaemonClient* client, QWidget* parent = nullptr);
     void refreshFromSnapshot(const QJsonObject& snapshot);
+    void reloadMixinFromDaemon();
     void refreshEffectiveRules();
 
 protected:
     void closeEvent(QCloseEvent* event) override;
 
 private slots:
-    void onRuleTypeChanged(int index);
-    void onCustomSelectionChanged();
-    void onCustomCellChanged(int row, int column);
-    void onAddRule();
-    void onUpdateSelectedRule();
-    void onMoveUp();
-    void onMoveDown();
-    void onDeleteSelected();
+    void onAddRuleRow();
     void onSaveAndApply();
-    void onOpenMixinFile();
+    void onTabChanged(int index);
+    void onOpenMixinFolder();
     void onEffectiveSelectionChanged();
     void onFilterEffectiveRules(const QString& keyword);
 
 private:
-    bool readFormIntoEntry(CustomRuleEntry* out, QString* errMsg) const;
-    void rebuildCustomTable(int selectRow = -1);
-    void rebuildTargetCombo(const QString& preserveTarget = QString());
-    void setDirty(bool dirty);
+    void applyMixinDocument(const QJsonObject& doc, bool markClean);
+    void rebuildCustomTable(int focusRow = -1);
+    void populateTargetCombo(QComboBox* combo, const QString& currentTarget) const;
+    QJsonArray serializeVisualRulesJson(bool skipBlankPayload) const;
+    void setDirty(bool dirty, const QString& savedHint = QString());
     void renderEffectiveTable();
-    QString formatTargetDisplay(const QString& target) const;
-    static bool typeSupportsNoResolve(const QString& ruleType);
+    static QString placeholderForRuleType(const QString& ruleType);
 
     DaemonClient* client_ = nullptr;
-    bool updatingTable_ = false;
+    bool suppressSignals_ = false;
     bool dirty_ = false;
+    bool visualModifiedSinceSync_ = false;
+    bool yamlModifiedSinceSync_ = false;
+    int lastTabIndex_ = 0;
+
+    QString mixinFilePath_;
+    QString lastSyncedYaml_;
+    bool hasExtraYamlKeys_ = false;
 
     QString selectedProfile_;
     QString outboundMode_;
     QString defaultTarget_ = QStringLiteral("DIRECT");
-    QSet<QString> validTargetsInProfile_;
-    QVector<CustomRuleEntry> workingRules_;
+    QStringList groupTargets_;
+    QStringList nodeTargets_;
+    QVector<MixinRuleRow> workingRules_;
 
     QJsonArray effectiveRules_;
     QJsonObject ruleProviders_;
 
-    QLabel* infoBanner_ = nullptr;
+    QLabel* headerDescLabel_ = nullptr;
     QTabWidget* tabs_ = nullptr;
 
-    // Tab 1: Custom Rules
+    // Tab 0: Visual Config Patch
+    QCheckBox* bypassCNWebCheck_ = nullptr;
+    QCheckBox* bypassLANCheck_ = nullptr;
+    QLabel* emptyHintLabel_ = nullptr;
     QTableWidget* customTable_ = nullptr;
-    QComboBox* typeCombo_ = nullptr;
-    QComboBox* targetCombo_ = nullptr;
-    QComboBox* positionCombo_ = nullptr;
-    QLineEdit* payloadEdit_ = nullptr;
-    QCheckBox* noResolveCheck_ = nullptr;
-    QLineEdit* noteEdit_ = nullptr;
-    QPushButton* addBtn_ = nullptr;
-    QPushButton* updateRowBtn_ = nullptr;
-    QPushButton* moveUpBtn_ = nullptr;
-    QPushButton* moveDownBtn_ = nullptr;
-    QPushButton* deleteBtn_ = nullptr;
-    QLabel* unsavedLabel_ = nullptr;
-    QPushButton* saveApplyBtn_ = nullptr;
+    QPushButton* addRowBtn_ = nullptr;
+    QLabel* extraKeysBadge_ = nullptr;
 
-    // Tab 2: Effective Rules Inspector
+    // Tab 1: Raw YAML (.profile_mixin.yaml)
+    QLabel* yamlPathLabel_ = nullptr;
+    QPlainTextEdit* yamlEdit_ = nullptr;
+
+    // Tab 2: Live Effective Rules Inspector
     QLineEdit* searchEdit_ = nullptr;
     QLabel* effSummaryLabel_ = nullptr;
     QPushButton* refreshEffBtn_ = nullptr;
     QTableWidget* effTable_ = nullptr;
     QGroupBox* providerDetailBox_ = nullptr;
     QPlainTextEdit* providerDetailEdit_ = nullptr;
+
+    // Shared Footer
+    QLabel* statusLabel_ = nullptr;
+    QPushButton* saveApplyBtn_ = nullptr;
 };
 
 } // namespace clashfx
