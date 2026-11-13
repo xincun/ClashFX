@@ -3,6 +3,7 @@
 
 import os
 import pathlib
+import shutil
 import struct
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import sys
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 CORE_ENGINE_DIR = REPO_ROOT / "core-engine"
 BIN_ROOT = REPO_ROOT / "windows" / "build" / "bin"
+DIST_ROOT = REPO_ROOT / "windows" / "dist"
 
 TARGETS = [
     ("arm64", 0xAA64),
@@ -50,6 +52,9 @@ def main() -> int:
                 env=env,
             )
             verify_pe_machine(out_path, expected_machine)
+            dist_stage = DIST_ROOT / f"windows-{arch}"
+            if dist_stage.is_dir():
+                shutil.copy2(out_path, dist_stage / exe_name)
             kib = out_path.stat().st_size // 1024
             print(f"  [OK] windows/{arch}: {exe_name} ({kib} KiB)")
     return 0

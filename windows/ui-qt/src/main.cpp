@@ -87,7 +87,11 @@ bool forwardToExistingInstance(const QString& serverName, const QString& payload
     sock.write(payload.toUtf8());
     sock.flush();
     sock.waitForBytesWritten(350);
-    sock.disconnectFromServer();
+    // Wait until the primary instance finishes handleExternalCommand (including SetForegroundWindow)
+    // and disconnects the socket before this process exits, keeping the Win32 foreground grant alive.
+    if (sock.state() == QLocalSocket::ConnectedState) {
+        sock.waitForDisconnected(600);
+    }
     return true;
 }
 

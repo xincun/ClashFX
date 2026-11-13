@@ -61,7 +61,8 @@ type AppliedRuntimeState struct {
 // Controller serializes runtime configuration generation, preflight validation,
 // port reservation checks, and live reload with automatic rollback on failure.
 type Controller struct {
-	mu          sync.Mutex
+	applyMu     sync.Mutex
+	stateMu     sync.RWMutex
 	store       *profile.Store
 	applier     CoreApplier
 	dashboardUI string
@@ -81,21 +82,25 @@ func NewController(store *profile.Store, applier CoreApplier, dashboardUI string
 }
 
 func (c *Controller) SetPortProbeForTest(fn func(port int, checkUDP bool) (bool, bool)) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
 	c.probePort = fn
 }
 
 func (c *Controller) LastState() AppliedRuntimeState {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
 	return c.lastState
 }
 
+func (c *Controller) setLastState(st AppliedRuntimeState) {
+	c.stateMu.Lock()
+	c.lastState = st
+	c.stateMu.Unlock()
+}
+
 func (c *Controller) ResetActiveState() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.lastState = AppliedRuntimeState{}
+	c.setLastState(AppliedRuntimeState{})
 }
 
 func (c *Controller) RuntimeConfigPath() string {
@@ -109,65 +114,66 @@ func (c *Controller) LastGoodConfigPath() string {
 // Apply builds a candidate runtime config for the selected profile, validates it,
 // applies it to the core, and rolls back automatically if validation or apply fails.
 func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) (AppliedRuntimeState, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
 
+	prevState := c.LastState()
 	settings := c.store.Settings()
 	cfgDir := c.store.ActiveConfigDir()
 	srcPath := c.store.ProfilePath(settings.SelectedProfile)
 
 	srcBytes, err := os.ReadFile(srcPath)
 	if err != nil {
-		return c.lastState, fmt.Errorf("read profile %q: %w", settings.SelectedProfile, err)
+		return prevState, fmt.Errorf("read profile %q: %w", settings.SelectedProfile, err)
 	}
 	root, err := profile.UnmarshalYAMLMap(srcBytes)
 	if err != nil {
-		return c.lastState, fmt.Errorf("parse profile %q: %w", settings.SelectedProfile, err)
+		return prevState, fmt.Errorf("parse profile %q: %w", settings.SelectedProfile, err)
 	}
 
 	// 1. Merge Profile Mixin (unless Enhanced Mode CustomConfigAsIs is enabled)
 	if !(settings.EnhancedMode && settings.CustomConfigAsIs) {
 		mixinBytes, err := c.store.ReadProfileMixinBytes()
 		if err != nil {
-			return c.lastState, fmt.Errorf("read Profile Mixin: %w", err)
+			return prevState, fmt.Errorf("read Profile Mixin: %w", err)
 		}
 		root, err = profile.ApplyProfileMixin(root, mixinBytes)
 		if err != nil {
-			return c.lastState, err
+			return prevState, err
 		}
 	}
 
 	// 2. Apply runtime port, controller, DNS, and TUN policies
 	state, err := c.prepareRuntimeTopology(root, settings)
 	if err != nil {
-		return c.lastState, err
+		return prevState, err
 	}
 
 	// 3. Ensure disk-backed built-in ruleset files exist, then run registered feature hooks
 	if err := profile.EnsureBuiltinRulesetFiles(cfgDir); err != nil {
-		return c.lastState, err
+		return prevState, err
 	}
 	for _, hook := range c.hooks {
 		if err := hook(root, settings); err != nil {
-			return c.lastState, err
+			return prevState, err
 		}
 	}
 
 	candidateBytes, err := yaml.Marshal(root)
 	if err != nil {
-		return c.lastState, fmt.Errorf("marshal runtime config: %w", err)
+		return prevState, fmt.Errorf("marshal runtime config: %w", err)
 	}
 
 	candidatePath := filepath.Join(cfgDir, ".runtime-candidate.yaml")
 	defer os.Remove(candidatePath)
 	if err := profile.WriteFileAtomic(candidatePath, candidateBytes, 0600); err != nil {
-		return c.lastState, err
+		return prevState, err
 	}
 
 	// 4. Fail-closed preflight validation with mihomo_core -t BEFORE touching active runtime!
 	if c.applier != nil {
 		if err := c.applier.ValidateConfig(cfgDir, candidatePath); err != nil {
-			return c.lastState, err
+			return prevState, err
 		}
 	}
 
@@ -179,16 +185,16 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 	}
 
 	if err := profile.WriteFileAtomic(runtimePath, candidateBytes, 0600); err != nil {
-		return c.lastState, err
+		return prevState, err
 	}
 
 	// 5. Apply to core; if apply fails and a last-good snapshot exists, automatically roll back!
 	// Note: if the core is already running, REST reload must target the currently active API port/secret.
 	dialAPIPort := state.APIPort
 	dialSecret := state.APISecret
-	if c.lastState.APIPort > 0 {
-		dialAPIPort = c.lastState.APIPort
-		dialSecret = c.lastState.APISecret
+	if prevState.APIPort > 0 {
+		dialAPIPort = prevState.APIPort
+		dialSecret = prevState.APISecret
 	}
 	if c.applier != nil {
 		if applyErr := c.applier.ApplyRuntimeConfig(ctx, settings, cfgDir, runtimePath, dialAPIPort, dialSecret); applyErr != nil {
@@ -198,16 +204,17 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 					_ = c.applier.ApplyRuntimeConfig(ctx, settings, cfgDir, runtimePath, dialAPIPort, dialSecret)
 				}
 			}
-			return c.lastState, fmt.Errorf("apply runtime config failed (rolled back): %w", applyErr)
+			return prevState, fmt.Errorf("apply runtime config failed (rolled back): %w", applyErr)
 		}
 	}
 
 	_ = profile.WriteFileAtomic(lastGoodPath, candidateBytes, 0600)
-	c.lastState = state
+	c.setLastState(state)
 	return state, nil
 }
 
 func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profile.AppSettings) (AppliedRuntimeState, error) {
+	prevState := c.LastState()
 	state := AppliedRuntimeState{
 		ProfileName: settings.SelectedProfile,
 		Enhanced:    settings.EnhancedMode,
@@ -246,7 +253,7 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		}
 	}
 	mixedPort := intFromYAML(root["mixed-port"])
-	ownedMixedPort := c.lastState.MixedPort
+	ownedMixedPort := prevState.MixedPort
 	if mixedPort != ownedMixedPort && !c.isPortUsable(mixedPort, false) {
 		if settings.PortOverride > 0 {
 			return state, fmt.Errorf("configured proxy port %d is unavailable or occupied by another application", mixedPort)
@@ -289,7 +296,7 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 	if apiPort <= 0 {
 		apiPort = 19090
 	}
-	ownedAPIPort := c.lastState.APIPort
+	ownedAPIPort := prevState.APIPort
 	if reserved[apiPort] || (apiPort != ownedAPIPort && !c.isPortUsable(apiPort, false)) {
 		if ownedAPIPort > 0 && !reserved[ownedAPIPort] {
 			apiPort = ownedAPIPort
@@ -347,7 +354,7 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		if preferredDNS < 1024 {
 			preferredDNS = 1053
 		}
-		ownedDNSPort := c.lastState.DNSPort
+		ownedDNSPort := prevState.DNSPort
 		if reserved[preferredDNS] || (preferredDNS != ownedDNSPort && !c.isPortUsable(preferredDNS, true)) {
 			if ownedDNSPort > 0 && !reserved[ownedDNSPort] {
 				preferredDNS = ownedDNSPort

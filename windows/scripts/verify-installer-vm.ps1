@@ -39,7 +39,18 @@ New-Item -ItemType Directory -Force -Path "C:\Temp" | Out-Null
 Copy-Item -Force $SetupArm64 $LocalSetup
 
 $InstallDir = "C:\Program Files\ClashFX"
+New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -ErrorAction SilentlyContinue | Out-Null
 $RegInternetSettings = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+try {
+    $interactiveUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+    if ($interactiveUser) {
+        $sid = (New-Object System.Security.Principal.NTAccount($interactiveUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $candidateHive = "HKU:\$sid\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        if (Test-Path $candidateHive) {
+            $RegInternetSettings = $candidateHive
+        }
+    }
+} catch {}
 $OrigReg = Get-ItemProperty -Path $RegInternetSettings
 $OrigProxyEnable = [int]$OrigReg.ProxyEnable
 $OrigProxyServer = $OrigReg.ProxyServer

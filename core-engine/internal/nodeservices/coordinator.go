@@ -269,6 +269,10 @@ func (c *Coordinator) CheckConnectivityNow(parentCtx context.Context) error {
 	}
 	pKey := ProfileKey(api.ProfileName)
 	names := append([]string(nil), st.ActiveNames[pKey]...)
+	provOwners := map[string]string{}
+	for k, v := range st.ProviderOwners[pKey] {
+		provOwners[k] = v
+	}
 	if len(names) == 0 {
 		c.setStatus("The active configuration has no inline proxy nodes")
 		return nil
@@ -313,7 +317,7 @@ func (c *Coordinator) CheckConnectivityNow(parentCtx context.Context) error {
 			}
 			defer func() { <-sem }()
 
-			sample := probeSingleNode204(ctx, api.APIPort, api.APISecret, n, primaryURL, secondaryURL)
+			sample := probeSingleNode204(ctx, api.APIPort, api.APISecret, n, provOwners[n], primaryURL, secondaryURL)
 			resCh <- result{name: n, sample: sample}
 		}(nodeName)
 	}
@@ -368,15 +372,15 @@ func (c *Coordinator) CheckConnectivityNow(parentCtx context.Context) error {
 	return nil
 }
 
-func probeSingleNode204(ctx context.Context, apiPort int, secret, nodeName, primaryURL, secondaryURL string) NodeHealthSample {
-	delay, ok, avail := callMihomoDelay204(ctx, apiPort, secret, nodeName, primaryURL)
+func probeSingleNode204(ctx context.Context, apiPort int, secret, nodeName, providerOwner, primaryURL, secondaryURL string) NodeHealthSample {
+	delay, ok, avail := callMihomoDelay204(ctx, apiPort, secret, nodeName, providerOwner, primaryURL)
 	if !avail {
 		return NodeHealthSample{Kind: HealthUnavailable}
 	}
 	if ok {
 		return NodeHealthSample{Kind: HealthHealthy, DelayMs: delay}
 	}
-	delay2, ok2, avail2 := callMihomoDelay204(ctx, apiPort, secret, nodeName, secondaryURL)
+	delay2, ok2, avail2 := callMihomoDelay204(ctx, apiPort, secret, nodeName, providerOwner, secondaryURL)
 	if !avail2 {
 		return NodeHealthSample{Kind: HealthUnavailable}
 	}
@@ -386,43 +390,58 @@ func probeSingleNode204(ctx context.Context, apiPort int, secret, nodeName, prim
 	return NodeHealthSample{Kind: HealthFailed}
 }
 
-func callMihomoDelay204(ctx context.Context, apiPort int, secret, nodeName, benchURL string) (delay int, healthy bool, available bool) {
+func callMihomoDelay204(ctx context.Context, apiPort int, secret, nodeName, providerOwner, benchURL string) (delay int, healthy bool, available bool) {
 	q := url.Values{}
 	q.Set("url", benchURL)
 	q.Set("timeout", "5000")
 	q.Set("expected", "204")
-	endpoint := fmt.Sprintf("http://127.0.0.1:%d/proxies/%s/delay?%s", apiPort, url.PathEscape(nodeName), q.Encode())
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return 0, false, false
+	endpoints := []string{
+		fmt.Sprintf("http://127.0.0.1:%d/proxies/%s/delay?%s", apiPort, url.PathEscape(nodeName), q.Encode()),
 	}
-	if secret != "" {
-		req.Header.Set("Authorization", "Bearer "+secret)
+	if strings.TrimSpace(providerOwner) != "" {
+		endpoints = append(endpoints, fmt.Sprintf(
+			"http://127.0.0.1:%d/providers/proxies/%s/%s/delay?%s",
+			apiPort,
+			url.PathEscape(strings.TrimSpace(providerOwner)),
+			url.PathEscape(nodeName),
+			q.Encode(),
+		))
 	}
+
 	client := &http.Client{Timeout: 6500 * time.Millisecond}
-	resp, err := client.Do(req)
-	if err != nil {
-		if ctx.Err() != nil {
+	for idx, endpoint := range endpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
 			return 0, false, false
 		}
-		return 0, false, false
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if secret != "" {
+			req.Header.Set("Authorization", "Bearer "+secret)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, false, false
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnauthorized {
-		return 0, false, false
-	}
-	if resp.StatusCode == http.StatusOK {
-		var payload struct {
-			Delay int `json:"delay"`
+		if resp.StatusCode == http.StatusNotFound && idx+1 < len(endpoints) {
+			continue
 		}
-		if json.Unmarshal(body, &payload) == nil && payload.Delay > 0 {
-			return payload.Delay, true, true
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnauthorized {
+			return 0, false, false
 		}
+		if resp.StatusCode == http.StatusOK {
+			var payload struct {
+				Delay int `json:"delay"`
+			}
+			if json.Unmarshal(body, &payload) == nil && payload.Delay > 0 {
+				return payload.Delay, true, true
+			}
+		}
+		return 0, false, true
 	}
-	return 0, false, true
+	return 0, false, false
 }
 
 func (c *Coordinator) RefreshSubscriptionDirectly(ctx context.Context, manual bool) error {

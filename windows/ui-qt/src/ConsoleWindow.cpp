@@ -51,11 +51,14 @@ ConsoleWindow::ConsoleWindow(QWidget* parent)
     barLayout->setSpacing(8);
 
     statusBadge_ = new QLabel(headerBar);
+    statusBadge_->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
     statusBadge_->setStyleSheet(QStringLiteral(
         "background-color: #2563eb; color: #ffffff; border-radius: 4px; padding: 2px 8px; font-weight: 600;"));
     detailLabel_ = new QLabel(headerBar);
+    detailLabel_->setMinimumWidth(120);
 
     trafficLabel_ = new QLabel(QStringLiteral("↑ 0 B/s  ↓ 0 B/s"), headerBar);
+    trafficLabel_->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
     trafficLabel_->setStyleSheet(QStringLiteral(
         "background-color: #222226; color: #93c5fd; border: 1px solid #2e2e33; "
         "border-radius: 4px; padding: 2px 8px; font-family: Consolas, monospace; font-size: 11px;"));

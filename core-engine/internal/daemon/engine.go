@@ -125,8 +125,9 @@ type Engine struct {
 	coreHelper   subscription.BinaryCoreHelper
 
 	opMu              sync.Mutex
-	coreViaService    bool
 	allowPromptUAC    bool
+	statusMu          sync.RWMutex
+	coreViaService    bool
 	suspendedByNet    string
 	lastApplyErr      string
 	proxyGroupsMu     sync.RWMutex
@@ -201,7 +202,7 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 			return nil
 		},
 		features.TransformHookForCNApps(),
-		nodeStore.TransformHookForController(eng.IsCoreRunning),
+		nodeStore.TransformHookForControllerWithProviderProxies(eng.IsCoreRunning, eng.loadProviderProxiesForNodeServices),
 	)
 
 	eng.nodeCoord = nodeservices.NewCoordinator(
@@ -304,9 +305,7 @@ func (e *Engine) ShutdownWithForceRestore(forceRestore bool) {
 	}
 
 	_ = e.localRunner.Stop()
-	e.opMu.Lock()
-	viaSvc := e.coreViaService
-	e.opMu.Unlock()
+	viaSvc := e.isCoreViaService()
 	if viaSvc {
 		_, _ = callService(5*time.Second, service.Request{Action: "stop_core"})
 	}
@@ -359,7 +358,7 @@ func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSet
 				return err
 			}
 		}
-		if e.coreViaService && e.isServiceCoreRunning() {
+		if e.isCoreViaService() && e.isServiceCoreRunning() {
 			if err := transaction.ReloadViaREST(ctx, apiPort, secret, runtimeConfigPath); err == nil {
 				return nil
 			}
@@ -376,14 +375,14 @@ func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSet
 		if !resp.OK {
 			return fmt.Errorf("ClashFXService start_core failed: %s", resp.Message)
 		}
-		e.coreViaService = true
+		e.setCoreViaService(true)
 		return nil
 	}
 
 	// Normal (non-elevated) mode
-	if e.coreViaService {
+	if e.isCoreViaService() {
 		_, _ = callService(6*time.Second, service.Request{Action: "stop_core"})
-		e.coreViaService = false
+		e.setCoreViaService(false)
 	}
 	if e.localRunner.Status().Running {
 		if err := transaction.ReloadViaREST(ctx, apiPort, secret, runtimeConfigPath); err == nil {
@@ -394,8 +393,20 @@ func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSet
 	return err
 }
 
+func (e *Engine) isCoreViaService() bool {
+	e.statusMu.RLock()
+	defer e.statusMu.RUnlock()
+	return e.coreViaService
+}
+
+func (e *Engine) setCoreViaService(v bool) {
+	e.statusMu.Lock()
+	e.coreViaService = v
+	e.statusMu.Unlock()
+}
+
 func (e *Engine) IsCoreRunning() bool {
-	if e.coreViaService {
+	if e.isCoreViaService() {
 		return e.isServiceCoreRunning()
 	}
 	return e.localRunner.Status().Running
@@ -409,18 +420,20 @@ func (e *Engine) isServiceCoreRunning() bool {
 func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUAC bool) (transaction.AppliedRuntimeState, error) {
 	e.opMu.Lock()
 	e.allowPromptUAC = allowUAC
-	prevViaService := e.coreViaService
+	prevViaService := e.isCoreViaService()
 	wantService := e.store.Settings().EnhancedMode && runtime.GOOS == "windows"
 	if prevViaService != wantService {
 		e.ctrl.ResetActiveState()
 	}
 	state, err := e.ctrl.Apply(ctx, includeRecovery)
 	e.allowPromptUAC = false
+	e.statusMu.Lock()
 	if err != nil {
 		e.lastApplyErr = err.Error()
 	} else {
 		e.lastApplyErr = ""
 	}
+	e.statusMu.Unlock()
 	e.opMu.Unlock()
 
 	if err != nil {
@@ -477,9 +490,9 @@ func (e *Engine) reconcileSystemProxy() {
 		matchedRule = ""
 	}
 
-	e.opMu.Lock()
+	e.statusMu.Lock()
 	e.suspendedByNet = matchedRule
-	e.opMu.Unlock()
+	e.statusMu.Unlock()
 
 	if settings.SystemProxyEnabled && !shouldSuspend && rt.HTTPPort > 0 {
 		_, _ = e.sysProxy.ReconcileIfExpected(true, rt.HTTPPort, settings.ProxyBypassList)
@@ -516,13 +529,13 @@ func (e *Engine) backgroundMaintenanceLoop() {
 		case <-coreSyncTicker.C:
 			e.syncFromLiveCore(context.Background())
 		case <-netTicker.C:
-			e.opMu.Lock()
+			e.statusMu.RLock()
 			prevSuspended := e.suspendedByNet
-			e.opMu.Unlock()
+			e.statusMu.RUnlock()
 			e.reconcileSystemProxy()
-			e.opMu.Lock()
+			e.statusMu.RLock()
 			currSuspended := e.suspendedByNet
-			e.opMu.Unlock()
+			e.statusMu.RUnlock()
 			if currSuspended != prevSuspended {
 				e.notifyStateChanged()
 			}
@@ -757,11 +770,11 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 		activeSubInfo = &copied
 	}
 
-	e.opMu.Lock()
+	e.statusMu.RLock()
 	suspended := e.suspendedByNet
 	viaSvc := e.coreViaService
 	lastErr := e.lastApplyErr
-	e.opMu.Unlock()
+	e.statusMu.RUnlock()
 
 	logsDir := filepath.Join(e.store.AppDataDir(), "logs")
 	_ = os.MkdirAll(logsDir, 0700)
@@ -846,6 +859,20 @@ func (e *Engine) activeLocalProxyPort() int {
 		return rt.MixedPort
 	}
 	return 0
+}
+
+func (e *Engine) loadProviderProxiesForNodeServices(rawRoot map[string]any) []nodeservices.ProviderProxy {
+	snaps := e.loadProviderSnapshots(rawRoot)
+	var out []nodeservices.ProviderProxy
+	for _, snap := range snaps {
+		for _, px := range snap.Proxies {
+			out = append(out, nodeservices.ProviderProxy{
+				ProviderName: snap.Name,
+				Proxy:        px,
+			})
+		}
+	}
+	return out
 }
 
 func (e *Engine) loadProviderSnapshots(rawRoot map[string]any) []ailock.ProviderSnapshot {
@@ -2156,10 +2183,10 @@ func (e *Engine) SetRuleDisabled(ctx context.Context, indices []int, disabled bo
 func (e *Engine) DiagnosticInfo() string {
 	rt := e.ctrl.LastState()
 	osState, _ := e.sysProxy.CurrentOSState()
-	e.opMu.Lock()
+	e.statusMu.RLock()
 	viaSvc := e.coreViaService
 	suspendedNet := e.suspendedByNet
-	e.opMu.Unlock()
+	e.statusMu.RUnlock()
 
 	var recentLogs []string
 	if viaSvc {

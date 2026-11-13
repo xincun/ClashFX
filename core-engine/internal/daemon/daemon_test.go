@@ -15,6 +15,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/clashfx/core-engine/internal/ailock"
+	"github.com/clashfx/core-engine/internal/features"
+	"github.com/clashfx/core-engine/internal/profile"
+	"github.com/clashfx/core-engine/internal/transaction"
 )
 
 func TestDaemonNamedPipeIPCSubscribeActionsAndDiagnostics(t *testing.T) {
@@ -409,5 +414,119 @@ func TestLoadProviderSnapshotsFromDiskAndUninstallCleanup(t *testing.T) {
 
 	if err := CleanupUninstallState(appData); err != nil {
 		t.Fatalf("CleanupUninstallState failed: %v", err)
+	}
+}
+
+type noopApplier struct{}
+
+func (noopApplier) ValidateConfig(_, _ string) error { return nil }
+func (noopApplier) ApplyRuntimeConfig(_ context.Context, _ profile.AppSettings, _, _ string, _ int, _ string) error {
+	return nil
+}
+
+func TestControllerHooksWithProxyProvidersNoDeadlockAndMultiNodeParity(t *testing.T) {
+	appData := t.TempDir()
+	eng, err := NewEngine(Config{AppDataDir: appData}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Shutdown()
+
+	// Replace applier with noopApplier so this regression test always runs even without CLASHFX_CORE_EXE
+	eng.ctrl = transaction.NewController(
+		eng.store,
+		noopApplier{},
+		"",
+		func(root map[string]any, settings profile.AppSettings) error {
+			if !settings.AILockEnabled {
+				return nil
+			}
+			outcome := ailock.Apply(root, settings.AILockTarget, eng.loadProviderSnapshots(root))
+			if !outcome.Applied {
+				return fmt.Errorf("AI Proxy Lock rejected target %q: %s", settings.AILockTarget, outcome.RejectionReason)
+			}
+			return nil
+		},
+		features.TransformHookForCNApps(),
+		eng.nodeStore.TransformHookForControllerWithProviderProxies(eng.IsCoreRunning, eng.loadProviderProxiesForNodeServices),
+	)
+
+	cfgDir := eng.store.ActiveConfigDir()
+	provDir := filepath.Join(cfgDir, "providers")
+	if err := os.MkdirAll(provDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	provYAML := `proxies:
+  - name: "US-Claude-Dedicated"
+    type: socks5
+    server: 198.51.100.11
+    port: 1080
+  - name: "JP-OpenAI-Pro"
+    type: socks5
+    server: 198.51.100.12
+    port: 1080
+`
+	if err := os.WriteFile(filepath.Join(provDir, "demo-airport.yaml"), []byte(provYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	profYAML := `mixed-port: 17890
+proxies:
+  - name: "HK-Fast-Inline"
+    type: socks5
+    server: 198.51.100.13
+    port: 1080
+proxy-providers:
+  demo-airport:
+    type: file
+    path: ./providers/demo-airport.yaml
+proxy-groups:
+  - name: "Proxy"
+    type: select
+    use:
+      - demo-airport
+    proxies:
+      - "HK-Fast-Inline"
+      - "DIRECT"
+rules:
+  - MATCH,Proxy
+`
+	if err := os.WriteFile(filepath.Join(cfgDir, "demo-airport.yaml"), []byte(profYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		if err := eng.SelectProfile(context.Background(), "demo-airport"); err != nil {
+			done <- fmt.Errorf("SelectProfile: %w", err)
+			return
+		}
+		if err := eng.SetAILock(context.Background(), true, "US-Claude-Dedicated", false); err != nil {
+			done <- fmt.Errorf("SetAILock: %w", err)
+			return
+		}
+		snap := eng.Snapshot()
+		if len(snap.NodeServices.Rows) != 3 {
+			done <- fmt.Errorf("expected 3 multi-node rows (1 inline + 2 provider), got %d: %+v", len(snap.NodeServices.Rows), snap.NodeServices.Rows)
+			return
+		}
+		rawRt, rErr := os.ReadFile(eng.ctrl.RuntimeConfigPath())
+		if rErr != nil {
+			done <- rErr
+			return
+		}
+		if !strings.Contains(string(rawRt), "clashfx-node-service-target-") {
+			done <- fmt.Errorf("expected hidden target wrapper group for non-materialized provider listener in runtime config:\n%s", string(rawRt))
+			return
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DEADLOCK: SelectProfile + SetAILock + Snapshot timed out on proxy-providers profile")
 	}
 }

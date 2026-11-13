@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -369,7 +370,16 @@ func ReservedPortsInConfig(root map[string]any) map[int]bool {
 	return ports
 }
 
+type ProviderProxy struct {
+	ProviderName string
+	Proxy        map[string]any
+}
+
 func ApplyListeners(root map[string]any, bindings []NodePortBinding, directPort *int) {
+	ApplyListenersWithProviders(root, bindings, directPort, nil)
+}
+
+func ApplyListenersWithProviders(root map[string]any, bindings []NodePortBinding, directPort *int, providerOwners map[string]string) {
 	var listeners []any
 	for _, ln := range mapSliceFromAny(root["listeners"]) {
 		name, _ := ln["name"].(string)
@@ -392,6 +402,29 @@ func ApplyListeners(root map[string]any, bindings []NodePortBinding, directPort 
 		}
 	}
 
+	inlineNames := map[string]bool{}
+	for _, px := range mapSliceFromAny(root["proxies"]) {
+		if n, _ := px["name"].(string); strings.TrimSpace(n) != "" {
+			inlineNames[strings.TrimSpace(n)] = true
+		}
+	}
+
+	rawGroups := mapSliceFromAny(root["proxy-groups"])
+	var proxyGroups []any
+	groupNames := map[string]bool{}
+	groupsModified := false
+	for _, g := range rawGroups {
+		n, _ := g["name"].(string)
+		if strings.HasPrefix(n, ListenerPrefix+"target-") {
+			groupsModified = true
+			continue
+		}
+		if strings.TrimSpace(n) != "" {
+			groupNames[strings.TrimSpace(n)] = true
+		}
+		proxyGroups = append(proxyGroups, g)
+	}
+
 	makeListener := func(name string, port int, proxy string, udp bool) map[string]any {
 		return map[string]any{
 			"name":   name,
@@ -407,10 +440,25 @@ func ApplyListeners(root map[string]any, bindings []NodePortBinding, directPort 
 		if !b.Enabled {
 			continue
 		}
+		targetProxy := b.Name
+		if !inlineNames[b.Name] && !groupNames[b.Name] {
+			if provName := strings.TrimSpace(providerOwners[b.Name]); provName != "" && !strings.Contains(b.Name, "`") {
+				hiddenGroup := fmt.Sprintf("%starget-%d", ListenerPrefix, b.Port)
+				proxyGroups = append(proxyGroups, map[string]any{
+					"name":   hiddenGroup,
+					"type":   "select",
+					"hidden": true,
+					"use":    []any{provName},
+					"filter": "^" + regexp.QuoteMeta(b.Name) + "$",
+				})
+				targetProxy = hiddenGroup
+				groupsModified = true
+			}
+		}
 		listeners = append(listeners, makeListener(
 			fmt.Sprintf("%s%d", ListenerPrefix, b.Port),
 			b.Port,
-			b.Name,
+			targetProxy,
 			true,
 		))
 	}
@@ -423,24 +471,29 @@ func ApplyListeners(root map[string]any, bindings []NodePortBinding, directPort 
 		))
 	}
 
+	if groupsModified {
+		root["proxy-groups"] = proxyGroups
+	}
 	if len(listeners) > 0 || root["listeners"] != nil {
 		root["listeners"] = listeners
 	}
 }
 
 type PersistedState struct {
-	Settings    Settings             `json:"settings"`
-	Registry    Registry             `json:"registry"`
-	LastRefresh map[string]time.Time `json:"last_refresh,omitempty"`
-	ActiveNames map[string][]string  `json:"active_names,omitempty"`
+	Settings       Settings                     `json:"settings"`
+	Registry       Registry                     `json:"registry"`
+	LastRefresh    map[string]time.Time         `json:"last_refresh,omitempty"`
+	ActiveNames    map[string][]string          `json:"active_names,omitempty"`
+	ProviderOwners map[string]map[string]string `json:"provider_owners,omitempty"`
 }
 
 func DefaultPersistedState() PersistedState {
 	return PersistedState{
-		Settings:    DefaultSettings(),
-		Registry:    NewRegistry(),
-		LastRefresh: map[string]time.Time{},
-		ActiveNames: map[string][]string{},
+		Settings:       DefaultSettings(),
+		Registry:       NewRegistry(),
+		LastRefresh:    map[string]time.Time{},
+		ActiveNames:    map[string][]string{},
+		ProviderOwners: map[string]map[string]string{},
 	}
 }
 
@@ -497,6 +550,9 @@ func (s *Store) readLocked() (PersistedState, error) {
 	}
 	if st.ActiveNames == nil {
 		st.ActiveNames = map[string][]string{}
+	}
+	if st.ProviderOwners == nil {
+		st.ProviderOwners = map[string]map[string]string{}
 	}
 	return st, nil
 }
@@ -582,10 +638,18 @@ func (s *Store) ActiveBindings(profileName string) ([]NodePortBinding, *int, Set
 
 // Prepare mutates root in-place with fixed node listeners + direct-refresh listener (pure 1-port-to-1-node proxy bindings, no sub-rules).
 func (s *Store) Prepare(root map[string]any, profileName string, coreRunning bool) ([]NodePortBinding, error) {
-	return s.PrepareWithFallbackProxies(root, profileName, coreRunning, nil)
+	return s.PrepareWithProviderProxies(root, profileName, coreRunning, nil)
 }
 
 func (s *Store) PrepareWithFallbackProxies(root map[string]any, profileName string, coreRunning bool, fallbackProxies []map[string]any) ([]NodePortBinding, error) {
+	wrapped := make([]ProviderProxy, 0, len(fallbackProxies))
+	for _, px := range fallbackProxies {
+		wrapped = append(wrapped, ProviderProxy{Proxy: px})
+	}
+	return s.PrepareWithProviderProxies(root, profileName, coreRunning, wrapped)
+}
+
+func (s *Store) PrepareWithProviderProxies(root map[string]any, profileName string, coreRunning bool, providerProxies []ProviderProxy) ([]NodePortBinding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -598,9 +662,32 @@ func (s *Store) PrepareWithFallbackProxies(root map[string]any, profileName stri
 	}
 
 	reserved := ReservedPortsInConfig(root)
-	proxies := mapSliceFromAny(root["proxies"])
-	if len(proxies) == 0 && len(fallbackProxies) > 0 {
-		proxies = fallbackProxies
+	inlineProxies := mapSliceFromAny(root["proxies"])
+	seenNames := make(map[string]bool, len(inlineProxies)+len(providerProxies))
+	proxies := make([]map[string]any, 0, len(inlineProxies)+len(providerProxies))
+	for _, px := range inlineProxies {
+		n, _ := px["name"].(string)
+		n = strings.TrimSpace(n)
+		if n != "" {
+			seenNames[n] = true
+		}
+		proxies = append(proxies, px)
+	}
+	providerOwners := map[string]string{}
+	for _, pp := range providerProxies {
+		if pp.Proxy == nil {
+			continue
+		}
+		n, _ := pp.Proxy["name"].(string)
+		n = strings.TrimSpace(n)
+		if n == "" || seenNames[n] {
+			continue
+		}
+		seenNames[n] = true
+		proxies = append(proxies, pp.Proxy)
+		if strings.TrimSpace(pp.ProviderName) != "" {
+			providerOwners[n] = strings.TrimSpace(pp.ProviderName)
+		}
 	}
 	pKey := ProfileKey(profileName)
 
@@ -631,6 +718,7 @@ func (s *Store) PrepareWithFallbackProxies(root map[string]any, profileName stri
 		}
 	}
 	st.ActiveNames[pKey] = names
+	st.ProviderOwners[pKey] = providerOwners
 
 	var directPtr *int
 	if st.Settings.RecoveryEnabled {
@@ -651,7 +739,7 @@ func (s *Store) PrepareWithFallbackProxies(root map[string]any, profileName stri
 	if st.Settings.PortsEnabled {
 		appliedBindings = bindings
 	}
-	ApplyListeners(root, appliedBindings, directPtr)
+	ApplyListenersWithProviders(root, appliedBindings, directPtr, providerOwners)
 
 	if err := s.writeLocked(st); err != nil {
 		return nil, err
@@ -660,12 +748,30 @@ func (s *Store) PrepareWithFallbackProxies(root map[string]any, profileName stri
 }
 
 func (s *Store) TransformHookForController(isCoreRunning func() bool) func(root map[string]any, settings profile.AppSettings) error {
-	return s.TransformHookForControllerWithProviders(isCoreRunning, nil)
+	return s.TransformHookForControllerWithProviderProxies(isCoreRunning, nil)
 }
 
 func (s *Store) TransformHookForControllerWithProviders(
 	isCoreRunning func() bool,
 	fallbackProxiesLoader func(root map[string]any) []map[string]any,
+) func(root map[string]any, settings profile.AppSettings) error {
+	var wrapped func(root map[string]any) []ProviderProxy
+	if fallbackProxiesLoader != nil {
+		wrapped = func(root map[string]any) []ProviderProxy {
+			raw := fallbackProxiesLoader(root)
+			out := make([]ProviderProxy, 0, len(raw))
+			for _, px := range raw {
+				out = append(out, ProviderProxy{Proxy: px})
+			}
+			return out
+		}
+	}
+	return s.TransformHookForControllerWithProviderProxies(isCoreRunning, wrapped)
+}
+
+func (s *Store) TransformHookForControllerWithProviderProxies(
+	isCoreRunning func() bool,
+	providerProxiesLoader func(root map[string]any) []ProviderProxy,
 ) func(root map[string]any, settings profile.AppSettings) error {
 	return func(root map[string]any, settings profile.AppSettings) error {
 		if settings.EnhancedMode && settings.CustomConfigAsIs {
@@ -675,11 +781,11 @@ func (s *Store) TransformHookForControllerWithProviders(
 		if isCoreRunning != nil {
 			running = isCoreRunning()
 		}
-		var fallback []map[string]any
-		if fallbackProxiesLoader != nil {
-			fallback = fallbackProxiesLoader(root)
+		var provs []ProviderProxy
+		if providerProxiesLoader != nil {
+			provs = providerProxiesLoader(root)
 		}
-		_, err := s.PrepareWithFallbackProxies(root, settings.SelectedProfile, running, fallback)
+		_, err := s.PrepareWithProviderProxies(root, settings.SelectedProfile, running, provs)
 		return err
 	}
 }

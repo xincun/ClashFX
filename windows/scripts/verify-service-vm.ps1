@@ -91,16 +91,38 @@ try {
         throw "Expected Medium Integrity Level (S-1-16-8192), got: $groups"
     }
 
-    # P0-2 check 1: Untrusted process (powershell.exe) MUST be rejected by VerifyPipePeer!
-    $untrusted = Invoke-ServicePipe @{
-        action = "start_core"
-        home_dir = "C:\Temp\clashfx-p0-2\home"
-        config_file = "C:\Temp\clashfx-p0-2\home\config.yaml"
+    # P0-2 check 1: Untrusted process (powershell.exe) MUST be rejected immediately by VerifyPipePeer!
+    $rejected = $false
+    $rejectReason = ""
+    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", "ClashFXService", [System.IO.Pipes.PipeDirection]::InOut)
+    $pipe.Connect(5000)
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $reader = New-Object System.IO.StreamReader($pipe, $utf8, $false, 4096, $true)
+        $writer = New-Object System.IO.StreamWriter($pipe, $utf8, 4096, $true)
+        $writer.AutoFlush = $true
+        try {
+            $writer.WriteLine('{"action":"start_core","home_dir":"C:\\Temp\\clashfx-p0-2\\home","config_file":"C:\\Temp\\clashfx-p0-2\\home\\config.yaml"}')
+        } catch {
+            $rejected = $true
+            $rejectReason = $_.Exception.Message
+        }
+        $line = $null
+        try { $line = $reader.ReadLine() } catch {}
+        if ($line) {
+            $resp = $line | ConvertFrom-Json
+            if (-not $resp.ok -and $resp.message -match "unauthorized pipe caller") {
+                $rejected = $true
+                $rejectReason = $resp.message
+            }
+        }
+    } finally {
+        $pipe.Dispose()
     }
-    if ($untrusted.ok -or $untrusted.message -notmatch "unauthorized pipe caller") {
-        throw "Expected powershell.exe caller to be rejected by VerifyPipePeer, got: $($untrusted | ConvertTo-Json -Compress)"
+    if (-not $rejected) {
+        throw "Expected powershell.exe caller to be rejected by VerifyPipePeer!"
     }
-    Log "P0-2 verified: untrusted pipe caller rejected ($($untrusted.message))"
+    Log "P0-2 verified: untrusted pipe caller rejected ($rejectReason)"
 
     # P0-2 check 2: Trusted clashfx-daemon.exe inside C:\Program Files\ClashFXTest succeeds with zero UAC!
     $daemonPipe = "ClashFXDaemon-P02Verify"

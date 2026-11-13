@@ -63,39 +63,46 @@ func ProbeSingleNode(
 	q.Set("url", benchmarkURL)
 	q.Set("timeout", fmt.Sprintf("%d", timeoutMs))
 
-	var endpoint string
+	var endpoints []string
 	if strings.TrimSpace(providerName) != "" {
-		endpoint = fmt.Sprintf(
+		endpoints = append(endpoints, fmt.Sprintf(
 			"http://127.0.0.1:%d/providers/proxies/%s/%s/delay?%s",
 			apiPort,
 			url.PathEscape(strings.TrimSpace(providerName)),
 			url.PathEscape(nodeName),
 			q.Encode(),
-		)
-	} else {
-		endpoint = fmt.Sprintf(
-			"http://127.0.0.1:%d/proxies/%s/delay?%s",
-			apiPort,
-			url.PathEscape(nodeName),
-			q.Encode(),
-		)
+		))
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return SingleNodeProbeReport{}, err
-	}
-	if secret != "" {
-		req.Header.Set("Authorization", "Bearer "+secret)
-	}
+	endpoints = append(endpoints, fmt.Sprintf(
+		"http://127.0.0.1:%d/proxies/%s/delay?%s",
+		apiPort,
+		url.PathEscape(nodeName),
+		q.Encode(),
+	))
 
 	client := &http.Client{Timeout: time.Duration(timeoutMs+2500) * time.Millisecond}
-	resp, err := client.Do(req)
-	if err != nil {
-		return SingleNodeProbeReport{}, fmt.Errorf("request core delay endpoint: %w", err)
+	var statusCode int
+	var body []byte
+	for idx, endpoint := range endpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return SingleNodeProbeReport{}, err
+		}
+		if secret != "" {
+			req.Header.Set("Authorization", "Bearer "+secret)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return SingleNodeProbeReport{}, fmt.Errorf("request core delay endpoint: %w", err)
+		}
+		body, _ = io.ReadAll(io.LimitReader(resp.Body, 8192))
+		statusCode = resp.StatusCode
+		_ = resp.Body.Close()
+		if statusCode == http.StatusNotFound && idx+1 < len(endpoints) {
+			continue
+		}
+		break
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 
 	report := SingleNodeProbeReport{
 		NodeName:     nodeName,
@@ -103,7 +110,7 @@ func ProbeSingleNode(
 		BenchmarkURL: sanitizeDiagnosticURL(benchmarkURL),
 	}
 
-	if resp.StatusCode == http.StatusOK {
+	if statusCode == http.StatusOK {
 		var okPayload struct {
 			Delay int `json:"delay"`
 		}
@@ -128,7 +135,7 @@ func ProbeSingleNode(
 		rawMsg = strings.TrimSpace(string(body))
 	}
 	report.RawMessage = redactLogLine(rawMsg)
-	report.Kind, report.Code = classifyStockMihomoError(resp.StatusCode, rawMsg)
+	report.Kind, report.Code = classifyStockMihomoError(statusCode, rawMsg)
 
 	report.SummaryZH, report.AdviceZH, report.SummaryEN, report.AdviceEN = explainProbeCode(report.Code)
 	report.Formatted = formatSingleNodeReport(report, lang)
