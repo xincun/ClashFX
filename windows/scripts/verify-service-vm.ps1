@@ -1,12 +1,16 @@
 param(
     [ValidateSet("setup", "client", "teardown")]
     [string]$Phase = "setup",
-    [string]$BinRoot = "C:\Mac\Home\Desktop\workspace\github\ClashFX\windows\build\bin"
+    [string]$BinRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+if ([string]::IsNullOrWhiteSpace($BinRoot)) {
+    $BinRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\build\bin")).Path
+}
 
 $installDir = "C:\Program Files\ClashFXTest"
 $testDataDir = "C:\Temp\clashfx-p0-2"
@@ -40,33 +44,6 @@ if ($Phase -eq "setup") {
     }
     Write-Host "[service] ClashFXService installed & running"
 
-    $tunCfg = @"
-mixed-port: 17894
-allow-lan: false
-external-controller: 127.0.0.1:19094
-dns:
-  enable: true
-  listen: 127.0.0.1:11054
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  default-nameserver: [223.5.5.5, 1.1.1.1]
-  nameserver: [223.5.5.5, 1.1.1.1]
-tun:
-  enable: true
-  device: ClashFXSvcTun
-  stack: mixed
-  auto-route: true
-  auto-detect-interface: true
-  dns-hijack:
-    - any:53
-    - tcp://any:53
-  mtu: 1500
-rules:
-  - PROCESS-NAME,mihomo_core.exe,DIRECT
-  - MATCH,DIRECT
-"@
-    [System.IO.File]::WriteAllText("$testDataDir\home\config.yaml", $tunCfg, $utf8NoBom)
-
     $innerScript = @'
 $ErrorActionPreference = "Stop"
 $logFile = "C:\Temp\clashfx-p0-2\client.log"
@@ -89,7 +66,22 @@ function Invoke-ServicePipe([hashtable]$payload) {
         $pipe.Dispose()
     }
 }
+function Invoke-DaemonRpc([string]$PipeName, [string]$Method, [string]$ParamsJson = "{}") {
+    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", $PipeName, [System.IO.Pipes.PipeDirection]::InOut)
+    $pipe.Connect(5000)
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $writer = New-Object System.IO.StreamWriter($pipe, $utf8, 4096, $true)
+        $writer.AutoFlush = $true
+        $reader = New-Object System.IO.StreamReader($pipe, $utf8, $false, 4096, $true)
+        $writer.WriteLine("{`"id`":1,`"method`":`"$Method`",`"params`":$ParamsJson}")
+        return ($reader.ReadLine() | ConvertFrom-Json)
+    } finally {
+        $pipe.Dispose()
+    }
+}
 
+$daemonProc = $null
 try {
     $who = (whoami | Out-String).Trim()
     $groups = (whoami /groups | Out-String)
@@ -99,43 +91,55 @@ try {
         throw "Expected Medium Integrity Level (S-1-16-8192), got: $groups"
     }
 
-    $bad = Invoke-ServicePipe @{ action = "start_core"; home_dir = "\\evil\unc"; config_file = "C:\Temp\clashfx-p0-2\home\config.yaml" }
-    if ($bad.ok) {
-        throw "UNC path should have been rejected"
+    # P0-2 check 1: Untrusted process (powershell.exe) MUST be rejected by VerifyPipePeer!
+    $untrusted = Invoke-ServicePipe @{
+        action = "start_core"
+        home_dir = "C:\Temp\clashfx-p0-2\home"
+        config_file = "C:\Temp\clashfx-p0-2\home\config.yaml"
     }
-    Log "Security check rejected UNC path: $($bad.message)"
+    if ($untrusted.ok -or $untrusted.message -notmatch "unauthorized pipe caller") {
+        throw "Expected powershell.exe caller to be rejected by VerifyPipePeer, got: $($untrusted | ConvertTo-Json -Compress)"
+    }
+    Log "P0-2 verified: untrusted pipe caller rejected ($($untrusted.message))"
 
-    for ($cycle = 1; $cycle -le 3; $cycle++) {
-        $startResp = Invoke-ServicePipe @{
-            action = "start_core"
-            home_dir = "C:\Temp\clashfx-p0-2\home"
-            config_file = "C:\Temp\clashfx-p0-2\home\config.yaml"
-        }
-        if (-not $startResp.ok -or -not $startResp.status.running) {
-            throw "Cycle $cycle start_core failed: $($startResp | ConvertTo-Json -Compress)"
-        }
-        $adapter = Get-NetAdapter -Name "ClashFXSvcTun" -ErrorAction SilentlyContinue
-        if (-not $adapter -or $adapter.Status -ne "Up") {
-            throw "Cycle $cycle adapter ClashFXSvcTun not Up"
-        }
-        $ver = Invoke-RestMethod -Uri "http://127.0.0.1:19094/version" -TimeoutSec 2
-        Log "Cycle $cycle UP: pid=$($startResp.status.pid) adapter=$($adapter.Status) version=$($ver.version)"
+    # P0-2 check 2: Trusted clashfx-daemon.exe inside C:\Program Files\ClashFXTest succeeds with zero UAC!
+    $daemonPipe = "ClashFXDaemon-P02Verify"
+    $daemonProc = Start-Process -FilePath "C:\Program Files\ClashFXTest\clashfx-daemon.exe" `
+        -ArgumentList @("-pipe", $daemonPipe, "-data-dir", "C:\Temp\clashfx-p0-2\home") `
+        -WorkingDirectory "C:\Program Files\ClashFXTest" -WindowStyle Hidden -PassThru
 
-        $stopResp = Invoke-ServicePipe @{ action = "stop_core" }
-        if (-not $stopResp.ok -or $stopResp.status.running) {
-            throw "Cycle $cycle stop_core failed: $($stopResp | ConvertTo-Json -Compress)"
-        }
+    $ready = $false
+    for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 400
-        $left = Get-NetAdapter -Name "ClashFXSvcTun" -ErrorAction SilentlyContinue
-        if ($left) {
-            throw "Cycle $cycle leftover adapter $($left.Name)"
-        }
-        Log "Cycle $cycle STOPPED cleanly (zero adapter residue)"
+        try {
+            $st = Invoke-DaemonRpc -PipeName $daemonPipe -Method "get_state"
+            if ($st.ok -and $st.data.core_running -and $st.data.service_installed) {
+                $ready = $true
+                break
+            }
+        } catch {}
     }
+    if (-not $ready) {
+        throw "Trusted clashfx-daemon.exe failed to become ready"
+    }
+
+    $tunOn = Invoke-DaemonRpc -PipeName $daemonPipe -Method "set_enhanced_mode" -ParamsJson '{"enabled":true,"allow_uac":false}'
+    if (-not $tunOn.ok -or -not $tunOn.data.core_via_service) {
+        throw "Trusted daemon zero-UAC TUN failed: $($tunOn | ConvertTo-Json -Compress)"
+    }
+    Log "Trusted daemon TUN UP via service: core_via_service=$($tunOn.data.core_via_service)"
+
+    [void](Invoke-DaemonRpc -PipeName $daemonPipe -Method "quit_daemon" -ParamsJson '{"force_restore_proxy":true}')
+    [void]$daemonProc.WaitForExit(10000)
+    $daemonProc = $null
     Log "CLIENT_OK"
 } catch {
     Log "CLIENT_ERR: $_"
     exit 1
+} finally {
+    if ($null -ne $daemonProc -and -not $daemonProc.HasExited) {
+        try { $daemonProc.Kill() } catch {}
+    }
 }
 '@
     [System.IO.File]::WriteAllText("$testDataDir\inner-client.ps1", $innerScript, $utf8NoBom)

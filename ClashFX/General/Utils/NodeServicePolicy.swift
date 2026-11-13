@@ -62,16 +62,28 @@ struct NodePortRegistry: Codable, Equatable {
 
     mutating func reconcile(profile: String, proxies: [[String: Any]], firstPort: Int,
                             reserved: Set<Int>, available: (Int) -> Bool) throws -> [NodePortBinding] {
-        let names = proxies.compactMap { $0["name"] as? String }
-        guard names.count == proxies.count, Set(names).count == names.count,
-              names.allSatisfy({ !$0.isEmpty }) else { throw NodeServiceError.invalidNodes }
+        var names = [String]()
+        var nameSet = Set<String>()
+        var serverKeys = [String]()
+        var serverCounts = [String: Int]()
+        for proxy in proxies {
+            guard let rawName = proxy["name"] as? String else { continue }
+            let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !nameSet.contains(trimmed) else { continue }
+            nameSet.insert(trimmed)
+            names.append(trimmed)
+            let key = Self.serverKey(proxy)
+            serverKeys.append(key)
+            if !key.isEmpty {
+                serverCounts[key, default: 0] += 1
+            }
+        }
         let previous = profiles[profile] ?? []
         var retained = previous
-        var used = Set(profiles.values.flatMap { $0 }.map { $0.port }).union(reserved)
+        var used = Set(previous.map { $0.port }).union(reserved)
         if let port = directPort { used.insert(port) }
         var claimed = Set<String>()
         var active = [NodePortBinding]()
-        let serverKeys = proxies.map(Self.serverKey)
 
         for (index, name) in names.enumerated() {
             let key = serverKeys[index]
@@ -79,9 +91,9 @@ struct NodePortRegistry: Codable, Equatable {
             // Password rotations and list ordering never affect a port. Also
             // retain it across a rename/server-port change when that server is
             // unambiguous, as in JMS's one-node-per-server subscriptions.
-            if binding == nil, !key.isEmpty, serverKeys.filter({ $0 == key }).count == 1 {
+            if binding == nil, !key.isEmpty, serverCounts[key] == 1 {
                 let candidates = previous.filter {
-                    $0.serverKey == key && !names.contains($0.name) && !claimed.contains($0.name)
+                    $0.serverKey == key && !nameSet.contains($0.name) && !claimed.contains($0.name)
                 }
                 if candidates.count == 1 {
                     binding = candidates[0]
@@ -112,12 +124,12 @@ struct NodePortRegistry: Codable, Equatable {
         return active
     }
 
-    mutating func setPort(_ port: Int, profile: String, node: String) throws {
-        guard (1024 ... 65535).contains(port), port != directPort else { throw NodeServiceError.portConflict(port) }
-        for (scope, entries) in profiles {
-            if entries.contains(where: { $0.port == port && (scope != profile || $0.name != node) }) {
-                throw NodeServiceError.portConflict(port)
-            }
+    mutating func setPort(_ port: Int, profile: String, node: String, reserved: Set<Int> = []) throws {
+        guard (1024 ... 65535).contains(port), !reserved.contains(port), port != directPort else {
+            throw NodeServiceError.portConflict(port)
+        }
+        if let entries = profiles[profile], entries.contains(where: { $0.port == port && $0.name != node }) {
+            throw NodeServiceError.portConflict(port)
         }
         guard let index = profiles[profile]?.firstIndex(where: { $0.name == node }) else {
             throw NodeServiceError.invalidNodes
@@ -125,16 +137,16 @@ struct NodePortRegistry: Codable, Equatable {
         profiles[profile]?[index].port = port
     }
 
-    mutating func setPorts(_ changes: [String: Int], profile: String) throws {
+    mutating func setPorts(_ changes: [String: Int], profile: String, reserved: Set<Int> = []) throws {
         var next = self
         for (name, port) in changes {
-            guard (1024 ... 65535).contains(port), port != directPort,
+            guard (1024 ... 65535).contains(port), !reserved.contains(port), port != directPort,
                   let index = next.profiles[profile]?.firstIndex(where: { $0.name == name }) else {
                 throw NodeServiceError.portConflict(port)
             }
             next.profiles[profile]?[index].port = port
         }
-        let ports = next.profiles.values.flatMap { $0 }.map { $0.port }
+        let ports = (next.profiles[profile] ?? []).map { $0.port }
         guard Set(ports).count == ports.count else { throw NodeServiceError.portConflict(changes.values.first ?? 0) }
         self = next
     }
@@ -176,6 +188,9 @@ enum NodeListenerPolicy {
         var ports = Set(["port", "socks-port", "mixed-port", "redir-port", "tproxy-port"].compactMap { root[$0] as? Int })
         if let controller = root["external-controller"] as? String,
            let port = controller.split(separator: ":").last.flatMap({ Int($0) }) { ports.insert(port) }
+        if let dns = root["dns"] as? [String: Any],
+           let listen = dns["listen"] as? String,
+           let port = listen.split(separator: ":").last.flatMap({ Int($0) }) { ports.insert(port) }
         for listener in root["listeners"] as? [[String: Any]] ?? [] {
             guard !(listener["name"] as? String ?? "").hasPrefix(prefix) else { continue }
             if let port = listener["port"] as? Int { ports.insert(port) }
@@ -191,11 +206,18 @@ enum NodeListenerPolicy {
     }
 
     static func apply(to root: inout [String: Any], bindings: [NodePortBinding], directPort: Int?,
-                      protectionRules: [String] = []) {
+                      protectionRules: [String] = [], providerOwners: [String: String] = [:]) {
         var listeners = (root["listeners"] as? [[String: Any]] ?? []).filter {
             !(($0["name"] as? String ?? "").hasPrefix(prefix))
         }
         var subRules = (root["sub-rules"] as? [String: Any] ?? [:]).filter { !$0.key.hasPrefix(prefix) }
+        let inlineNames = Set((root["proxies"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String })
+        var proxyGroups = (root["proxy-groups"] as? [[String: Any]] ?? []).filter {
+            !(($0["name"] as? String ?? "").hasPrefix(prefix + "target-"))
+        }
+        let groupNames = Set(proxyGroups.compactMap { $0["name"] as? String })
+        var groupsModified = (root["proxy-groups"] as? [[String: Any]] ?? []).count != proxyGroups.count
+
         func listener(name: String, port: Int, proxy: String, udp: Bool) -> [String: Any] {
             var entry: [String: Any] = ["name": name, "type": "mixed", "listen": "127.0.0.1", "port": port, "udp": udp]
             if protectionRules.isEmpty {
@@ -208,11 +230,28 @@ enum NodeListenerPolicy {
             return entry
         }
         for binding in bindings where binding.enabled {
-            listeners.append(listener(name: "\(prefix)\(binding.port)", port: binding.port, proxy: binding.name, udp: true))
+            var targetProxy = binding.name
+            if !inlineNames.contains(binding.name),
+               !groupNames.contains(binding.name),
+               let providerName = providerOwners[binding.name],
+               !providerName.isEmpty,
+               !binding.name.contains("\u{60}") {
+                let hiddenGroup = "\(prefix)target-\(binding.port)"
+                proxyGroups.append([
+                    "name": hiddenGroup,
+                    "type": "select",
+                    "use": [providerName],
+                    "filter": "^\(NSRegularExpression.escapedPattern(for: binding.name))$"
+                ])
+                targetProxy = hiddenGroup
+                groupsModified = true
+            }
+            listeners.append(listener(name: "\(prefix)\(binding.port)", port: binding.port, proxy: targetProxy, udp: true))
         }
         if let port = directPort {
             listeners.append(listener(name: "\(prefix)direct-refresh", port: port, proxy: "DIRECT", udp: false))
         }
+        if groupsModified { root["proxy-groups"] = proxyGroups }
         if !listeners.isEmpty || root["listeners"] != nil { root["listeners"] = listeners }
         if !subRules.isEmpty || root["sub-rules"] != nil { root["sub-rules"] = subRules }
     }
@@ -276,6 +315,7 @@ final class NodeServiceStore {
     @discardableResult
     func prepare(root: inout [String: Any], profile: String,
                  additionalReserved: Set<Int> = [], protectionRules: [String] = [],
+                 providerProxies: [(providerName: String, proxy: [String: Any])] = [],
                  available: (Int) -> Bool) throws -> [NodePortBinding] {
         lock.lock(); defer { lock.unlock() }
         var state = try read()
@@ -283,14 +323,34 @@ final class NodeServiceStore {
         let reserved = NodeListenerPolicy.reservedPorts(in: root).union(additionalReserved)
         if let value = root["listeners"], !(value is [[String: Any]]) { throw NodeServiceError.invalidNodes }
         if let value = root["sub-rules"], !(value is [String: Any]) { throw NodeServiceError.invalidNodes }
-        let proxies = root["proxies"] as? [[String: Any]] ?? []
+        let inlineProxies = root["proxies"] as? [[String: Any]] ?? []
+        var mergedProxies = inlineProxies
+        var seenNames = Set(inlineProxies.compactMap { ($0["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+        var providerOwners: [String: String] = [:]
+        for item in providerProxies {
+            guard let rawName = item.proxy["name"] as? String else { continue }
+            let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seenNames.insert(trimmed).inserted else { continue }
+            mergedProxies.append(item.proxy)
+            providerOwners[trimmed] = item.providerName
+        }
         let bindings = state.settings.portsEnabled
-            ? try state.registry.reconcile(profile: profile, proxies: proxies, firstPort: state.settings.firstPort,
+            ? try state.registry.reconcile(profile: profile, proxies: mergedProxies, firstPort: state.settings.firstPort,
                                            reserved: reserved, available: available) : []
-        state.activeNames[profile] = proxies.compactMap { $0["name"] as? String }
+        var activeNames = [String]()
+        var activeSet = Set<String>()
+        for px in mergedProxies {
+            if let raw = px["name"] as? String {
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty, activeSet.insert(trimmed).inserted {
+                    activeNames.append(trimmed)
+                }
+            }
+        }
+        state.activeNames[profile] = activeNames
         let direct = state.settings.recoveryEnabled ? try state.registry.prepareDirectPort(reserved: reserved, available: available) : nil
         NodeListenerPolicy.apply(to: &root, bindings: state.settings.portsEnabled ? bindings : [], directPort: direct,
-                                 protectionRules: protectionRules)
+                                 protectionRules: protectionRules, providerOwners: providerOwners)
         try write(state)
         return bindings
     }

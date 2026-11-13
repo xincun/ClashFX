@@ -220,7 +220,13 @@ final class NodeServicesWindowController: NSWindowController, NSTableViewDataSou
             next.settings.checkInterval = TimeInterval(seconds)
             next.settings.failureThreshold = failures
             next.settings.refreshCooldown = TimeInterval(cooling)
-            try next.registry.setPorts(edits, profile: profile)
+            var reserved = Set([Settings.proxyPort, Int(ConfigManager.shared.apiPort) ?? 0]).subtracting([0])
+            let activePath = Paths.localConfigPath(for: ConfigManager.selectConfigName)
+            if let yaml = try? String(contentsOfFile: activePath, encoding: .utf8),
+               let root = try? Yams.load(yaml: yaml) as? [String: Any] {
+                reserved.formUnion(NodeListenerPolicy.reservedPorts(in: root))
+            }
+            try next.registry.setPorts(edits, profile: profile, reserved: reserved)
             try next.registry.setEnabled(enabledEdits, profile: profile)
             try NodeServiceStore.shared.write(next)
             NodeServices.shared.cancelCheck()

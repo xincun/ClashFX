@@ -160,11 +160,17 @@ jobs:
         rmdir "$DMG_MOUNT_POINT" "$DMG_VERIFY_DIR"
         echo "DMG created: $(ls -lh ClashFX.dmg)"
 
+    # Personal fork disables Sparkle auto-updates by default (see AutoUpgradeManager.swift).
+    # Set repository variable ENABLE_SPARKLE_APPCAST=true only when publishing a signed Sparkle feed.
     - name: sign dmg with sparkle
-      if: startsWith(github.ref, 'refs/tags/')
+      if: startsWith(github.ref, 'refs/tags/') && vars.ENABLE_SPARKLE_APPCAST == 'true'
       env:
         SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
       run: |
+        if [ -z "$SPARKLE_PRIVATE_KEY" ] || [ ! -x ./Pods/Sparkle/bin/sign_update ]; then
+          echo "Error: SPARKLE_PRIVATE_KEY or ./Pods/Sparkle/bin/sign_update missing while ENABLE_SPARKLE_APPCAST=true"
+          exit 1
+        fi
         SIGN_OUTPUT=$(echo "$SPARKLE_PRIVATE_KEY" | ./Pods/Sparkle/bin/sign_update --ed-key-file - ClashFX.dmg)
         echo "Sparkle signature output: $SIGN_OUTPUT"
 
@@ -195,7 +201,7 @@ jobs:
         body_path: RELEASE_NOTES.md
 
     - name: update appcast.xml
-      if: startsWith(github.ref, 'refs/tags/')
+      if: startsWith(github.ref, 'refs/tags/') && vars.ENABLE_SPARKLE_APPCAST == 'true'
       run: |
         tag=${GITHUB_REF##*/}
         python3 - "$tag" "$SPARKLE_SIGNATURE" "$SPARKLE_LENGTH" "${RELEASE_CHANNEL:-stable}" <<'PYEOF'
@@ -256,7 +262,7 @@ jobs:
         PYEOF
 
     - name: push appcast update
-      if: startsWith(github.ref, 'refs/tags/')
+      if: startsWith(github.ref, 'refs/tags/') && vars.ENABLE_SPARKLE_APPCAST == 'true'
       env:
         WEBSITE_PAT: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
         GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
@@ -284,7 +290,7 @@ jobs:
         echo "Leaving it open for the required review before merge."
 
     - name: notify website repos
-      if: startsWith(github.ref, 'refs/tags/')
+      if: startsWith(github.ref, 'refs/tags/') && vars.ENABLE_WEBSITE_DISPATCH == 'true'
       env:
         WEBSITE_PAT: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
       run: |

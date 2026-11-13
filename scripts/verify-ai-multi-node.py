@@ -81,7 +81,7 @@ def main():
             api, mixed, control = fixture.free_port(), fixture.free_port(), fixture.free_port()
             hosts = ['api.anthropic.com', 'chatgpt.com', 'api.openai.com', 'antigravity.google',
                      'cloudcode-pa.googleapis.com', 'businessaicode.googleapis.com', 'generativelanguage.googleapis.com',
-                     'github.com', 'maps.google.com', 'storage.googleapis.com', 'subscription.invalid', 'udp-origin.invalid']
+                     'github.com', 'stackoverflow.com', 'example.com', 'subscription.invalid', 'udp-origin.invalid']
             template = {
                 'mode': 'rule', 'log-level': 'warning', 'mixed-port': mixed, 'allow-lan': False,
                 'external-controller': f'127.0.0.1:{api}', 'tun': {'enable': False},
@@ -120,7 +120,7 @@ def main():
                 else:
                     raise AssertionError('fixture core not ready')
                 for name in ['Alpha', 'Beta']:
-                    for host in ['github.com', 'maps.google.com', 'storage.googleapis.com']:
+                    for host in ['github.com', 'stackoverflow.com', 'example.com']:
                         assert fixture.request(plan['ports'][name], f'http://{host}:{origin.server_port}/page') == (200, name)
                     for host in hosts[:7]:
                         assert fixture.request(plan['ports'][name], f'http://{host}:{origin.server_port}/ai') == (200, 'Locked')

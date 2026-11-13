@@ -35,7 +35,14 @@ if (-not $IsccExe) {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe" -OutFile $innoSetupTmp -UseBasicParsing
     }
-    $p = Start-Process -FilePath $innoSetupTmp -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/ALLUSERS") -Wait -PassThru
+    $innoLog = "C:\Temp\inno-install.log"
+    Remove-Item -Force $innoLog -ErrorAction SilentlyContinue
+    $p = Start-Process -FilePath $innoSetupTmp -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/ALLUSERS", "/LOG=`"$innoLog`"") -PassThru
+    if (-not $p.WaitForExit(120000)) {
+        try { $p.Kill() } catch {}
+        $tail = if (Test-Path $innoLog) { (Get-Content $innoLog -Tail 30 | Out-String) } else { "(no log)" }
+        throw "Inno Setup installer timed out after 120s. Log tail:`n$tail"
+    }
     Remove-Item -Force $innoSetupTmp -ErrorAction SilentlyContinue
     $IsccExe = Find-Iscc
     if (-not $IsccExe) {
@@ -45,13 +52,13 @@ if (-not $IsccExe) {
 Write-Host "=== [Package] Using Inno Setup Compiler: $IsccExe ==="
 
 $DistDir = Join-Path $RepoRoot "windows\dist"
-$IssFile = Join-Path $RepoRoot "windows\installer\clashfx.iss"
+$InstallerDir = Join-Path $RepoRoot "windows\installer"
 
 # Stage locally on C:\Temp so ISCC and Compress-Archive run at native SSD speed without UNC overhead
 $PackWork = "C:\Temp\clashfx-package-work"
 if (Test-Path $PackWork) { Remove-Item -Recurse -Force $PackWork }
 New-Item -ItemType Directory -Force -Path "$PackWork\out" | Out-Null
-Copy-Item -Force $IssFile "$PackWork\clashfx.iss"
+Copy-Item -Force (Join-Path $InstallerDir "*") $PackWork
 
 foreach ($arch in @("arm64", "amd64")) {
     $srcDist = Join-Path $DistDir "windows-$arch"

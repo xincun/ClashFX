@@ -1,8 +1,12 @@
 param(
-    [string]$RepoRoot = "C:\Mac\Home\Desktop\workspace\github\ClashFX"
+    [string]$RepoRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+}
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type @"

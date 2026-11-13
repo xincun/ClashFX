@@ -666,6 +666,29 @@ final class ClaudeProxyLockPolicyTests: XCTestCase {
         XCTAssertEqual((root["rules"] as? [String])?.first, "PROCESS-NAME-REGEX,^claude( helper.*)?$,A (B)")
     }
 
+    func testProviderOnlyNodeWithoutRelayMaterializesHiddenSelectorGroup() {
+        var root: [String: Any] = [
+            "rules": ["MATCH,DIRECT"],
+            "proxy-providers": ["airport": ["type": "http", "path": "providers/airport.yaml"]]
+        ]
+        let providers = [
+            ClaudeProxyLockPolicy.ProviderSnapshot(
+                name: "airport",
+                dialerProxy: nil,
+                overrideDialerProxy: nil,
+                proxies: [["name": "HK (VIP)", "type": "socks5", "server": "203.0.113.8", "port": 1080]]
+            )
+        ]
+        let outcome = ClaudeProxyLockPolicy.apply(to: &root, target: "HK (VIP)", providers: providers)
+        XCTAssertTrue(outcome.applied)
+        XCTAssertNil(outcome.relayProxy)
+        XCTAssertEqual(outcome.effectiveTarget, ClaudeProxyLockPolicy.aiLockTargetGroupName)
+        let groups = root["proxy-groups"] as? [[String: Any]]
+        XCTAssertEqual(groups?.first?["name"] as? String, ClaudeProxyLockPolicy.aiLockTargetGroupName)
+        XCTAssertEqual(groups?.first?["filter"] as? String, "^HK \\(VIP\\)$")
+        XCTAssertEqual((root["rules"] as? [String])?.first, "PROCESS-NAME-REGEX,^claude( helper.*)?$,\(ClaudeProxyLockPolicy.aiLockTargetGroupName)")
+    }
+
     func testMatchRelayUsesCandidatesWhenNowIsMissing() {
         var root: [String: Any] = [
             "rules": ["MATCH,Final"],
@@ -3564,14 +3587,10 @@ final class AIProxyLockCoverageTests: XCTestCase {
 
     func testRequiredProviderDomainsAndGoogleScope() {
         let rules = ClaudeProxyLockPolicy.rules(target: "Locked")
-        for domain in ["claude.ai", "anthropic.com", "chatgpt.com", "openai.com", "oaistatic.com", "antigravity.google"] {
+        for domain in ["claude.ai", "anthropic.com", "chatgpt.com", "openai.com", "oaistatic.com", "antigravity.google", "google.com", "googleapis.com"] {
             XCTAssertTrue(rules.contains("DOMAIN-SUFFIX,\(domain),Locked"), domain)
         }
-        for host in ["oauth2.googleapis.com", "cloudcode-pa.googleapis.com", "businessaicode.googleapis.com", "businessaicode.us.rep.googleapis.com", "aiplatform.eu.rep.googleapis.com", "generativelanguage.googleapis.com"] {
-            XCTAssertTrue(rules.contains("DOMAIN,\(host),Locked"), host)
-        }
-        XCTAssertFalse(rules.contains("DOMAIN-SUFFIX,google.com,Locked"))
-        XCTAssertFalse(rules.contains("DOMAIN-SUFFIX,googleapis.com,Locked"))
+        XCTAssertTrue(ClaudeProxyLockPolicy.protectedExactDomains.isEmpty)
     }
 
     func testEveryProtectedMatcherHasImmediateRejectFallback() {

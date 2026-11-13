@@ -1,0 +1,72 @@
+name: Windows & Core Engine CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'feat/**'
+    paths:
+      - 'core-engine/**'
+      - 'windows/**'
+      - '.github/workflows/windows-ci.yml'
+  pull_request:
+    paths:
+      - 'core-engine/**'
+      - 'windows/**'
+      - '.github/workflows/windows-ci.yml'
+
+jobs:
+  core-engine-race-and-crossbuild:
+    name: Go Core Engine (Race Tests & Dual-Arch Cross Build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: core-engine/go.mod
+          cache-dependency-path: core-engine/go.sum
+
+      - name: Run core-engine tests with race detector
+        working-directory: core-engine
+        run: go test -race -count=1 ./...
+
+      - name: Build dual-arch Windows daemon & service binaries
+        run: python3 windows/scripts/build-daemon.py
+
+  windows-native:
+    name: Windows Native Go Tests & Qt6 UI Build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: core-engine/go.mod
+          cache-dependency-path: core-engine/go.sum
+
+      - name: Run native Windows core-engine tests
+        working-directory: core-engine
+        run: go test -count=1 ./...
+
+      - name: Install Qt 6 (MSVC x64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: 'win64_msvc2022_64'
+          cache: true
+
+      - name: Fetch WebView2 SDK
+        run: python windows/scripts/fetch-webview2-sdk.py
+
+      - name: Configure & Build clashfx-ui (Qt6 + WebView2)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -G Ninja -S windows/ui-qt -B windows/build/ui-ci ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DWEBVIEW2_SDK_DIR="%GITHUB_WORKSPACE%\windows\build\.cache\webview2" ^
+            -DWEBVIEW2_ARCH=x64
+          cmake --build windows/build/ui-ci --config Release

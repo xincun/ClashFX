@@ -11,7 +11,7 @@ import Cocoa
 
 class RemoteConfigManager {
     private static let remoteConfigUpdateTimeout: TimeInterval = 60
-    private static let generatedShareLinkTemplateVersion = 8
+    private static let generatedShareLinkTemplateVersion = 9
     private static let generatedShareLinkMarker = "clashfx-generated: share-links"
     private static let generatedShareLinkMigrationKey = "kGeneratedShareLinkRemoteConfigMigrationVersion"
     private static let generatedShareLinkLocalMatchAutoMigrationKey = "kGeneratedShareLinkLocalMatchAutoMigrated"
@@ -33,7 +33,7 @@ class RemoteConfigManager {
             if let loadedConfig = try? decoder.decode([RemoteConfigModel].self, from: savedConfigs) {
                 configs = loadedConfig
             } else {
-                assertionFailure()
+                Logger.log("[RemoteConfigManager] Failed to decode saved kRemoteConfigs", level: .warning)
             }
         }
         migrateOldRemoteConfig()
@@ -163,7 +163,6 @@ class RemoteConfigManager {
     static func getRemoteConfigData(config: RemoteConfigModel, forceDirect: Bool = false,
                                     complete: @escaping ((String?, String?, [AnyHashable: Any]?) -> Void)) -> DataRequest? {
         guard var urlRequest = try? URLRequest(url: config.url, method: .get) else {
-            assertionFailure()
             Logger.log("[getRemoteConfigData] Invalid URL for \(config.name)", level: .warning)
             complete(nil, nil, nil)
             return nil
@@ -362,6 +361,8 @@ class RemoteConfigManager {
 
         var proxies: [String] = []
         var names: [String] = []
+        var seenNames = Set<String>()
+        var nameCounts: [String: Int] = [:]
 
         for line in lines {
             // Some subscriptions double-encode each URI: try base64-decoding
@@ -376,17 +377,50 @@ class RemoteConfigManager {
                 continue
             }
 
-            guard let proxy = parseShareLink(candidate) else {
+            guard var proxy = parseShareLink(candidate) else {
                 continue
             }
+            let baseName = proxy.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Proxy"
+                : proxy.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            var uniqueName = baseName
+            if seenNames.contains(uniqueName) {
+                var idx = max(nameCounts[baseName] ?? 1, 1) + 1
+                while seenNames.contains("\(baseName) (\(idx))") {
+                    idx += 1
+                }
+                nameCounts[baseName] = idx
+                uniqueName = "\(baseName) (\(idx))"
+            } else {
+                nameCounts[baseName] = max(nameCounts[baseName] ?? 0, 1)
+            }
+            seenNames.insert(uniqueName)
+            proxy = proxy.withName(uniqueName)
             proxies.append(proxy.yaml)
-            names.append("\"\(escapeYAML(proxy.name))\"")
+            names.append("\"\(escapeYAML(uniqueName))\"")
         }
 
         guard !proxies.isEmpty else { return nil }
 
         let proxyList = names.joined(separator: ", ")
         let nameserverPolicy = nameserverPolicyYAML(from: proxies)
+        let domesticDirectSuffixes = [
+            "cn", "baidu.com", "bdimg.com", "bdstatic.com",
+            "qq.com", "wechat.com", "tencent.com", "myqcloud.com", "myapp.com",
+            "taobao.com", "tmall.com", "alicdn.com", "alipay.com", "aliyun.com", "aliyuncs.com", "1688.com",
+            "jd.com", "360buyimg.com", "jdcloud.com",
+            "bilibili.com", "bilivideo.com", "hdslb.com", "biliapi.net",
+            "douyin.com", "bytedance.com", "byteimg.com", "toutiao.com",
+            "163.com", "126.com", "126.net", "127.net", "netease.com",
+            "weibo.com", "weibocdn.com", "zhihu.com", "zhimg.com",
+            "xiaohongshu.com", "xhscdn.com", "meituan.com", "dianping.com", "pinduoduo.com", "yangkeduo.com",
+            "xiaomi.com", "mi.com", "miui.com", "huawei.com", "vmall.com", "dbankcdn.com",
+            "csdn.net", "gitee.com", "oschina.net", "iqiyi.com", "youku.com", "kuaishou.com", "ctrip.com",
+            "apple.com", "icloud.com", "cdn-apple.com", "mzstatic.com"
+        ]
+        let domesticRules = domesticDirectSuffixes
+            .map { "  - DOMAIN-SUFFIX,\($0),DIRECT" }
+            .joined(separator: "\n")
         return """
         # \(generatedShareLinkMarker)
         # clashfx-template-version: \(generatedShareLinkTemplateVersion)
@@ -447,13 +481,10 @@ class RemoteConfigManager {
         rules:
           - DOMAIN,localhost,DIRECT
           - DOMAIN-SUFFIX,local,DIRECT
-          - DOMAIN-SUFFIX,cn,DIRECT
           - DOMAIN,www.baidu.com,DIRECT
           - DOMAIN,baidu.com,DIRECT
           - DOMAIN-KEYWORD,baidu,DIRECT
-          - DOMAIN-SUFFIX,baidu.com,DIRECT
-          - DOMAIN-SUFFIX,bdimg.com,DIRECT
-          - DOMAIN-SUFFIX,bdstatic.com,DIRECT
+        \(domesticRules)
           - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
           - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
           - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
@@ -788,6 +819,15 @@ class RemoteConfigManager {
     private struct ParsedProxyResult {
         let name: String
         let yaml: String
+
+        func withName(_ newName: String) -> ParsedProxyResult {
+            guard newName != name else { return self }
+            var lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            if let index = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("- name:") }) {
+                lines[index] = "  - name: \"\(RemoteConfigManager.escapeYAML(newName))\""
+            }
+            return ParsedProxyResult(name: newName, yaml: lines.joined(separator: "\n"))
+        }
     }
 
     private static func parseShareLink(_ line: String) -> ParsedProxyResult? {

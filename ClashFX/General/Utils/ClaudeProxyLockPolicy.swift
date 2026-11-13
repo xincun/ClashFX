@@ -32,6 +32,7 @@ enum ClaudeProxyLockPolicy {
 
     struct ApplyOutcome {
         var applied: Bool
+        var effectiveTarget: String
         var serverHost: String?
         /// Proxy that dials the locked node's server. The locked node remains the exit.
         var relayProxy: String?
@@ -39,11 +40,13 @@ enum ClaudeProxyLockPolicy {
 
         init(
             applied: Bool,
+            effectiveTarget: String = "",
             serverHost: String?,
             relayProxy: String?,
             rejectionReason: String? = nil
         ) {
             self.applied = applied
+            self.effectiveTarget = effectiveTarget
             self.serverHost = serverHost
             self.relayProxy = relayProxy
             self.rejectionReason = rejectionReason
@@ -51,6 +54,7 @@ enum ClaudeProxyLockPolicy {
 
         static let rejected = ApplyOutcome(
             applied: false,
+            effectiveTarget: "",
             serverHost: nil,
             relayProxy: nil
         )
@@ -136,21 +140,16 @@ enum ClaudeProxyLockPolicy {
         var proxy: [String: Any]
     }
 
-    // Provider-owned domains use suffix rules; shared Google infrastructure
-    // is listed as exact endpoints so unrelated Google services stay untouched.
+    static let aiLockTargetGroupName = "__clashfx_ai_lock_target__"
+
+    // AI provider domains (including Google / Google APIs under Option A) use
+    // suffix rules so regional/new AI endpoints never slip out of the lock.
     static let protectedDomains = [
         "claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
         "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com", "oaistatsig.com", "openaimerge.com",
-        "antigravity.google"
+        "antigravity.google", "google.com", "googleapis.com"
     ]
-    static let protectedExactDomains = [
-        "accounts.google.com", "oauth2.googleapis.com", "generativelanguage.googleapis.com",
-        "cloudcode-pa.googleapis.com", "businessaicode.googleapis.com",
-        "businessaicode.us.rep.googleapis.com", "businessaicode.eu.rep.googleapis.com", "businessaicode.mtls.googleapis.com",
-        "aiplatform.googleapis.com", "aiplatform.us.rep.googleapis.com", "aiplatform.eu.rep.googleapis.com", "aiplatform.mtls.googleapis.com",
-        "discoveryengine.googleapis.com", "us-discoveryengine.googleapis.com", "eu-discoveryengine.googleapis.com",
-        "discoveryengine.mtls.googleapis.com", "us-discoveryengine.mtls.googleapis.com", "eu-discoveryengine.mtls.googleapis.com"
-    ]
+    static let protectedExactDomains: [String] = []
 
     static func isValidTarget(_ target: String) -> Bool {
         let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -237,6 +236,19 @@ enum ClaudeProxyLockPolicy {
             }
         }
 
+        var effectiveRuleTarget = trimmed
+        var finalInjectedRules = injectedRules
+        if appliedRelay == nil {
+            effectiveRuleTarget = ensureProviderTargetResolvable(
+                in: &finalRoot,
+                target: trimmed,
+                located: located
+            )
+            if effectiveRuleTarget != trimmed {
+                finalInjectedRules = rules(target: effectiveRuleTarget)
+            }
+        }
+
         let existingRules: [String]
         if let rules = finalRoot["rules"] {
             existingRules = rules as? [String] ?? []
@@ -246,13 +258,31 @@ enum ClaudeProxyLockPolicy {
 
         finalRoot["mode"] = "rule"
         finalRoot["find-process-mode"] = "always"
-        finalRoot["rules"] = injectedRules + existingRules.filter { !injectedRules.contains($0) }
+        finalRoot["rules"] = finalInjectedRules + existingRules.filter { !finalInjectedRules.contains($0) }
         root = finalRoot
         return ApplyOutcome(
             applied: true,
+            effectiveTarget: effectiveRuleTarget,
             serverHost: located?.server,
             relayProxy: appliedRelay
         )
+    }
+
+    static func resolvedProviderProxies(
+        in root: [String: Any],
+        providers: [ProviderSnapshot]
+    ) -> [(providerName: String, proxy: [String: Any])] {
+        let definitions = root["proxy-providers"] as? [String: Any] ?? [:]
+        var results: [(providerName: String, proxy: [String: Any])] = []
+        var seen = Set<String>()
+        for snapshot in providers {
+            let definition = definitions[snapshot.name] as? [String: Any]
+            let resolution = resolveProvider(snapshot, definition: definition)
+            for record in resolution.proxies where !record.name.isEmpty && seen.insert(record.name).inserted {
+                results.append((providerName: snapshot.name, proxy: record.proxy))
+            }
+        }
+        return results
     }
 
     private static func rejected(_ reason: String) -> ApplyOutcome {
@@ -813,6 +843,38 @@ enum ClaudeProxyLockPolicy {
         return nil
     }
 
+    private static func ensureProviderTargetResolvable(
+        in root: inout [String: Any],
+        target: String,
+        located: LocatedProxy?
+    ) -> String {
+        if let proxies = root["proxies"] as? [[String: Any]],
+           proxies.contains(where: { ($0["name"] as? String) == target }) {
+            return target
+        }
+        if let groups = root["proxy-groups"] as? [[String: Any]],
+           groups.contains(where: { ($0["name"] as? String) == target }) {
+            return target
+        }
+        guard let located,
+              let providerName = located.providerName,
+              !providerName.isEmpty,
+              !target.contains("\u{60}") else {
+            return target
+        }
+        var groups = (root["proxy-groups"] as? [[String: Any]] ?? []).filter {
+            ($0["name"] as? String) != aiLockTargetGroupName
+        }
+        groups.append([
+            "name": aiLockTargetGroupName,
+            "type": "select",
+            "use": [providerName],
+            "filter": "^\(NSRegularExpression.escapedPattern(for: target))$"
+        ])
+        root["proxy-groups"] = groups
+        return aiLockTargetGroupName
+    }
+
     private static func assignRelay(
         in root: inout [String: Any],
         target: String,
@@ -824,6 +886,7 @@ enum ClaudeProxyLockPolicy {
         }
         guard let located,
               let providerName = located.providerName,
+              located.server != nil,
               !target.contains("\u{60}") else {
             return false
         }

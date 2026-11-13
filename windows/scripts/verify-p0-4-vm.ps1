@@ -1,10 +1,14 @@
 param(
-    [string]$TestBinRoot = "C:\Mac\Home\Desktop\workspace\github\ClashFX\windows\build\tests"
+    [string]$TestBinRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+if ([string]::IsNullOrWhiteSpace($TestBinRoot)) {
+    $TestBinRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\build\tests")).Path
+}
 
 $workRoot = "C:\Temp\clashfx-p0-4"
 if (Test-Path $workRoot) {

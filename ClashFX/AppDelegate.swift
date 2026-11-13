@@ -9,6 +9,7 @@
 import Alamofire
 import Cocoa
 import CocoaLumberjack
+import CommonCrypto
 import CoreFoundation
 import Darwin
 import KeyboardShortcuts
@@ -2529,24 +2530,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             var changed = applyProfileRuleDirectives(in: &root)
             changed = applyProfileMixin(to: &root) || changed
 
-            try NodeServiceStore.shared.prepare(
-                root: &root, profile: NodeServices.profileKey(configName),
-                additionalReserved: Set([Settings.proxyPort, Int(ConfigManager.shared.apiPort) ?? 0]),
-                protectionRules: lockEnabled ? ClaudeProxyLockPolicy.rules(target: lockTarget) : [],
-                available: NodeServices.portAvailable
-            )
-            changed = true
-
-            let measurementMethod = Settings.benchmarkMeasurementMethod
-            changed = RuntimeBenchmarkSettingsPolicy.apply(
-                measurementMethod,
-                to: &root
-            ) || changed
-
+            let providers = claudeLockProviderSnapshots(in: root)
+            var effectiveProtectionRules: [String] = []
             if lockEnabled {
                 if ClaudeProxyLockPolicy.isValidTarget(lockTarget) {
                     let target = lockTarget
-                    let providers = claudeLockProviderSnapshots(in: root)
                     let outcome = ClaudeProxyLockPolicy.apply(
                         to: &root,
                         target: target,
@@ -2556,6 +2544,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         removePatched()
                         return RuntimeConfigPatch(error: outcome.rejectionReason ?? "The locked proxy has an unsafe dialer dependency.")
                     }
+                    let ruleTarget = outcome.effectiveTarget.isEmpty ? target : outcome.effectiveTarget
+                    effectiveProtectionRules = ClaudeProxyLockPolicy.rules(target: ruleTarget)
                     changed = outcome.applied || changed
                     logClaudeProxyLockOutcome(outcome, target: target)
                 } else {
@@ -2563,6 +2553,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     return RuntimeConfigPatch(error: "The AI Proxy Lock target is invalid.")
                 }
             }
+
+            let providerProxies = ClaudeProxyLockPolicy.resolvedProviderProxies(in: root, providers: providers)
+            try NodeServiceStore.shared.prepare(
+                root: &root, profile: NodeServices.profileKey(configName),
+                additionalReserved: Set([Settings.proxyPort, Int(ConfigManager.shared.apiPort) ?? 0]).subtracting([0]),
+                protectionRules: effectiveProtectionRules,
+                providerProxies: providerProxies,
+                available: NodeServices.portAvailable
+            )
+            changed = true
+
+            let measurementMethod = Settings.benchmarkMeasurementMethod
+            changed = RuntimeBenchmarkSettingsPolicy.apply(
+                measurementMethod,
+                to: &root
+            ) || changed
 
             if includeRulePatch && !(lockSettings?.enhanced ?? Settings.enhancedMode) {
                 let injectedRules = Settings.proxyIgnoreListAsRules()
@@ -2618,12 +2624,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return providers.keys.sorted().compactMap { name in
             guard let provider = providers[name] as? [String: Any] else { return nil }
             var proxies = proxyDictionaries(from: provider["payload"])
-            if let path = provider["path"] as? String {
-                let fullPath = resolvedClaudeProviderPath(path)
-                if let yaml = try? String(contentsOfFile: fullPath, encoding: .utf8),
-                   let fileRoot = try? Yams.load(yaml: yaml) as? [String: Any] {
-                    proxies.append(contentsOf: proxyDictionaries(from: fileRoot["proxies"]))
-                }
+            var candidatePath: String?
+            if let path = provider["path"] as? String, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                candidatePath = resolvedClaudeProviderPath(path)
+            } else if let url = provider["url"] as? String, !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                candidatePath = resolvedClaudeProviderPath("proxies/\(Self.md5Hex(url))")
+            }
+            if let fullPath = candidatePath,
+               let yaml = try? String(contentsOfFile: fullPath, encoding: .utf8),
+               let fileRoot = try? Yams.load(yaml: yaml) as? [String: Any] {
+                proxies.append(contentsOf: proxyDictionaries(from: fileRoot["proxies"]))
             }
             let override = provider["override"] as? [String: Any]
             return ClaudeProxyLockPolicy.ProviderSnapshot(
@@ -2633,6 +2643,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 proxies: proxies
             )
         }
+    }
+
+    private static func md5Hex(_ string: String) -> String {
+        let data = Data(string.utf8)
+        var digest = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
+        data.withUnsafeBytes { bytes in
+            _ = CC_MD5(bytes.baseAddress, CC_LONG(data.count), &digest)
+        }
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     private func proxyDictionaries(from value: Any?) -> [[String: Any]] {

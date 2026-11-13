@@ -99,7 +99,7 @@ final class NodeServices {
         let profile = Self.profileKey()
         let names = state.activeNames[profile] ?? []
         guard !names.isEmpty else {
-            setStatus(NSLocalizedString("The active configuration has no inline proxy nodes", comment: ""))
+            setStatus(NSLocalizedString("The active configuration has no proxy nodes", comment: ""))
             return
         }
         if lastProfile != profile {

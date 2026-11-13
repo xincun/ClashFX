@@ -29,16 +29,39 @@ final class NodeServicePolicyTests: XCTestCase {
         XCTAssertFalse(ambiguous.contains { $0.port == original[0].port })
     }
 
-    func testAllocationsSkipConfiguredAndOccupiedPortsAndOtherProfiles() throws {
+    func testAllocationsSkipConfiguredAndOccupiedPortsScopedToActiveProfile() throws {
         var registry = NodePortRegistry()
         let a = try registry.reconcile(profile: "one", proxies: [node("a")], firstPort: 21000,
                                        reserved: [21000], available: { $0 != 21001 })
         let b = try registry.reconcile(profile: "two", proxies: [node("a")], firstPort: 21000,
                                        reserved: [21000], available: { $0 != 21001 })
         XCTAssertEqual(a[0].port, 21002)
-        XCTAssertEqual(b[0].port, 21003)
+        XCTAssertEqual(b[0].port, 21002)
         XCTAssertThrowsError(try registry.reconcile(profile: "one", proxies: [node("a")], firstPort: 21000,
                                                    reserved: [21002], available: { _ in true }))
+    }
+
+    func testReconcileToleratesDuplicateAndEmptyNamesAndProviderProxies() throws {
+        let suite = "ClashFX.NodeServices.Tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = NodeServiceStore(defaults: defaults)
+        var root: [String: Any] = [
+            "mixed-port": 7890,
+            "proxies": [node("alpha"), node(""), node("alpha")],
+            "proxy-providers": ["airport": ["type": "http"]]
+        ]
+        let bindings = try store.prepare(
+            root: &root,
+            profile: "JMS",
+            providerProxies: [("airport", node("beta-from-provider"))],
+            available: { _ in true }
+        )
+        XCTAssertEqual(bindings.map { $0.name }, ["alpha", "beta-from-provider"])
+        let groups = root["proxy-groups"] as? [[String: Any]] ?? []
+        XCTAssertTrue(groups.contains { ($0["name"] as? String) == "clashfx-node-service-target-\(bindings[1].port)" })
+        var saved = try store.read()
+        XCTAssertThrowsError(try saved.registry.setPorts(["alpha": 7890], profile: "JMS", reserved: [7890]))
     }
 
     func testPortEditsAreAtomicAndAllowSwaps() throws {

@@ -1,9 +1,13 @@
 param(
-    [string]$BinRoot = "C:\Mac\Home\Desktop\workspace\github\ClashFX\windows\build\bin"
+    [string]$BinRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+if ([string]::IsNullOrWhiteSpace($BinRoot)) {
+    $BinRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\build\bin")).Path
+}
 
 Get-Process -Name "mihomo_core" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
