@@ -287,6 +287,15 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			return errResp(err)
 		}
 		return okResp(s.engine.Snapshot())
+	case "benchmark_group":
+		var p struct {
+			Group string `json:"group"`
+		}
+		_ = json.Unmarshal(req.Params, &p)
+		if err := s.engine.BenchmarkGroup(ctx, p.Group); err != nil {
+			return errResp(err)
+		}
+		return okResp(s.engine.Snapshot())
 	case "diagnose_node":
 		var p struct {
 			NodeName     string `json:"node_name"`

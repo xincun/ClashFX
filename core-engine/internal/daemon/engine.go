@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -42,37 +43,40 @@ type ProxyItemView struct {
 	Name    string `json:"name"`
 	Type    string `json:"type"`
 	DelayMs int    `json:"delay_ms"`
+	Tested  bool   `json:"tested"`
 }
 
 type ProxyGroupView struct {
 	Name              string          `json:"name"`
 	Type              string          `json:"type"`
 	Now               string          `json:"now"`
+	TestURL           string          `json:"test_url,omitempty"`
 	HasManualOverride bool            `json:"has_manual_override"`
 	Items             []ProxyItemView `json:"items"`
 }
 
 type DaemonSnapshot struct {
-	Version            string                              `json:"version"`
-	Arch               string                              `json:"arch"`
-	CoreRunning        bool                                `json:"core_running"`
-	CoreViaService     bool                                `json:"core_via_service"`
-	ServiceInstalled   bool                                `json:"service_installed"`
-	Settings           profile.AppSettings                 `json:"settings"`
-	Runtime            transaction.AppliedRuntimeState     `json:"runtime"`
-	DashboardURL       string                              `json:"dashboard_url"`
-	Profiles           []string                            `json:"profiles"`
-	ProfileMixinPath   string                              `json:"profile_mixin_path"`
-	ConfigDir          string                              `json:"config_dir"`
-	LogsDir            string                              `json:"logs_dir"`
-	ProxyGroups        []ProxyGroupView                    `json:"proxy_groups"`
-	AILockCandidates   []ailock.CandidateNode              `json:"ai_lock_candidates"`
-	AILockRelay        string                              `json:"ai_lock_relay,omitempty"`
-	Subscriptions      []subscription.ManagedSubscription  `json:"subscriptions"`
-	NodeServices       nodeservices.RuntimeSnapshot        `json:"node_services"`
-	ActiveNetwork      features.ActiveNetworkSignature     `json:"active_network"`
-	SuspendedByNetwork string                              `json:"suspended_by_network,omitempty"`
-	LastError          string                              `json:"last_error,omitempty"`
+	Version                string                             `json:"version"`
+	Arch                   string                             `json:"arch"`
+	CoreRunning            bool                               `json:"core_running"`
+	CoreViaService         bool                               `json:"core_via_service"`
+	ServiceInstalled       bool                               `json:"service_installed"`
+	Settings               profile.AppSettings                `json:"settings"`
+	Runtime                transaction.AppliedRuntimeState    `json:"runtime"`
+	DashboardURL           string                             `json:"dashboard_url"`
+	Profiles               []string                           `json:"profiles"`
+	ProfileMixinPath       string                             `json:"profile_mixin_path"`
+	ConfigDir              string                             `json:"config_dir"`
+	LogsDir                string                             `json:"logs_dir"`
+	ProxyGroups            []ProxyGroupView                   `json:"proxy_groups"`
+	AILockCandidates       []ailock.CandidateNode             `json:"ai_lock_candidates"`
+	AILockRelay            string                             `json:"ai_lock_relay,omitempty"`
+	Subscriptions          []subscription.ManagedSubscription `json:"subscriptions"`
+	ActiveSubscriptionInfo *subscription.UserInfo             `json:"active_subscription_info,omitempty"`
+	NodeServices           nodeservices.RuntimeSnapshot       `json:"node_services"`
+	ActiveNetwork          features.ActiveNetworkSignature    `json:"active_network"`
+	SuspendedByNetwork     string                             `json:"suspended_by_network,omitempty"`
+	LastError              string                             `json:"last_error,omitempty"`
 }
 
 type Engine struct {
@@ -95,6 +99,7 @@ type Engine struct {
 	proxyGroups     []ProxyGroupView
 	aiCandidates    []ailock.CandidateNode
 	aiRelay         string
+	providerSubInfo *subscription.UserInfo
 
 	stopBgCh   chan struct{}
 	stopPower  func()
@@ -413,8 +418,10 @@ func (e *Engine) handleWakeOrNetworkCheck() {
 }
 
 func (e *Engine) backgroundMaintenanceLoop() {
+	coreSyncTicker := time.NewTicker(3 * time.Second)
 	netTicker := time.NewTicker(10 * time.Second)
 	subTicker := time.NewTicker(60 * time.Second)
+	defer coreSyncTicker.Stop()
 	defer netTicker.Stop()
 	defer subTicker.Stop()
 
@@ -423,6 +430,8 @@ func (e *Engine) backgroundMaintenanceLoop() {
 		select {
 		case <-e.stopBgCh:
 			return
+		case <-coreSyncTicker.C:
+			e.syncFromLiveCore(context.Background())
 		case <-netTicker.C:
 			prevSuspended := e.suspendedByNet
 			e.reconcileSystemProxy()
@@ -446,6 +455,190 @@ func (e *Engine) backgroundMaintenanceLoop() {
 	}
 }
 
+func (e *Engine) syncFromLiveCore(ctx context.Context) {
+	if !e.opMu.TryLock() {
+		return
+	}
+	e.opMu.Unlock()
+
+	rt := e.ctrl.LastState()
+	if rt.APIPort <= 0 || !e.IsCoreRunning() {
+		return
+	}
+
+	settings := e.store.Settings()
+	anyChanged := false
+
+	// 1. Reconcile outbound mode if user changed it inside MetaCubeXD WebView
+	if liveMode := fetchCoreOutboundMode(ctx, rt.APIPort, rt.APISecret); liveMode != "" {
+		if settings.AILockEnabled && liveMode != "rule" {
+			// Enforce AI Proxy Lock invariant if WebView tried to switch away from Rule mode
+			patchCoreOutboundMode(ctx, rt.APIPort, rt.APISecret, "rule")
+		} else if !settings.AILockEnabled && (liveMode == "rule" || liveMode == "global" || liveMode == "direct") &&
+			liveMode != strings.ToLower(strings.TrimSpace(settings.OutboundMode)) {
+			if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
+				s.OutboundMode = liveMode
+				return nil
+			}); err == nil {
+				settings = e.store.Settings()
+				e.reconcileSystemProxy()
+				anyChanged = true
+			}
+		}
+	}
+
+	// 2. Reconcile live proxy group selections & delays from WebView / auto-URLTest
+	var rawRoot map[string]any
+	if data, err := os.ReadFile(e.store.ProfilePath(settings.SelectedProfile)); err == nil {
+		rawRoot, _ = profile.UnmarshalYAMLMap(data)
+	}
+	e.proxyGroupsMu.RLock()
+	prevGroups := append([]ProxyGroupView(nil), e.proxyGroups...)
+	prevProvInfo := e.providerSubInfo
+	e.proxyGroupsMu.RUnlock()
+
+	prevNowMap := make(map[string]string, len(prevGroups))
+	for _, pg := range prevGroups {
+		prevNowMap[pg.Name] = pg.Now
+	}
+
+	groups := fetchProxyGroupsFromCore(ctx, rt.APIPort, rt.APISecret, rawRoot, e.store.RecoverySelectionsForProfile(settings.SelectedProfile))
+	if len(groups) > 0 {
+		for i := range groups {
+			g := &groups[i]
+			prevNow := prevNowMap[g.Name]
+			if strings.EqualFold(g.Type, "Selector") && g.Now != "" && prevNow != "" && g.Now != prevNow {
+				if g.Name != "GLOBAL" || strings.EqualFold(settings.OutboundMode, "global") {
+					_ = e.store.RememberProxySelection(settings.SelectedProfile, g.Name, g.Now)
+					g.HasManualOverride = true
+				}
+			}
+		}
+	}
+	provInfo := fetchProviderSubscriptionInfo(ctx, rt.APIPort, rt.APISecret)
+
+	if len(groups) > 0 && (!reflect.DeepEqual(prevGroups, groups) || !reflect.DeepEqual(prevProvInfo, provInfo)) {
+		e.proxyGroupsMu.Lock()
+		e.proxyGroups = groups
+		e.providerSubInfo = provInfo
+		e.proxyGroupsMu.Unlock()
+		anyChanged = true
+	}
+
+	if anyChanged {
+		e.notifyStateChanged()
+	}
+}
+
+func fetchCoreOutboundMode(ctx context.Context, apiPort int, secret string) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/configs", apiPort), nil)
+	if err != nil {
+		return ""
+	}
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	resp, err := (&http.Client{Timeout: 1500 * time.Millisecond}).Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var doc struct {
+		Mode string `json:"mode"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if json.Unmarshal(body, &doc) != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(doc.Mode))
+}
+
+func patchCoreOutboundMode(ctx context.Context, apiPort int, secret, mode string) {
+	body, _ := json.Marshal(map[string]string{"mode": mode})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, fmt.Sprintf("http://127.0.0.1:%d/configs", apiPort), bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	if resp, doErr := (&http.Client{Timeout: 2 * time.Second}).Do(req); doErr == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+}
+
+func fetchProviderSubscriptionInfo(ctx context.Context, apiPort int, secret string) *subscription.UserInfo {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/providers/proxies", apiPort), nil)
+	if err != nil {
+		return nil
+	}
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var payload struct {
+		Providers map[string]struct {
+			VehicleType      string `json:"vehicleType"`
+			SubscriptionInfo *struct {
+				Upload   int64 `json:"Upload"`
+				Download int64 `json:"Download"`
+				Total    int64 `json:"Total"`
+				Expire   int64 `json:"Expire"`
+			} `json:"subscriptionInfo"`
+		} `json:"providers"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if json.Unmarshal(body, &payload) != nil {
+		return nil
+	}
+	var names []string
+	for k := range payload.Providers {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		prov := payload.Providers[k]
+		if strings.EqualFold(prov.VehicleType, "Compatible") || prov.SubscriptionInfo == nil {
+			continue
+		}
+		si := prov.SubscriptionInfo
+		if si.Total <= 0 && si.Upload <= 0 && si.Download <= 0 && si.Expire <= 0 {
+			continue
+		}
+		out := &subscription.UserInfo{}
+		if si.Upload > 0 || si.Download > 0 || si.Total > 0 {
+			u := si.Upload
+			d := si.Download
+			out.Upload = &u
+			out.Download = &d
+		}
+		if si.Total > 0 {
+			t := si.Total
+			out.Total = &t
+		}
+		if si.Expire > 0 {
+			ex := si.Expire
+			out.Expire = &ex
+		}
+		if out.HasAny() {
+			return out
+		}
+	}
+	return nil
+}
+
 func (e *Engine) Snapshot() DaemonSnapshot {
 	settings := e.store.Settings()
 	rt := e.ctrl.LastState()
@@ -457,7 +650,17 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 	groups := append([]ProxyGroupView(nil), e.proxyGroups...)
 	cands := append([]ailock.CandidateNode(nil), e.aiCandidates...)
 	relay := e.aiRelay
+	provSubInfo := e.providerSubInfo
 	e.proxyGroupsMu.RUnlock()
+
+	var activeSubInfo *subscription.UserInfo
+	if sub, ok := e.subMgr.FindByName(settings.SelectedProfile); ok && sub.UserInfo != nil && sub.UserInfo.HasAny() {
+		copied := *sub.UserInfo
+		activeSubInfo = &copied
+	} else if provSubInfo != nil && provSubInfo.HasAny() {
+		copied := *provSubInfo
+		activeSubInfo = &copied
+	}
 
 	e.opMu.Lock()
 	suspended := e.suspendedByNet
@@ -469,26 +672,27 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 	_ = os.MkdirAll(logsDir, 0700)
 
 	return DaemonSnapshot{
-		Version:            AppVersion,
-		Arch:               runtime.GOARCH,
-		CoreRunning:        e.IsCoreRunning(),
-		CoreViaService:     viaSvc,
-		ServiceInstalled:   IsPrivilegedServiceInstalled(service.ServiceName),
-		Settings:           settings,
-		Runtime:            rt,
-		DashboardURL:       buildDashboardURL(rt.APIPort, rt.APISecret),
-		Profiles:           profiles,
-		ProfileMixinPath:   e.store.ProfileMixinPath(),
-		ConfigDir:          e.store.ActiveConfigDir(),
-		LogsDir:            logsDir,
-		ProxyGroups:        groups,
-		AILockCandidates:   cands,
-		AILockRelay:        relay,
-		Subscriptions:      e.subMgr.List(),
-		NodeServices:       nsSnap,
-		ActiveNetwork:      sig,
-		SuspendedByNetwork: suspended,
-		LastError:          lastErr,
+		Version:                AppVersion,
+		Arch:                   runtime.GOARCH,
+		CoreRunning:            e.IsCoreRunning(),
+		CoreViaService:         viaSvc,
+		ServiceInstalled:       IsPrivilegedServiceInstalled(service.ServiceName),
+		Settings:               settings,
+		Runtime:                rt,
+		DashboardURL:           buildDashboardURL(rt.APIPort, rt.APISecret),
+		Profiles:               profiles,
+		ProfileMixinPath:       e.store.ProfileMixinPath(),
+		ConfigDir:              e.store.ActiveConfigDir(),
+		LogsDir:                logsDir,
+		ProxyGroups:            groups,
+		AILockCandidates:       cands,
+		AILockRelay:            relay,
+		Subscriptions:          e.subMgr.List(),
+		ActiveSubscriptionInfo: activeSubInfo,
+		NodeServices:           nsSnap,
+		ActiveNetwork:          sig,
+		SuspendedByNetwork:     suspended,
+		LastError:              lastErr,
 	}
 }
 
@@ -522,14 +726,17 @@ func (e *Engine) refreshLiveCoreMetadata(ctx context.Context) {
 	}
 
 	var groups []ProxyGroupView
+	var provInfo *subscription.UserInfo
 	if rt.APIPort > 0 && e.IsCoreRunning() {
 		groups = fetchProxyGroupsFromCore(ctx, rt.APIPort, rt.APISecret, rawRoot, e.store.RecoverySelectionsForProfile(settings.SelectedProfile))
+		provInfo = fetchProviderSubscriptionInfo(ctx, rt.APIPort, rt.APISecret)
 	}
 
 	e.proxyGroupsMu.Lock()
 	e.proxyGroups = groups
 	e.aiCandidates = cands
 	e.aiRelay = relay
+	e.providerSubInfo = provInfo
 	e.proxyGroupsMu.Unlock()
 }
 
@@ -562,6 +769,8 @@ func fetchProxyGroupsFromCore(
 			Name    string   `json:"name"`
 			Type    string   `json:"type"`
 			Now     string   `json:"now"`
+			Hidden  bool     `json:"hidden"`
+			TestURL string   `json:"testUrl"`
 			All     []string `json:"all"`
 			History []struct {
 				Delay int `json:"delay"`
@@ -573,12 +782,12 @@ func fetchProxyGroupsFromCore(
 		return nil
 	}
 
-	delayOf := func(name string) int {
+	delayOf := func(name string) (int, bool) {
 		p, ok := payload.Proxies[name]
 		if !ok || len(p.History) == 0 {
-			return 0
+			return 0, false
 		}
-		return p.History[len(p.History)-1].Delay
+		return p.History[len(p.History)-1].Delay, true
 	}
 
 	// Preserve profile YAML declaration order for groups!
@@ -598,40 +807,61 @@ func fetchProxyGroupsFromCore(
 	}
 	var extras []string
 	for name, px := range payload.Proxies {
-		if len(px.All) > 0 && name != "GLOBAL" && !seen[name] {
+		if len(px.All) > 0 && !px.Hidden && name != "GLOBAL" && !seen[name] {
 			extras = append(extras, name)
 		}
 	}
 	sort.Strings(extras)
 	orderedNames = append(orderedNames, extras...)
-	if g, hasGlobal := payload.Proxies["GLOBAL"]; hasGlobal && len(g.All) > 0 && !seen["GLOBAL"] {
+	if g, hasGlobal := payload.Proxies["GLOBAL"]; hasGlobal && len(g.All) > 0 && !g.Hidden && !seen["GLOBAL"] {
 		orderedNames = append(orderedNames, "GLOBAL")
 	}
 
 	var out []ProxyGroupView
 	for _, gName := range orderedNames {
 		p, ok := payload.Proxies[gName]
-		if !ok || len(p.All) == 0 {
+		if !ok || len(p.All) == 0 || p.Hidden {
 			continue
 		}
 		gv := ProxyGroupView{
 			Name:              gName,
 			Type:              p.Type,
 			Now:               p.Now,
+			TestURL:           p.TestURL,
 			HasManualOverride: savedSel[gName] != "",
 			Items:             make([]ProxyItemView, 0, len(p.All)),
 		}
 		for _, itemName := range p.All {
 			itemMeta := payload.Proxies[itemName]
+			d, tested := delayOf(itemName)
 			gv.Items = append(gv.Items, ProxyItemView{
 				Name:    itemName,
 				Type:    itemMeta.Type,
-				DelayMs: delayOf(itemName),
+				DelayMs: d,
+				Tested:  tested,
 			})
 		}
 		out = append(out, gv)
 	}
 	return out
+}
+
+func (e *Engine) closeAllConnections(ctx context.Context) {
+	rt := e.ctrl.LastState()
+	if rt.APIPort <= 0 || !e.IsCoreRunning() {
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("http://127.0.0.1:%d/connections", rt.APIPort), nil)
+	if err != nil {
+		return
+	}
+	if rt.APISecret != "" {
+		req.Header.Set("Authorization", "Bearer "+rt.APISecret)
+	}
+	if resp, doErr := (&http.Client{Timeout: 2 * time.Second}).Do(req); doErr == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
 }
 
 // --- High-level RPC Operations ---
@@ -651,8 +881,11 @@ func (e *Engine) SetOutboundMode(ctx context.Context, mode string) error {
 	}); err != nil {
 		return err
 	}
-	_, err := e.applyAndSync(ctx, false, false)
-	return err
+	if _, err := e.applyAndSync(ctx, false, false); err != nil {
+		return err
+	}
+	e.closeAllConnections(ctx)
+	return nil
 }
 
 func (e *Engine) SetSystemProxy(enabled bool) error {
@@ -747,6 +980,7 @@ func (e *Engine) SelectProxy(ctx context.Context, group, target string) error {
 	}
 
 	_ = e.store.RememberProxySelection(e.store.Settings().SelectedProfile, group, target)
+	e.closeAllConnections(ctx)
 	e.refreshLiveCoreMetadata(ctx)
 	e.notifyStateChanged()
 	return nil
@@ -774,8 +1008,52 @@ func (e *Engine) RestoreAutoSelection(ctx context.Context, group string) error {
 			}
 		}
 	}
-	_, err := e.applyAndSync(ctx, false, false)
-	return err
+	if _, err := e.applyAndSync(ctx, false, false); err != nil {
+		return err
+	}
+	e.closeAllConnections(ctx)
+	return nil
+}
+
+func (e *Engine) BenchmarkGroup(ctx context.Context, groupName string) error {
+	groupName = strings.TrimSpace(groupName)
+	if groupName == "" {
+		return fmt.Errorf("group name is required")
+	}
+	rt := e.ctrl.LastState()
+	if rt.APIPort <= 0 || !e.IsCoreRunning() {
+		return fmt.Errorf("proxy core is not running")
+	}
+	benchURL := strings.TrimSpace(e.store.Settings().BenchmarkURL)
+	e.proxyGroupsMu.RLock()
+	for _, g := range e.proxyGroups {
+		if g.Name == groupName && strings.TrimSpace(g.TestURL) != "" {
+			benchURL = strings.TrimSpace(g.TestURL)
+			break
+		}
+	}
+	e.proxyGroupsMu.RUnlock()
+	if benchURL == "" {
+		benchURL = "https://cp.cloudflare.com/generate_204"
+	}
+
+	u := fmt.Sprintf("http://127.0.0.1:%d/group/%s/delay?url=%s&timeout=5000",
+		rt.APIPort, url.PathEscape(groupName), url.QueryEscape(benchURL))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	if rt.APISecret != "" {
+		req.Header.Set("Authorization", "Bearer "+rt.APISecret)
+	}
+	if resp, doErr := (&http.Client{Timeout: 12 * time.Second}).Do(req); doErr == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	e.refreshLiveCoreMetadata(ctx)
+	e.notifyStateChanged()
+	return nil
 }
 
 func (e *Engine) BenchmarkAll(ctx context.Context) error {
@@ -832,10 +1110,27 @@ func (e *Engine) SetAILock(ctx context.Context, enabled bool, target string, all
 		return fmt.Errorf("choose a valid concrete proxy node for AI Proxy Lock")
 	}
 	if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
-		s.AILockEnabled = enabled
 		if enabled {
+			if !prev.AILockEnabled {
+				s.AILockSavedState = &profile.AILockPreLockState{
+					OutboundMode:       prev.OutboundMode,
+					EnhancedMode:       prev.EnhancedMode,
+					SystemProxyEnabled: prev.SystemProxyEnabled,
+				}
+			}
+			s.AILockEnabled = true
 			s.AILockTarget = strings.TrimSpace(target)
 			ailock.EnforceProtectedSettings(s)
+		} else {
+			s.AILockEnabled = false
+			if s.AILockSavedState != nil {
+				if s.AILockSavedState.OutboundMode != "" {
+					s.OutboundMode = s.AILockSavedState.OutboundMode
+				}
+				s.EnhancedMode = s.AILockSavedState.EnhancedMode
+				s.SystemProxyEnabled = s.AILockSavedState.SystemProxyEnabled
+				s.AILockSavedState = nil
+			}
 		}
 		return nil
 	}); err != nil {
@@ -850,6 +1145,7 @@ func (e *Engine) SetAILock(ctx context.Context, enabled bool, target string, all
 		_, _ = e.applyAndSync(ctx, false, false)
 		return err
 	}
+	e.closeAllConnections(ctx)
 	return nil
 }
 
@@ -872,6 +1168,7 @@ func (e *Engine) SelectProfile(ctx context.Context, name string) error {
 		})
 		return err
 	}
+	e.closeAllConnections(ctx)
 	return nil
 }
 
@@ -885,9 +1182,14 @@ func (e *Engine) UpsertSubscription(ctx context.Context, name, rawURL, userAgent
 		return sub, err
 	}
 	if selectAfter {
-		_ = e.SelectProfile(ctx, updated.Name)
+		if err := e.SelectProfile(ctx, updated.Name); err != nil {
+			e.notifyStateChanged()
+			return updated, err
+		}
 	} else if e.store.Settings().SelectedProfile == updated.Name {
-		_, _ = e.applyAndSync(ctx, false, false)
+		if _, err := e.applyAndSync(ctx, false, false); err != nil {
+			return updated, err
+		}
 	} else {
 		e.notifyStateChanged()
 	}
@@ -900,7 +1202,9 @@ func (e *Engine) RefreshSubscription(ctx context.Context, name string) (subscrip
 		return subscription.ManagedSubscription{}, err
 	}
 	if e.store.Settings().SelectedProfile == updated.Name {
-		_, _ = e.applyAndSync(ctx, false, false)
+		if _, err := e.applyAndSync(ctx, false, false); err != nil {
+			return updated, err
+		}
 	} else {
 		e.notifyStateChanged()
 	}
@@ -971,6 +1275,7 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 		next.AILockTarget = cur.AILockTarget
 		ailock.EnforceProtectedSettings(&next)
 	}
+	next.AILockSavedState = cur.AILockSavedState
 	next.SavedSelections = cur.SavedSelections
 
 	if next.LaunchAtLogin != cur.LaunchAtLogin {

@@ -38,6 +38,7 @@ private:
     QTableWidget* table_ = nullptr;
     QLineEdit* nameEdit_ = nullptr;
     QLineEdit* urlEdit_ = nullptr;
+    QLineEdit* userAgentEdit_ = nullptr;
     QCheckBox* activateCheck_ = nullptr;
     QPushButton* saveSubBtn_ = nullptr;
 };

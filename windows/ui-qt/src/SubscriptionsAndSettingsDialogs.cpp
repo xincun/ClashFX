@@ -12,6 +12,7 @@
 #include <QJsonArray>
 #include <QMessageBox>
 #include <QTabWidget>
+#include <QUrl>
 #include <QVBoxLayout>
 
 namespace clashfx {
@@ -71,11 +72,14 @@ SubscriptionsDialog::SubscriptionsDialog(DaemonClient* client, QWidget* parent)
     nameEdit_->setPlaceholderText(L("例如 my-airport（留空则自动根据 URL 命名）", "e.g. my-provider (optional)"));
     urlEdit_ = new QLineEdit(editBox);
     urlEdit_->setPlaceholderText(QStringLiteral("https://example.com/api/v1/client/subscribe?token=..."));
+    userAgentEdit_ = new QLineEdit(editBox);
+    userAgentEdit_->setPlaceholderText(L("可选（留空默认 clash.meta/v1.19.24）", "Optional (default clash.meta/v1.19.24)"));
     activateCheck_ = new QCheckBox(L("拉取成功后立即切换至该配置", "Switch to this profile immediately after pull"), editBox);
     activateCheck_->setChecked(true);
 
     editForm->addRow(L("配置名称:", "Profile Name:"), nameEdit_);
     editForm->addRow(L("订阅 URL:", "Subscription URL:"), urlEdit_);
+    editForm->addRow(L("自定义 User-Agent:", "Custom User-Agent:"), userAgentEdit_);
     editForm->addRow(QString(), activateCheck_);
     root->addWidget(editBox);
 
@@ -101,6 +105,14 @@ SubscriptionsDialog::SubscriptionsDialog(DaemonClient* client, QWidget* parent)
     connect(refreshAllBtn, &QPushButton::clicked, this, &SubscriptionsDialog::onRefreshAll);
     connect(deleteBtn, &QPushButton::clicked, this, &SubscriptionsDialog::onDeleteSelected);
     connect(table_, &QTableWidget::itemSelectionChanged, this, &SubscriptionsDialog::onSelectionChanged);
+    connect(urlEdit_, &QLineEdit::textChanged, this, [this](const QString& text) {
+        const QString host = QUrl(text.trimmed()).host();
+        if (!host.isEmpty()) {
+            nameEdit_->setPlaceholderText(host);
+        } else {
+            nameEdit_->setPlaceholderText(L("例如 my-airport（留空则自动根据 URL 命名）", "e.g. my-provider (optional)"));
+        }
+    });
     connect(closeBtn, &QPushButton::clicked, this, &QDialog::close);
 
     if (client_) {
@@ -142,8 +154,11 @@ void SubscriptionsDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
                              (total > 0 ? formatBytes(total) : QStringLiteral("∞"));
             }
             const qint64 expTs = static_cast<qint64>(ui.value(QStringLiteral("expire")).toDouble(0));
+            const QString expText = ui.value(QStringLiteral("expire_text")).toString().trimmed();
             if (expTs > 0) {
                 expireStr = QDateTime::fromSecsSinceEpoch(expTs).toString(QStringLiteral("yyyy-MM-dd"));
+            } else if (!expText.isEmpty()) {
+                expireStr = expText;
             }
         }
 
@@ -153,7 +168,9 @@ void SubscriptionsDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
             updatedStr = QDateTime::fromSecsSinceEpoch(updTs).toString(QStringLiteral("MM-dd HH:mm"));
         }
 
-        table_->setItem(i, 0, new QTableWidgetItem(name));
+        auto* nameItem = new QTableWidgetItem(name);
+        nameItem->setData(Qt::UserRole, s.value(QStringLiteral("user_agent")).toString());
+        table_->setItem(i, 0, nameItem);
         table_->setItem(i, 1, new QTableWidgetItem(url));
         table_->setItem(i, 2, new QTableWidgetItem(trafficStr));
         table_->setItem(i, 3, new QTableWidgetItem(expireStr));
@@ -166,6 +183,7 @@ void SubscriptionsDialog::onSelectionChanged() {
     if (row < 0 || row >= table_->rowCount()) return;
     nameEdit_->setText(table_->item(row, 0)->text());
     urlEdit_->setText(table_->item(row, 1)->text());
+    userAgentEdit_->setText(table_->item(row, 0)->data(Qt::UserRole).toString());
 }
 
 void SubscriptionsDialog::onAddOrUpdate() {
@@ -179,6 +197,7 @@ void SubscriptionsDialog::onAddOrUpdate() {
     QJsonObject params;
     params.insert(QStringLiteral("name"), nameEdit_->text().trimmed());
     params.insert(QStringLiteral("url"), url);
+    params.insert(QStringLiteral("user_agent"), userAgentEdit_->text().trimmed());
     params.insert(QStringLiteral("select_after"), activateCheck_->isChecked());
     client_->call(QStringLiteral("upsert_subscription"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
         saveSubBtn_->setEnabled(true);

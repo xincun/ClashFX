@@ -104,6 +104,7 @@ void AiLockDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
     targetCombo_->clear();
     const QJsonArray candidates = snapshot.value(QStringLiteral("ai_lock_candidates")).toArray();
     int matchIdx = -1;
+    bool currentTargetExists = false;
     for (int i = 0; i < candidates.size(); ++i) {
         const QJsonObject item = candidates.at(i).toObject();
         const QString name = item.value(QStringLiteral("name")).toString();
@@ -118,6 +119,7 @@ void AiLockDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
         }
         targetCombo_->addItem(label, name);
         if (!currentTarget.isEmpty() && name == currentTarget) {
+            currentTargetExists = true;
             matchIdx = i;
         } else if (matchIdx < 0 && !prevSelected.isEmpty() && name == prevSelected) {
             matchIdx = i;
@@ -125,6 +127,14 @@ void AiLockDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
     }
     if (matchIdx >= 0) {
         targetCombo_->setCurrentIndex(matchIdx);
+    }
+
+    if (locked && !currentTarget.isEmpty() && !currentTargetExists) {
+        statusLabel_->setText(
+            L("警告：当前配置中不存在锁定节点「", "WARNING: Locked node missing in active profile: ") +
+            currentTarget +
+            (I18n::instance().isChinese() ? QStringLiteral("」，请改选节点或停用锁定！") : QString()));
+        statusLabel_->setStyleSheet(QStringLiteral("color: #dc2626; font-weight: 700; font-size: 13px;"));
     }
 
     disableBtn_->setEnabled(locked);
@@ -187,22 +197,51 @@ MultiNodeDialog::MultiNodeDialog(DaemonClient* client, QWidget* parent)
     auto* root = new QVBoxLayout(this);
     root->setSpacing(10);
 
-    auto* topBar = new QHBoxLayout();
+    auto* topBar1 = new QHBoxLayout();
     portsEnabledCheck_ = new QCheckBox(L("启用多节点固定本地端口", "Enable Fixed Local Ports"), this);
-    recoveryEnabledCheck_ = new QCheckBox(L("启用 60s 204 巡检与失败直连自愈", "Enable 60s 204 Health Watchdog & Direct Refresh"), this);
     auto* firstPortLabel = new QLabel(L("起始端口:", "Start Port:"), this);
     firstPortSpin_ = new QSpinBox(this);
     firstPortSpin_->setRange(1024, 65000);
     firstPortSpin_->setValue(21000);
 
-    topBar->addWidget(portsEnabledCheck_);
-    topBar->addSpacing(12);
-    topBar->addWidget(recoveryEnabledCheck_);
-    topBar->addSpacing(12);
-    topBar->addWidget(firstPortLabel);
-    topBar->addWidget(firstPortSpin_);
-    topBar->addStretch(1);
-    root->addLayout(topBar);
+    topBar1->addWidget(portsEnabledCheck_);
+    topBar1->addSpacing(14);
+    topBar1->addWidget(firstPortLabel);
+    topBar1->addWidget(firstPortSpin_);
+    topBar1->addStretch(1);
+    root->addLayout(topBar1);
+
+    auto* topBar2 = new QHBoxLayout();
+    recoveryEnabledCheck_ = new QCheckBox(L("启用 204 巡检与失败直连自愈", "Enable 204 Health Watchdog & Direct Refresh"), this);
+    auto* intervalLabel = new QLabel(L("检测间隔:", "Interval:"), this);
+    checkIntervalSpin_ = new QSpinBox(this);
+    checkIntervalSpin_->setRange(15, 3600);
+    checkIntervalSpin_->setSuffix(QStringLiteral(" s"));
+    checkIntervalSpin_->setValue(60);
+
+    auto* thresholdLabel = new QLabel(L("连续失败次数:", "Fail Threshold:"), this);
+    failureThresholdSpin_ = new QSpinBox(this);
+    failureThresholdSpin_->setRange(2, 10);
+    failureThresholdSpin_->setValue(3);
+
+    auto* cooldownLabel = new QLabel(L("刷新冷却:", "Refresh Cooldown:"), this);
+    refreshCooldownSpin_ = new QSpinBox(this);
+    refreshCooldownSpin_->setRange(60, 86400);
+    refreshCooldownSpin_->setSuffix(QStringLiteral(" s"));
+    refreshCooldownSpin_->setValue(300);
+
+    topBar2->addWidget(recoveryEnabledCheck_);
+    topBar2->addSpacing(12);
+    topBar2->addWidget(intervalLabel);
+    topBar2->addWidget(checkIntervalSpin_);
+    topBar2->addSpacing(10);
+    topBar2->addWidget(thresholdLabel);
+    topBar2->addWidget(failureThresholdSpin_);
+    topBar2->addSpacing(10);
+    topBar2->addWidget(cooldownLabel);
+    topBar2->addWidget(refreshCooldownSpin_);
+    topBar2->addStretch(1);
+    root->addLayout(topBar2);
 
     statusBanner_ = new QLabel(this);
     statusBanner_->setStyleSheet(QStringLiteral(
@@ -276,6 +315,15 @@ MultiNodeDialog::MultiNodeDialog(DaemonClient* client, QWidget* parent)
     connect(firstPortSpin_, &QSpinBox::valueChanged, this, [this]() {
         if (!updatingModel_) userEditedPending_ = true;
     });
+    connect(checkIntervalSpin_, &QSpinBox::valueChanged, this, [this]() {
+        if (!updatingModel_) userEditedPending_ = true;
+    });
+    connect(failureThresholdSpin_, &QSpinBox::valueChanged, this, [this]() {
+        if (!updatingModel_) userEditedPending_ = true;
+    });
+    connect(refreshCooldownSpin_, &QSpinBox::valueChanged, this, [this]() {
+        if (!updatingModel_) userEditedPending_ = true;
+    });
 
     connect(selectAllBtn, &QPushButton::clicked, this, &MultiNodeDialog::onSelectAll);
     connect(disableAllBtn, &QPushButton::clicked, this, &MultiNodeDialog::onDisableAll);
@@ -313,7 +361,10 @@ QString MultiNodeDialog::formatHealth(const QJsonObject& healthObj, bool portEna
     return L("未检测", "Unchecked");
 }
 
-QString MultiNodeDialog::formatSpeed(const QJsonObject& speedObj) {
+QString MultiNodeDialog::formatSpeed(const QJsonObject& speedObj, bool portEnabled, bool portsGlobalEnabled) {
+    if (!portsGlobalEnabled || !portEnabled) {
+        return QStringLiteral("—");
+    }
     const QString kind = speedObj.value(QStringLiteral("kind")).toString();
     const double mbps = speedObj.value(QStringLiteral("mbps")).toDouble(0.0);
     if (kind == QStringLiteral("measuring")) {
@@ -335,6 +386,10 @@ QString MultiNodeDialog::formatSpeed(const QJsonObject& speedObj) {
 }
 
 void MultiNodeDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
+    const QJsonObject appSettings = snapshot.value(QStringLiteral("settings")).toObject();
+    const QString selProfile = appSettings.value(QStringLiteral("selected_profile")).toString(QStringLiteral("config"));
+    const bool aiLocked = appSettings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
+
     const QJsonObject ns = snapshot.value(QStringLiteral("node_services")).toObject();
     const QJsonObject nsSettings = ns.value(QStringLiteral("settings")).toObject();
     const QJsonArray rows = ns.value(QStringLiteral("rows")).toArray();
@@ -342,13 +397,34 @@ void MultiNodeDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
     const bool portsGlobalEnabled = nsSettings.value(QStringLiteral("ports_enabled")).toBool(true);
     const bool recoveryEnabled = nsSettings.value(QStringLiteral("recovery_enabled")).toBool(true);
     const int firstPort = nsSettings.value(QStringLiteral("first_port")).toInt(21000);
+    const int checkIntervalSec = nsSettings.value(QStringLiteral("check_interval_sec")).toInt(60);
+    const int failureThreshold = nsSettings.value(QStringLiteral("failure_threshold")).toInt(3);
+    const int refreshCooldownSec = nsSettings.value(QStringLiteral("refresh_cooldown_sec")).toInt(300);
     isSpeedTesting_ = ns.value(QStringLiteral("is_speed_testing")).toBool(false);
 
-    const QString statusText = ns.value(QStringLiteral("status_text")).toString();
-    statusBanner_->setText(statusText.isEmpty()
-                               ? L("每个启用节点在 127.0.0.1:<端口> 同时监听 HTTP 与 SOCKS5 入站。",
-                                   "Each enabled node listens for both HTTP and SOCKS5 on 127.0.0.1:<port>.")
-                               : statusText);
+    int enabledNodeCount = 0;
+    if (portsGlobalEnabled) {
+        for (const QJsonValue& rv : rows) {
+            if (rv.toObject().value(QStringLiteral("enabled")).toBool(true)) {
+                ++enabledNodeCount;
+            }
+        }
+    }
+
+    const QString statusText = ns.value(QStringLiteral("status_text")).toString().trimmed();
+    QString banner = selProfile + QStringLiteral(" — ") +
+                     (I18n::instance().isChinese()
+                          ? QStringLiteral("已启用 %1 / %2 个节点端口").arg(enabledNodeCount).arg(rows.size())
+                          : QStringLiteral("%1 / %2 node ports enabled").arg(enabledNodeCount).arg(rows.size())) +
+                     QStringLiteral(" — ") +
+                     (statusText.isEmpty()
+                          ? L("127.0.0.1:<端口> 同时监听 HTTP 与 SOCKS5 直通对应节点",
+                              "127.0.0.1:<port> listens for HTTP & SOCKS5 directly to each node")
+                          : statusText);
+    if (aiLocked) {
+        banner += L("  [AI 锁定开启中：独立节点端口不受影响]", "  [AI Lock active: fixed node ports unaffected]");
+    }
+    statusBanner_->setText(banner);
 
     speedTestBtn_->setText(isSpeedTesting_
                                ? L("停止下载测速", "Stop Speed Test")
@@ -361,6 +437,9 @@ void MultiNodeDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
         portsEnabledCheck_->setChecked(portsGlobalEnabled);
         recoveryEnabledCheck_->setChecked(recoveryEnabled);
         firstPortSpin_->setValue(firstPort);
+        checkIntervalSpin_->setValue(checkIntervalSec);
+        failureThresholdSpin_->setValue(failureThreshold);
+        refreshCooldownSpin_->setValue(refreshCooldownSec);
     }
 
     const int prevSelectedRow = tableView_->currentIndex().isValid() ? tableView_->currentIndex().row() : -1;
@@ -387,7 +466,7 @@ void MultiNodeDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
             auto* healthItem = new QStandardItem(formatHealth(r.value(QStringLiteral("health")).toObject(), en, portsGlobalEnabled));
             healthItem->setEditable(false);
 
-            auto* speedItem = new QStandardItem(formatSpeed(r.value(QStringLiteral("speed")).toObject()));
+            auto* speedItem = new QStandardItem(formatSpeed(r.value(QStringLiteral("speed")).toObject(), en, portsGlobalEnabled));
             speedItem->setEditable(false);
 
             model_->appendRow({checkItem, nameItem, portItem, healthItem, speedItem});
@@ -404,7 +483,7 @@ void MultiNodeDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
                 hItem->setText(formatHealth(r.value(QStringLiteral("health")).toObject(), en, portsGlobalEnabled));
             }
             if (auto* sItem = model_->item(i, 4)) {
-                sItem->setText(formatSpeed(r.value(QStringLiteral("speed")).toObject()));
+                sItem->setText(formatSpeed(r.value(QStringLiteral("speed")).toObject(), en, portsGlobalEnabled));
             }
         }
     }
@@ -413,6 +492,7 @@ void MultiNodeDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
 
 void MultiNodeDialog::onSelectAll() {
     updatingModel_ = true;
+    portsEnabledCheck_->setChecked(true);
     for (int i = 0; i < model_->rowCount(); ++i) {
         if (auto* it = model_->item(i, 0)) {
             it->setCheckState(Qt::Checked);
@@ -455,18 +535,13 @@ void MultiNodeDialog::onSaveAndApply() {
         enabledMap.insert(name, enabled);
     }
 
-    const QJsonObject prevNs = client_->snapshot()
-                                   .value(QStringLiteral("node_services"))
-                                   .toObject()
-                                   .value(QStringLiteral("settings"))
-                                   .toObject();
     QJsonObject settingsObj;
     settingsObj.insert(QStringLiteral("ports_enabled"), portsEnabledCheck_->isChecked());
     settingsObj.insert(QStringLiteral("recovery_enabled"), recoveryEnabledCheck_->isChecked());
     settingsObj.insert(QStringLiteral("first_port"), firstPortSpin_->value());
-    settingsObj.insert(QStringLiteral("check_interval_sec"), prevNs.value(QStringLiteral("check_interval_sec")).toInt(60));
-    settingsObj.insert(QStringLiteral("failure_threshold"), prevNs.value(QStringLiteral("failure_threshold")).toInt(3));
-    settingsObj.insert(QStringLiteral("refresh_cooldown_sec"), prevNs.value(QStringLiteral("refresh_cooldown_sec")).toInt(300));
+    settingsObj.insert(QStringLiteral("check_interval_sec"), checkIntervalSpin_->value());
+    settingsObj.insert(QStringLiteral("failure_threshold"), failureThresholdSpin_->value());
+    settingsObj.insert(QStringLiteral("refresh_cooldown_sec"), refreshCooldownSpin_->value());
 
     QJsonObject params;
     params.insert(QStringLiteral("settings"), settingsObj);
@@ -504,6 +579,14 @@ void MultiNodeDialog::onDirectRefresh() {
 
 void MultiNodeDialog::onToggleSpeedTest() {
     if (!client_) return;
+    if (!isSpeedTesting_ && userEditedPending_) {
+        QMessageBox::information(
+            this,
+            windowTitle(),
+            L("存在未保存的端口或启用状态修改，请先点击「保存端口设置并重载」后再开始下载测速。",
+              "You have unsaved port or enablement changes. Please click 'Save & Apply Ports' before starting the speed test."));
+        return;
+    }
     const QString method = isSpeedTesting_ ? QStringLiteral("node_speed_test_cancel")
                                            : QStringLiteral("node_speed_test_start");
     client_->call(method, QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {

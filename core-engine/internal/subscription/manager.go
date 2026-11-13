@@ -24,14 +24,15 @@ import (
 const DefaultSubscriptionUserAgent = "clash.meta/v1.19.24"
 
 type UserInfo struct {
-	Upload   *int64 `json:"upload,omitempty"`
-	Download *int64 `json:"download,omitempty"`
-	Total    *int64 `json:"total,omitempty"`
-	Expire   *int64 `json:"expire,omitempty"`
+	Upload     *int64 `json:"upload,omitempty"`
+	Download   *int64 `json:"download,omitempty"`
+	Total      *int64 `json:"total,omitempty"`
+	Expire     *int64 `json:"expire,omitempty"`
+	ExpireText string `json:"expire_text,omitempty"`
 }
 
 func (u UserInfo) HasAny() bool {
-	return u.Upload != nil || u.Download != nil || u.Total != nil || u.Expire != nil
+	return u.Upload != nil || u.Download != nil || u.Total != nil || u.Expire != nil || strings.TrimSpace(u.ExpireText) != ""
 }
 
 type ManagedSubscription struct {
@@ -305,7 +306,9 @@ func (m *Manager) Refresh(ctx context.Context, name string, directProxyPort int)
 	}
 
 	now := time.Now().Unix()
-	info := ParseUserinfoHeader(resp.Header.Get("Subscription-Userinfo"))
+	headerInfo := ParseUserinfoHeader(resp.Header.Get("Subscription-Userinfo"))
+	bodyInfo := ParseUserinfoBody(rawBody)
+	info := MergeUserInfo(headerInfo, bodyInfo)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -435,6 +438,155 @@ func ParseUserinfoHeader(raw string) *UserInfo {
 		return nil
 	}
 	return &info
+}
+
+func MergeUserInfo(primary, fallback *UserInfo) *UserInfo {
+	if primary == nil && fallback == nil {
+		return nil
+	}
+	var out UserInfo
+	if primary != nil {
+		out = *primary
+	}
+	if fallback != nil {
+		if out.Upload == nil && out.Download == nil {
+			out.Upload = fallback.Upload
+			out.Download = fallback.Download
+		}
+		if out.Total == nil {
+			out.Total = fallback.Total
+		}
+		if out.Expire == nil {
+			out.Expire = fallback.Expire
+		}
+		if strings.TrimSpace(out.ExpireText) == "" {
+			out.ExpireText = fallback.ExpireText
+		}
+	}
+	if !out.HasAny() {
+		return nil
+	}
+	return &out
+}
+
+func ParseUserinfoBody(raw []byte) *UserInfo {
+	text := string(raw)
+	compact := strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(text))
+	if compact != "" && !strings.Contains(text, "proxies:") {
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+			if dec, err := enc.DecodeString(compact); err == nil && len(dec) > 0 {
+				text = string(dec)
+				break
+			}
+		}
+	}
+
+	var info UserInfo
+	for _, rawLine := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		if decoded, err := url.QueryUnescape(line); err == nil && decoded != "" {
+			line = decoded
+		}
+		if total, ok := matchByteValueAfter(line, []string{"总流量", "Total Traffic", "TOT", "Total"}); ok {
+			info.Total = &total
+		}
+		if used, ok := matchByteValueAfter(line, []string{"已用流量", "已使用", "Used"}); ok && info.Upload == nil && info.Download == nil {
+			info.Download = &used
+		}
+		if rem, ok := matchByteValueAfter(line, []string{"剩余流量", "Remaining Traffic", "Remaining"}); ok {
+			if info.Total != nil && info.Upload == nil && info.Download == nil {
+				used := *info.Total - rem
+				if used < 0 {
+					used = 0
+				}
+				info.Download = &used
+			}
+		}
+		if exp := matchExpireLabel(line); exp != "" {
+			info.ExpireText = exp
+		}
+	}
+	if !info.HasAny() {
+		return nil
+	}
+	return &info
+}
+
+func matchByteValueAfter(line string, labels []string) (int64, bool) {
+	type unitMult struct {
+		suffix string
+		mult   float64
+	}
+	units := []unitMult{
+		{"PB", 1125899906842624},
+		{"TB", 1099511627776},
+		{"GB", 1073741824},
+		{"MB", 1048576},
+		{"KB", 1024},
+		{"B", 1},
+	}
+	lowerLine := strings.ToLower(line)
+	for _, lbl := range labels {
+		idx := strings.Index(lowerLine, strings.ToLower(lbl))
+		if idx < 0 {
+			continue
+		}
+		tail := strings.TrimLeft(line[idx+len(lbl):], " ：:=|/-\t")
+		numEnd := 0
+		hasDot := false
+		for numEnd < len(tail) {
+			ch := tail[numEnd]
+			if ch >= '0' && ch <= '9' {
+				numEnd++
+			} else if ch == '.' && !hasDot {
+				hasDot = true
+				numEnd++
+			} else {
+				break
+			}
+		}
+		if numEnd == 0 {
+			continue
+		}
+		val, err := strconv.ParseFloat(tail[:numEnd], 64)
+		if err != nil {
+			continue
+		}
+		unitTail := strings.ToUpper(strings.TrimSpace(tail[numEnd:]))
+		for _, u := range units {
+			if strings.HasPrefix(unitTail, u.suffix) {
+				return int64(val * u.mult), true
+			}
+		}
+		return int64(val), true
+	}
+	return 0, false
+}
+
+func matchExpireLabel(line string) string {
+	lowerLine := strings.ToLower(line)
+	for _, lbl := range []string{"套餐到期", "到期时间", "Expires", "Expiry", "Expire"} {
+		idx := strings.Index(lowerLine, strings.ToLower(lbl))
+		if idx < 0 {
+			continue
+		}
+		tail := strings.TrimSpace(strings.TrimLeft(line[idx+len(lbl):], " ：:=|/-\t"))
+		if tail != "" {
+			if cut := strings.IndexAny(tail, ";|,"); cut > 0 {
+				tail = strings.TrimSpace(tail[:cut])
+			}
+			return tail
+		}
+	}
+	return ""
 }
 
 func newSubscriptionHTTPClient(directProxyPort int, timeout time.Duration) (*http.Client, error) {

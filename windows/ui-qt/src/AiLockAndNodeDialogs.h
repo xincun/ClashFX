@@ -55,7 +55,7 @@ private slots:
 private:
     int selectedRowPort(QString* outNodeName = nullptr) const;
     static QString formatHealth(const QJsonObject& healthObj, bool portEnabled, bool portsGlobalEnabled);
-    static QString formatSpeed(const QJsonObject& speedObj);
+    static QString formatSpeed(const QJsonObject& speedObj, bool portEnabled, bool portsGlobalEnabled);
 
     DaemonClient* client_ = nullptr;
     bool updatingModel_ = false;
@@ -65,6 +65,9 @@ private:
     QCheckBox* portsEnabledCheck_ = nullptr;
     QCheckBox* recoveryEnabledCheck_ = nullptr;
     QSpinBox* firstPortSpin_ = nullptr;
+    QSpinBox* checkIntervalSpin_ = nullptr;
+    QSpinBox* failureThresholdSpin_ = nullptr;
+    QSpinBox* refreshCooldownSpin_ = nullptr;
     QLabel* statusBanner_ = nullptr;
 
     QTableView* tableView_ = nullptr;

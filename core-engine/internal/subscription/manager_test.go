@@ -91,3 +91,32 @@ func TestSubscriptionFetchUserinfoAndShareLinkConversion(t *testing.T) {
 		t.Fatalf("expected converted YAML, got:\n%s", string(savedBytes))
 	}
 }
+
+func TestParseUserinfoBodyAndCustomUserAgent(t *testing.T) {
+	raw := base64.StdEncoding.EncodeToString([]byte(
+		"socks5://127.0.0.1:1080#%E6%80%BB%E6%B5%81%E9%87%8F%3A%20100%20GB\n" +
+			"socks5://127.0.0.1:1081#%E5%89%A9%E4%BD%99%E6%B5%81%E9%87%8F%3A%2040%20GB\n" +
+			"socks5://127.0.0.1:1082#%E5%A5%97%E9%A4%90%E5%88%B0%E6%9C%9F%3A%202027-05-01\n",
+	))
+	parsed := ParseUserinfoBody([]byte(raw))
+	if parsed == nil {
+		t.Fatal("expected ParseUserinfoBody to extract quota & expiry")
+	}
+	const gb = int64(1073741824)
+	if parsed.Total == nil || *parsed.Total != 100*gb {
+		t.Fatalf("expected total 100 GB, got %+v", parsed.Total)
+	}
+	if parsed.Download == nil || *parsed.Download != 60*gb {
+		t.Fatalf("expected derived used 60 GB, got %+v", parsed.Download)
+	}
+	if parsed.ExpireText != "2027-05-01" {
+		t.Fatalf("expected expire_text 2027-05-01, got %q", parsed.ExpireText)
+	}
+
+	// Header takes precedence over body fallback when both exist
+	hdr := ParseUserinfoHeader("upload=10; download=20; total=100")
+	merged := MergeUserInfo(hdr, parsed)
+	if *merged.Total != 100 || *merged.Upload != 10 || *merged.Download != 20 || merged.ExpireText != "2027-05-01" {
+		t.Fatalf("unexpected MergeUserInfo result: %+v", merged)
+	}
+}

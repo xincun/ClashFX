@@ -10,15 +10,78 @@
 #include <QActionGroup>
 #include <QApplication>
 #include <QClipboard>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QLocalSocket>
 #include <QMessageBox>
 #include <QTimer>
 #include <QUrl>
 
 namespace clashfx {
+
+namespace {
+
+QString formatTrafficBytes(qint64 bytes) {
+    if (bytes <= 0) {
+        return QStringLiteral("0 B");
+    }
+    const double gb = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+    if (gb >= 1.0) {
+        return QString::number(gb, 'f', 2) + QStringLiteral(" GB");
+    }
+    const double mb = static_cast<double>(bytes) / (1024.0 * 1024.0);
+    return QString::number(mb, 'f', 1) + QStringLiteral(" MB");
+}
+
+QString buildTopSubscriptionStatusText(const QString& profileName, const QJsonObject& subInfo) {
+    if (subInfo.isEmpty()) {
+        return QString();
+    }
+    QString quotaPart;
+    const bool hasUp = subInfo.contains(QStringLiteral("upload"));
+    const bool hasDown = subInfo.contains(QStringLiteral("download"));
+    const bool hasTotal = subInfo.contains(QStringLiteral("total"));
+    if (hasUp || hasDown || hasTotal) {
+        const qint64 up = static_cast<qint64>(subInfo.value(QStringLiteral("upload")).toDouble(0));
+        const qint64 down = static_cast<qint64>(subInfo.value(QStringLiteral("download")).toDouble(0));
+        const qint64 total = static_cast<qint64>(subInfo.value(QStringLiteral("total")).toDouble(0));
+        const qint64 used = qMax<qint64>(0, up + down);
+        if (total > 0) {
+            quotaPart = formatTrafficBytes(used) + QStringLiteral(" / ") + formatTrafficBytes(total);
+        } else if (used > 0) {
+            quotaPart = formatTrafficBytes(used);
+        }
+    }
+
+    QString expirePart;
+    const qint64 expTs = static_cast<qint64>(subInfo.value(QStringLiteral("expire")).toDouble(0));
+    const QString expText = subInfo.value(QStringLiteral("expire_text")).toString().trimmed();
+    if (expTs > 0) {
+        expirePart = L("到期 ", "Exp ") + QDateTime::fromSecsSinceEpoch(expTs).toString(QStringLiteral("yyyy-MM-dd"));
+    } else if (!expText.isEmpty()) {
+        expirePart = L("到期 ", "Exp ") + expText;
+    }
+
+    if (quotaPart.isEmpty() && expirePart.isEmpty()) {
+        return QString();
+    }
+    QStringList parts;
+    if (!profileName.isEmpty()) {
+        parts << profileName;
+    }
+    if (!quotaPart.isEmpty()) {
+        parts << quotaPart;
+    }
+    if (!expirePart.isEmpty()) {
+        parts << expirePart;
+    }
+    return parts.join(QStringLiteral(" · "));
+}
+
+} // namespace
 
 TrayController::TrayController(DaemonClient* client,
                                const QString& uiServerName,
@@ -39,6 +102,20 @@ TrayController::TrayController(DaemonClient* client,
     trayIcon_->show();
 
     connect(trayIcon_, &QSystemTrayIcon::activated, this, &TrayController::onTrayActivated);
+    connect(trayMenu_, &QMenu::aboutToShow, this, [this]() {
+        if (menuDirty_) {
+            rebuildMenuContents();
+        }
+    });
+    connect(trayMenu_, &QMenu::aboutToHide, this, [this]() {
+        if (menuDirty_) {
+            QTimer::singleShot(80, this, [this]() {
+                if (menuDirty_ && !isMenuTreeVisible()) {
+                    rebuildMenuContents();
+                }
+            });
+        }
+    });
     connect(hotkeys_, &HotkeyManager::toggleSystemProxyTriggered, this, &TrayController::onToggleSystemProxyHotkey);
     connect(hotkeys_, &HotkeyManager::switchOutboundModeTriggered, this, &TrayController::onSwitchModeHotkey);
 
@@ -48,14 +125,14 @@ TrayController::TrayController(DaemonClient* client,
     connect(consoleWindow_, &ConsoleWindow::openDiagnosticsRequested, this, [this]() { openDiagnosticsDialog(); });
     connect(consoleWindow_, &ConsoleWindow::openSettingsRequested, this, &TrayController::openSettingsDialog);
 
-    connect(&I18n::instance(), &I18n::languageChanged, this, [this]() { rebuildTrayVisualsAndMenu(); });
+    connect(&I18n::instance(), &I18n::languageChanged, this, [this]() { rebuildTrayVisualsAndMenu(true); });
 
     if (client_) {
         connect(client_, &DaemonClient::connectionChanged, this, &TrayController::onConnectionChanged);
         connect(client_, &DaemonClient::stateChanged, this, &TrayController::onStateChanged);
     }
 
-    rebuildTrayVisualsAndMenu();
+    rebuildTrayVisualsAndMenu(true);
 
     if (showConsoleInitially) {
         QTimer::singleShot(150, this, &TrayController::openConsole);
@@ -177,7 +254,127 @@ void TrayController::onSwitchModeHotkey() {
     client_->call(QStringLiteral("set_outbound_mode"), p);
 }
 
-void TrayController::rebuildTrayVisualsAndMenu() {
+bool TrayController::isMenuTreeVisible() const {
+    if (!trayMenu_) {
+        return false;
+    }
+    if (trayMenu_->isVisible()) {
+        return true;
+    }
+    const auto subMenus = trayMenu_->findChildren<QMenu*>();
+    for (QMenu* sub : subMenus) {
+        if (sub && sub->isVisible()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+QByteArray TrayController::buildMenuSignature() const {
+    const QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
+    const QJsonObject runtime = snapshot_.value(QStringLiteral("runtime")).toObject();
+    QJsonObject sig;
+    sig.insert(QStringLiteral("connected"), connected_);
+    sig.insert(QStringLiteral("lang"), I18n::instance().language());
+    sig.insert(QStringLiteral("preset"), settings.value(QStringLiteral("tray_icon_preset")));
+    sig.insert(QStringLiteral("sys"), settings.value(QStringLiteral("system_proxy_enabled")));
+    sig.insert(QStringLiteral("tun"), settings.value(QStringLiteral("enhanced_mode")));
+    sig.insert(QStringLiteral("ai_en"), settings.value(QStringLiteral("claudeProxyLockEnabled")));
+    sig.insert(QStringLiteral("ai_tgt"), settings.value(QStringLiteral("claudeProxyLockTarget")));
+    sig.insert(QStringLiteral("mode"), settings.value(QStringLiteral("outbound_mode")));
+    sig.insert(QStringLiteral("prof"), settings.value(QStringLiteral("selected_profile")));
+    sig.insert(QStringLiteral("allow_lan"), settings.value(QStringLiteral("allow_lan")));
+    sig.insert(QStringLiteral("ipv6"), settings.value(QStringLiteral("ipv6")));
+    sig.insert(QStringLiteral("bypass_cn"), settings.value(QStringLiteral("bypass_cn_apps")));
+    sig.insert(QStringLiteral("as_is"), settings.value(QStringLiteral("custom_config_as_is")));
+    sig.insert(QStringLiteral("autostart"), settings.value(QStringLiteral("launch_at_login")));
+    sig.insert(QStringLiteral("mixed_port"), runtime.value(QStringLiteral("mixed_port")));
+    sig.insert(QStringLiteral("profiles"), snapshot_.value(QStringLiteral("profiles")));
+    sig.insert(QStringLiteral("groups"), snapshot_.value(QStringLiteral("proxy_groups")));
+    sig.insert(QStringLiteral("sub_info"), snapshot_.value(QStringLiteral("active_subscription_info")));
+    return QJsonDocument(sig).toJson(QJsonDocument::Compact);
+}
+
+void TrayController::handleConfigMutationResult(const QString& actionTitle,
+                                                const std::function<void()>& retryAction,
+                                                bool ok,
+                                                const QString& err) {
+    if (ok) {
+        return;
+    }
+    const bool aiLocked = snapshot_.value(QStringLiteral("settings"))
+                              .toObject()
+                              .value(QStringLiteral("claudeProxyLockEnabled"))
+                              .toBool(false);
+    if (aiLocked && retryAction) {
+        QMessageBox box(consoleWindow_);
+        box.setIcon(QMessageBox::Warning);
+        box.setWindowTitle(actionTitle);
+        box.setText(actionTitle + L("失败：\n", " failed:\n") + err +
+                    L("\n\n当前已启用 AI 专用锁定（要求目标配置包含锁定的具体节点）。是否停用 AI 专用锁定并立即重试？",
+                      "\n\nAI Proxy Lock is active (which requires the locked node to exist in the profile). Disable AI Proxy Lock and retry now?"));
+        auto* disableRetryBtn = box.addButton(L("停用 AI 锁定并重试", "Disable AI Lock & Retry"), QMessageBox::AcceptRole);
+        box.addButton(L("取消", "Cancel"), QMessageBox::RejectRole);
+        box.exec();
+        if (box.clickedButton() == disableRetryBtn && client_) {
+            QJsonObject p;
+            p.insert(QStringLiteral("enabled"), false);
+            p.insert(QStringLiteral("target"), QString());
+            p.insert(QStringLiteral("allow_uac"), false);
+            client_->call(QStringLiteral("set_ai_lock"), p, [this, actionTitle, retryAction](bool disOk, const QJsonValue&, const QString& disErr, const QString&) {
+                if (!disOk) {
+                    QMessageBox::warning(consoleWindow_, actionTitle, disErr);
+                    return;
+                }
+                retryAction();
+            });
+        }
+        return;
+    }
+    trayIcon_->showMessage(QStringLiteral("ClashFX"), actionTitle + QStringLiteral(": ") + err, QSystemTrayIcon::Warning);
+}
+
+void TrayController::rebuildTrayVisualsAndMenu(bool forceMenu) {
+    const QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
+    const QString preset = settings.value(QStringLiteral("tray_icon_preset")).toString(QStringLiteral("default"));
+    const bool sysProxy = settings.value(QStringLiteral("system_proxy_enabled")).toBool(false);
+    const bool enhanced = settings.value(QStringLiteral("enhanced_mode")).toBool(false);
+    const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
+
+    TrayVisualState vis = TrayVisualState::Disconnected;
+    if (connected_ && !snapshot_.isEmpty()) {
+        if (enhanced) vis = TrayVisualState::EnhancedTun;
+        else if (sysProxy) vis = TrayVisualState::SystemProxy;
+        else vis = TrayVisualState::Idle;
+    }
+
+    const QString iconKey = QStringLiteral("%1|%2|%3")
+                                .arg(preset)
+                                .arg(static_cast<int>(vis))
+                                .arg(aiLocked ? 1 : 0);
+    if (iconKey != lastIconKey_) {
+        lastIconKey_ = iconKey;
+        trayIcon_->setIcon(TrayIconGenerator::generate(preset, vis, aiLocked));
+    }
+
+    const QString tooltip = TrayIconGenerator::buildTooltip(connected_, snapshot_);
+    if (tooltip != lastTooltip_) {
+        lastTooltip_ = tooltip;
+        trayIcon_->setToolTip(tooltip);
+    }
+
+    const QByteArray nextSig = buildMenuSignature();
+    if (!forceMenu && !menuDirty_ && nextSig == lastMenuSig_) {
+        return;
+    }
+    if (isMenuTreeVisible()) {
+        menuDirty_ = true;
+        return;
+    }
+    rebuildMenuContents();
+}
+
+void TrayController::rebuildMenuContents() {
     const QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
     const QJsonObject runtime = snapshot_.value(QStringLiteral("runtime")).toObject();
 
@@ -187,19 +384,26 @@ void TrayController::rebuildTrayVisualsAndMenu() {
     const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
     const QString aiTarget = settings.value(QStringLiteral("claudeProxyLockTarget")).toString();
     const QString mode = settings.value(QStringLiteral("outbound_mode")).toString(QStringLiteral("rule")).toLower();
+    const QString selProfile = settings.value(QStringLiteral("selected_profile")).toString(QStringLiteral("config"));
     const int mixedPort = runtime.value(QStringLiteral("mixed_port")).toInt(7890);
 
-    TrayVisualState vis = TrayVisualState::Disconnected;
-    if (connected_ && !snapshot_.isEmpty()) {
-        if (enhanced) vis = TrayVisualState::EnhancedTun;
-        else if (sysProxy) vis = TrayVisualState::SystemProxy;
-        else vis = TrayVisualState::Idle;
+    lastMenuSig_ = buildMenuSignature();
+    menuDirty_ = false;
+
+    const auto oldSubMenus = trayMenu_->findChildren<QMenu*>(QString(), Qt::FindDirectChildrenOnly);
+    trayMenu_->clear();
+    for (QMenu* sub : oldSubMenus) {
+        sub->deleteLater();
     }
 
-    trayIcon_->setIcon(TrayIconGenerator::generate(preset, vis, aiLocked));
-    trayIcon_->setToolTip(TrayIconGenerator::buildTooltip(connected_, snapshot_));
-
-    trayMenu_->clear();
+    // 0. Top subscription quota & expiry status row (aligned with macOS ClashFX)
+    const QJsonObject activeSubInfo = snapshot_.value(QStringLiteral("active_subscription_info")).toObject();
+    const QString subStatusLine = buildTopSubscriptionStatusText(selProfile, activeSubInfo);
+    if (!subStatusLine.isEmpty()) {
+        QAction* subStatusAct = trayMenu_->addAction(subStatusLine);
+        subStatusAct->setEnabled(false);
+        trayMenu_->addSeparator();
+    }
 
     // 1. Open Console
     QAction* openAct = trayMenu_->addAction(L("打开控制台 (MetaCubeXD)", "Open Console (MetaCubeXD)"),
@@ -237,30 +441,63 @@ void TrayController::rebuildTrayVisualsAndMenu() {
         });
     }
 
-    // 3. Dynamic Proxy Groups
+    // 3. Dynamic Proxy Groups (GLOBAL only shown in Global mode; hidden groups already filtered)
     const QJsonArray groups = snapshot_.value(QStringLiteral("proxy_groups")).toArray();
-    if (!groups.isEmpty()) {
-        trayMenu_->addSeparator();
-        for (const QJsonValue& gv : groups) {
-            const QJsonObject g = gv.toObject();
-            const QString gName = g.value(QStringLiteral("name")).toString();
-            const QString gType = g.value(QStringLiteral("type")).toString();
-            const QString now = g.value(QStringLiteral("now")).toString();
-            const bool hasManual = g.value(QStringLiteral("has_manual_override")).toBool(false);
+    bool addedGroupsSep = false;
+    for (const QJsonValue& gv : groups) {
+        const QJsonObject g = gv.toObject();
+        const QString gName = g.value(QStringLiteral("name")).toString();
+        const QString gType = g.value(QStringLiteral("type")).toString();
+        const QString now = g.value(QStringLiteral("now")).toString();
+        const bool hasManual = g.value(QStringLiteral("has_manual_override")).toBool(false);
 
-            QMenu* gMenu = trayMenu_->addMenu(
-                now.isEmpty() ? gName : QStringLiteral("%1  (%2)").arg(gName, now));
+        if (gName == QStringLiteral("GLOBAL") && mode != QStringLiteral("global")) {
+            continue;
+        }
+        if (!addedGroupsSep) {
+            trayMenu_->addSeparator();
+            addedGroupsSep = true;
+        }
 
-            const QJsonArray items = g.value(QStringLiteral("items")).toArray();
-            for (const QJsonValue& iv : items) {
-                const QJsonObject it = iv.toObject();
-                const QString itemName = it.value(QStringLiteral("name")).toString();
-                const int delay = it.value(QStringLiteral("delay_ms")).toInt(0);
-                QString title = itemName;
-                if (delay > 0) {
-                    title += QStringLiteral("   (%1 ms)").arg(delay);
-                }
-                QAction* itemAct = gMenu->addAction(title);
+        const bool isLoadBalance = (gType.compare(QStringLiteral("LoadBalance"), Qt::CaseInsensitive) == 0 ||
+                                    gType.compare(QStringLiteral("load-balance"), Qt::CaseInsensitive) == 0);
+        const bool isRelay = (gType.compare(QStringLiteral("Relay"), Qt::CaseInsensitive) == 0);
+        const bool isAutoGroup = (gType.compare(QStringLiteral("URLTest"), Qt::CaseInsensitive) == 0 ||
+                                  gType.compare(QStringLiteral("Fallback"), Qt::CaseInsensitive) == 0);
+
+        QString groupMenuTitle = gName;
+        if (isLoadBalance) {
+            groupMenuTitle = QStringLiteral("%1  (%2)").arg(gName, L("负载均衡", "Load Balance"));
+        } else if (!now.isEmpty()) {
+            groupMenuTitle = QStringLiteral("%1  (%2)").arg(gName, now);
+        }
+        QMenu* gMenu = trayMenu_->addMenu(groupMenuTitle);
+
+        QAction* benchGrpAct = gMenu->addAction(L("测试本组延迟", "Test Group Latency"));
+        benchGrpAct->setEnabled(connected_);
+        connect(benchGrpAct, &QAction::triggered, this, [this, gName]() {
+            QJsonObject p;
+            p.insert(QStringLiteral("group"), gName);
+            client_->call(QStringLiteral("benchmark_group"), p);
+        });
+        gMenu->addSeparator();
+
+        const QJsonArray items = g.value(QStringLiteral("items")).toArray();
+        for (const QJsonValue& iv : items) {
+            const QJsonObject it = iv.toObject();
+            const QString itemName = it.value(QStringLiteral("name")).toString();
+            const int delay = it.value(QStringLiteral("delay_ms")).toInt(0);
+            const bool tested = it.value(QStringLiteral("tested")).toBool(false);
+            QString title = itemName;
+            if (delay > 0) {
+                title += QStringLiteral("   (%1 ms)").arg(delay);
+            } else if (tested && itemName != QStringLiteral("DIRECT") && itemName != QStringLiteral("REJECT")) {
+                title += QStringLiteral("   (%1)").arg(L("超时", "Timeout"));
+            }
+            QAction* itemAct = gMenu->addAction(title);
+            if (isLoadBalance || isRelay) {
+                itemAct->setEnabled(false);
+            } else {
                 itemAct->setCheckable(true);
                 itemAct->setChecked(itemName == now);
                 connect(itemAct, &QAction::triggered, this, [this, gName, itemName]() {
@@ -270,18 +507,26 @@ void TrayController::rebuildTrayVisualsAndMenu() {
                     client_->call(QStringLiteral("select_proxy"), p);
                 });
             }
+        }
 
+        const bool showDiag = (!isLoadBalance && !now.isEmpty() &&
+                               now != QStringLiteral("DIRECT") && now != QStringLiteral("REJECT"));
+        if (isAutoGroup || showDiag) {
             gMenu->addSeparator();
-            if (hasManual || gType.compare(QStringLiteral("URLTest"), Qt::CaseInsensitive) == 0 ||
-                gType.compare(QStringLiteral("Fallback"), Qt::CaseInsensitive) == 0) {
-                QAction* autoAct = gMenu->addAction(L("恢复自动选择", "Restore Automatic Selection"));
-                connect(autoAct, &QAction::triggered, this, [this, gName]() {
-                    QJsonObject p;
-                    p.insert(QStringLiteral("group"), gName);
-                    client_->call(QStringLiteral("restore_auto_selection"), p);
-                });
+            if (isAutoGroup) {
+                if (hasManual) {
+                    QAction* autoAct = gMenu->addAction(L("恢复自动选择", "Restore Automatic Selection"));
+                    connect(autoAct, &QAction::triggered, this, [this, gName]() {
+                        QJsonObject p;
+                        p.insert(QStringLiteral("group"), gName);
+                        client_->call(QStringLiteral("restore_auto_selection"), p);
+                    });
+                } else {
+                    QAction* autoHintAct = gMenu->addAction(L("自动测速择优中", "Automatic Selection Active"));
+                    autoHintAct->setEnabled(false);
+                }
             }
-            if (!now.isEmpty() && now != QStringLiteral("DIRECT") && now != QStringLiteral("REJECT")) {
+            if (showDiag) {
                 QAction* diagAct = gMenu->addAction(L("诊断当前节点…", "Diagnose Current Node…"));
                 connect(diagAct, &QAction::triggered, this, [this, now]() {
                     openDiagnosticsDialog(now);
@@ -342,7 +587,6 @@ void TrayController::rebuildTrayVisualsAndMenu() {
     trayMenu_->addSeparator();
 
     // 6. Config submenu
-    const QString selProfile = settings.value(QStringLiteral("selected_profile")).toString(QStringLiteral("config"));
     QMenu* cfgMenu = trayMenu_->addMenu(L("配置管理", "Config") + QStringLiteral(" (%1)").arg(selProfile));
     for (const QJsonValue& pv : snapshot_.value(QStringLiteral("profiles")).toArray()) {
         const QString pName = pv.toString();
@@ -350,14 +594,33 @@ void TrayController::rebuildTrayVisualsAndMenu() {
         pAct->setCheckable(true);
         pAct->setChecked(pName == selProfile);
         connect(pAct, &QAction::triggered, this, [this, pName]() {
-            QJsonObject p;
-            p.insert(QStringLiteral("name"), pName);
-            client_->call(QStringLiteral("select_profile"), p);
+            auto doSelect = [this, pName]() {
+                QJsonObject p;
+                p.insert(QStringLiteral("name"), pName);
+                client_->call(QStringLiteral("select_profile"), p, [this, pName](bool ok, const QJsonValue&, const QString& err, const QString&) {
+                    handleConfigMutationResult(
+                        L("切换配置", "Switch Profile"),
+                        [this, pName]() {
+                            QJsonObject retryP;
+                            retryP.insert(QStringLiteral("name"), pName);
+                            client_->call(QStringLiteral("select_profile"), retryP);
+                        },
+                        ok,
+                        err);
+                });
+            };
+            doSelect();
         });
     }
     cfgMenu->addSeparator();
     cfgMenu->addAction(L("重载当前配置", "Reload Config"), this, [this]() {
-        client_->call(QStringLiteral("reload_config"));
+        client_->call(QStringLiteral("reload_config"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+            handleConfigMutationResult(
+                L("重载当前配置", "Reload Config"),
+                [this]() { client_->call(QStringLiteral("reload_config")); },
+                ok,
+                err);
+        });
     });
     cfgMenu->addAction(L("编辑 Profile Mixin…", "Edit Profile Mixin…"), this, [this]() {
         client_->call(QStringLiteral("ensure_profile_mixin"), QJsonObject(), [](bool ok, const QJsonValue& data, const QString&, const QString&) {

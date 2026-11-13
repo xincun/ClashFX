@@ -57,6 +57,12 @@ type HotkeySettings struct {
 	SwitchOutboundMode string `json:"switch_outbound_mode"`
 }
 
+type AILockPreLockState struct {
+	OutboundMode       string `json:"outbound_mode"`
+	EnhancedMode       bool   `json:"enhanced_mode"`
+	SystemProxyEnabled bool   `json:"system_proxy_enabled"`
+}
+
 type AppSettings struct {
 	SelectedProfile       string                       `json:"selected_profile"`
 	CustomConfigDir       string                       `json:"custom_config_dir"`
@@ -80,6 +86,7 @@ type AppSettings struct {
 	AutoUpdateIntervalSec int                          `json:"auto_update_interval_sec"`
 	AILockEnabled         bool                         `json:"claudeProxyLockEnabled"`
 	AILockTarget          string                       `json:"claudeProxyLockTarget"`
+	AILockSavedState      *AILockPreLockState          `json:"ai_lock_saved_state,omitempty"`
 	TrayIconPreset        string                       `json:"tray_icon_preset"`
 	Language              string                       `json:"language"`
 	LaunchAtLogin         bool                         `json:"launch_at_login"`

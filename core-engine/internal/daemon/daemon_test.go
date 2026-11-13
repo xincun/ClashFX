@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -170,5 +171,91 @@ rules:
 	bundleStr := fmt.Sprint(diagBundle.Data)
 	if !strings.Contains(bundleStr, "ClashFX Windows Diagnostic Report") {
 		t.Fatalf("unexpected diagnostic bundle: %s", bundleStr)
+	}
+}
+
+func TestFetchProxyGroupsHiddenFilterTimeoutAndProviderQuota(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/proxies", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"proxies": map[string]any{
+				"Proxy": map[string]any{
+					"name":    "Proxy",
+					"type":    "Selector",
+					"now":     "NodeOK",
+					"hidden":  false,
+					"testUrl": "https://www.gstatic.com/generate_204",
+					"all":     []string{"NodeOK", "NodeTimeout", "NodeUntested"},
+				},
+				"InternalHelper": map[string]any{
+					"name":   "InternalHelper",
+					"type":   "URLTest",
+					"now":    "NodeOK",
+					"hidden": true,
+					"all":    []string{"NodeOK"},
+				},
+				"GLOBAL": map[string]any{
+					"name":   "GLOBAL",
+					"type":   "Selector",
+					"now":    "DIRECT",
+					"hidden": false,
+					"all":    []string{"DIRECT", "Proxy"},
+				},
+				"NodeOK": map[string]any{
+					"name":    "NodeOK",
+					"type":    "Shadowsocks",
+					"history": []map[string]any{{"delay": 88}},
+				},
+				"NodeTimeout": map[string]any{
+					"name":    "NodeTimeout",
+					"type":    "Shadowsocks",
+					"history": []map[string]any{{"delay": 0}},
+				},
+				"NodeUntested": map[string]any{
+					"name":    "NodeUntested",
+					"type":    "Shadowsocks",
+					"history": []map[string]any{},
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/providers/proxies", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"providers": map[string]any{
+				"default": map[string]any{
+					"vehicleType": "Compatible",
+				},
+				"airport": map[string]any{
+					"vehicleType": "HTTP",
+					"subscriptionInfo": map[string]any{
+						"Upload":   int64(100),
+						"Download": int64(200),
+						"Total":    int64(1000),
+						"Expire":   int64(1893456000),
+					},
+				},
+			},
+		})
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+
+	groups := fetchProxyGroupsFromCore(context.Background(), port, "", nil, map[string]string{"Proxy": "NodeOK"})
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 non-hidden groups (Proxy + GLOBAL), got %d: %+v", len(groups), groups)
+	}
+	if groups[0].Name != "Proxy" || groups[0].TestURL != "https://www.gstatic.com/generate_204" || !groups[0].HasManualOverride {
+		t.Fatalf("unexpected Proxy group metadata: %+v", groups[0])
+	}
+	items := groups[0].Items
+	if len(items) != 3 || !items[0].Tested || items[0].DelayMs != 88 || !items[1].Tested || items[1].DelayMs != 0 || items[2].Tested {
+		t.Fatalf("unexpected item delay/tested flags: %+v", items)
+	}
+
+	provInfo := fetchProviderSubscriptionInfo(context.Background(), port, "")
+	if provInfo == nil || *provInfo.Upload != 100 || *provInfo.Download != 200 || *provInfo.Total != 1000 || *provInfo.Expire != 1893456000 {
+		t.Fatalf("unexpected provider subscription info: %+v", provInfo)
 	}
 }

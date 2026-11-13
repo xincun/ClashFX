@@ -1,11 +1,13 @@
 #pragma once
 
+#include <QByteArray>
 #include <QJsonObject>
 #include <QLocalServer>
 #include <QMenu>
 #include <QObject>
 #include <QPointer>
 #include <QSystemTrayIcon>
+#include <functional>
 
 namespace clashfx {
 
@@ -47,7 +49,14 @@ private slots:
     void onSwitchModeHotkey();
 
 private:
-    void rebuildTrayVisualsAndMenu();
+    void rebuildTrayVisualsAndMenu(bool forceMenu = false);
+    void rebuildMenuContents();
+    bool isMenuTreeVisible() const;
+    QByteArray buildMenuSignature() const;
+    void handleConfigMutationResult(const QString& actionTitle,
+                                    const std::function<void()>& retryAction,
+                                    bool ok,
+                                    const QString& err);
     void mutateSettingBool(const QString& key, bool value);
     void mutateSettingString(const QString& key, const QString& value);
     void importSchemeUri(const QString& uri);
@@ -70,6 +79,10 @@ private:
     QPointer<SettingsDialog> settingsDlg_;
 
     bool connected_ = false;
+    bool menuDirty_ = true;
+    QString lastIconKey_;
+    QString lastTooltip_;
+    QByteArray lastMenuSig_;
     QJsonObject snapshot_;
 };
 
