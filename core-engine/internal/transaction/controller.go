@@ -124,7 +124,10 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 		return c.lastState, err
 	}
 
-	// 3. Run registered feature hooks (AI Proxy Lock, Multi-Node ports, CN Apps bypass)
+	// 3. Ensure disk-backed built-in ruleset files exist, then run registered feature hooks
+	if err := profile.EnsureBuiltinRulesetFiles(cfgDir); err != nil {
+		return c.lastState, err
+	}
 	for _, hook := range c.hooks {
 		if err := hook(root, settings); err != nil {
 			return c.lastState, err

@@ -212,6 +212,64 @@ rules:
 	if effView.Rules[0].Payload != "scholar.org" || effView.Rules[0].Proxy != "Proxy" || effView.Rules[0].Source != "mixin" {
 		t.Fatalf("expected mixin rule #0 -> Proxy, got %+v", effView.Rules[0])
 	}
+
+	// 7. Live top-level rule disable/enable (PATCH /rules/disable) + editable ruleset save/reset
+	disResp := callRPC(8, "set_rule_disabled", map[string]any{
+		"indices":  []int{0},
+		"disabled": true,
+	})
+	if !disResp.OK {
+		t.Fatalf("set_rule_disabled(true) failed: %s", disResp.Error)
+	}
+	var disView EffectiveRulesView
+	rawDis, _ := json.Marshal(disResp.Data)
+	_ = json.Unmarshal(rawDis, &disView)
+	if !disView.Rules[0].Disabled {
+		t.Fatalf("expected rule #0 Disabled=true, got %+v", disView.Rules[0])
+	}
+
+	enResp := callRPC(9, "set_rule_disabled", map[string]any{
+		"indices":  []int{0},
+		"disabled": false,
+	})
+	if !enResp.OK {
+		t.Fatalf("set_rule_disabled(false) failed: %s", enResp.Error)
+	}
+
+	badProvResp := callRPC(10, "save_rule_provider", map[string]string{
+		"provider_name": "clashfx-ai-lock",
+		"content":       "DOMAIN-SUFFIX,perplexity.ai,DIRECT\n",
+	})
+	if badProvResp.OK {
+		t.Fatal("expected save_rule_provider with trailing ,DIRECT target to fail validation")
+	}
+
+	goodProvResp := callRPC(11, "save_rule_provider", map[string]string{
+		"provider_name": "clashfx-ai-lock",
+		"content":       "# custom test\nDOMAIN-SUFFIX,perplexity.ai\nDOMAIN-SUFFIX,claude.ai\n",
+	})
+	if !goodProvResp.OK {
+		t.Fatalf("save_rule_provider failed: %s", goodProvResp.Error)
+	}
+	var provView EffectiveRulesView
+	rawProv, _ := json.Marshal(goodProvResp.Data)
+	_ = json.Unmarshal(rawProv, &provView)
+	if provView.RuleProviders["clashfx-ai-lock"].RuleCount != 2 || !provView.RuleProviders["clashfx-ai-lock"].Editable {
+		t.Fatalf("unexpected clashfx-ai-lock provider after save: %+v", provView.RuleProviders["clashfx-ai-lock"])
+	}
+
+	resetProvResp := callRPC(12, "reset_rule_provider", map[string]string{
+		"provider_name": "clashfx-ai-lock",
+	})
+	if !resetProvResp.OK {
+		t.Fatalf("reset_rule_provider failed: %s", resetProvResp.Error)
+	}
+	var resetView EffectiveRulesView
+	rawReset, _ := json.Marshal(resetProvResp.Data)
+	_ = json.Unmarshal(rawReset, &resetView)
+	if resetView.RuleProviders["clashfx-ai-lock"].RuleCount != 15 {
+		t.Fatalf("expected 15 default rules after reset, got %d", resetView.RuleProviders["clashfx-ai-lock"].RuleCount)
+	}
 }
 
 func TestFetchProxyGroupsHiddenFilterTimeoutAndProviderQuota(t *testing.T) {

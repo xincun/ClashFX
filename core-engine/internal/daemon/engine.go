@@ -73,6 +73,10 @@ type RuleProviderView struct {
 	VehicleType string   `json:"vehicle_type"`
 	RuleCount   int      `json:"rule_count"`
 	Payload     []string `json:"payload,omitempty"`
+	Editable    bool     `json:"editable,omitempty"`
+	CanReset    bool     `json:"can_reset,omitempty"`
+	FilePath    string   `json:"file_path,omitempty"`
+	RawText     string   `json:"raw_text,omitempty"`
 }
 
 type EffectiveRulesView struct {
@@ -1483,16 +1487,51 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 		return "profile"
 	}
 
+	_ = e.store.EnsureBuiltinRulesets()
+	cfgDir := e.store.ActiveConfigDir()
+
 	out := EffectiveRulesView{
 		OutboundMode:  settings.OutboundMode,
 		DefaultTarget: defTarget,
 		RuleProviders: map[string]RuleProviderView{},
 	}
 
-	// Seed inline rule-providers from runtime YAML as fallback
+	loadBuiltinView := func(name string) (RuleProviderView, bool) {
+		absPath := profile.BuiltinRulesetAbsPath(cfgDir, name)
+		rawBytes, err := os.ReadFile(absPath)
+		if err != nil {
+			return RuleProviderView{}, false
+		}
+		rawText := string(rawBytes)
+		parsed, _ := profile.ParseAndValidateClassicalRulesetText(rawText)
+		return RuleProviderView{
+			Name:        name,
+			Behavior:    "Classical",
+			VehicleType: "File",
+			RuleCount:   len(parsed),
+			Payload:     parsed,
+			Editable:    true,
+			CanReset:    true,
+			FilePath:    absPath,
+			RawText:     rawText,
+		}, true
+	}
+
+	for _, builtinName := range []string{profile.AILockRuleProviderName, profile.CNAppsRuleProviderName} {
+		if v, ok := loadBuiltinView(builtinName); ok {
+			out.RuleProviders[builtinName] = v
+		}
+	}
+
+	// Seed inline & file rule-providers from runtime YAML as fallback
 	if rawRoot != nil {
 		if rpMap, ok := rawRoot["rule-providers"].(map[string]any); ok {
 			for name, rawDef := range rpMap {
+				if profile.IsEditableBuiltinRuleset(name) {
+					if _, exists := out.RuleProviders[name]; exists {
+						continue
+					}
+				}
 				dm, ok := rawDef.(map[string]any)
 				if !ok {
 					continue
@@ -1500,12 +1539,29 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 				pList := profile.ExtractStringRules(dm["payload"])
 				vType, _ := dm["type"].(string)
 				beh, _ := dm["behavior"].(string)
+				var rawText, filePath string
+				if strings.EqualFold(vType, "file") {
+					if relP, _ := dm["path"].(string); strings.TrimSpace(relP) != "" {
+						candPath := filepath.Clean(filepath.Join(cfgDir, relP))
+						if relCheck, relErr := filepath.Rel(cfgDir, candPath); relErr == nil && !strings.HasPrefix(relCheck, "..") {
+							filePath = candPath
+							if fb, rErr := os.ReadFile(candPath); rErr == nil {
+								rawText = string(fb)
+								if len(pList) == 0 {
+									pList, _ = profile.ParseAndValidateClassicalRulesetText(rawText)
+								}
+							}
+						}
+					}
+				}
 				out.RuleProviders[name] = RuleProviderView{
 					Name:        name,
 					Behavior:    beh,
 					VehicleType: vType,
 					RuleCount:   len(pList),
 					Payload:     pList,
+					FilePath:    filePath,
+					RawText:     rawText,
 				}
 			}
 		}
@@ -1544,9 +1600,10 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 			}
 			if json.Unmarshal(provBody, &provDoc) == nil {
 				for k, p := range provDoc.Providers {
+					seeded := out.RuleProviders[k]
 					payload := p.Payload
 					if len(payload) == 0 {
-						payload = out.RuleProviders[k].Payload
+						payload = seeded.Payload
 					}
 					out.RuleProviders[k] = RuleProviderView{
 						Name:        k,
@@ -1554,6 +1611,10 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 						VehicleType: p.VehicleType,
 						RuleCount:   p.RuleCount,
 						Payload:     payload,
+						Editable:    seeded.Editable,
+						CanReset:    seeded.CanReset,
+						FilePath:    seeded.FilePath,
+						RawText:     seeded.RawText,
 					}
 				}
 			}
@@ -1635,6 +1696,170 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 		out.TotalRules = len(out.Rules)
 	}
 	return out, nil
+}
+
+func (e *Engine) refreshLiveRuleProvider(ctx context.Context, rt transaction.AppliedRuntimeState, providerName string) (found bool, err error) {
+	if rt.APIPort <= 0 || !e.IsCoreRunning() {
+		return false, nil
+	}
+	client := &http.Client{Timeout: 4 * time.Second}
+	endpoint := fmt.Sprintf("http://127.0.0.1:%d/providers/rules/%s", rt.APIPort, url.PathEscape(providerName))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, nil)
+	if err != nil {
+		return false, err
+	}
+	if rt.APISecret != "" {
+		req.Header.Set("Authorization", "Bearer "+rt.APISecret)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return true, fmt.Errorf("Mihomo 热更新规则集失败 (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return true, nil
+}
+
+func (e *Engine) SaveRuleProvider(ctx context.Context, providerName, content string) (EffectiveRulesView, error) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+
+	providerName = strings.TrimSpace(providerName)
+	if !profile.IsEditableBuiltinRuleset(providerName) {
+		return EffectiveRulesView{}, fmt.Errorf("规则集 %q 不支持直接编辑", providerName)
+	}
+
+	parsedRules, err := profile.ParseAndValidateClassicalRulesetText(content)
+	if err != nil {
+		return EffectiveRulesView{}, err
+	}
+	if len(parsedRules) == 0 {
+		if providerName == profile.AILockRuleProviderName {
+			return EffectiveRulesView{}, errors.New("AI 锁定规则集不能为空（至少保留一条匹配规则，否则 AI 锁定将失去保护）")
+		}
+		return EffectiveRulesView{}, errors.New("规则集不能为空（如需整体停用，请在设置中关闭「绕过常用国内应用」）")
+	}
+
+	if err := e.store.EnsureBuiltinRulesets(); err != nil {
+		return EffectiveRulesView{}, err
+	}
+	absPath := e.store.BuiltinRulesetPath(providerName)
+	prevBytes, prevErr := os.ReadFile(absPath)
+
+	normalized := profile.NormalizeRulesetContent(content)
+	if err := profile.WriteFileAtomic(absPath, []byte(normalized), 0600); err != nil {
+		return EffectiveRulesView{}, fmt.Errorf("写入规则集文件失败: %w", err)
+	}
+
+	rt := e.ctrl.LastState()
+	mounted, err := e.refreshLiveRuleProvider(ctx, rt, providerName)
+	if err != nil {
+		if prevErr == nil {
+			_ = profile.WriteFileAtomic(absPath, prevBytes, 0600)
+			_, _ = e.refreshLiveRuleProvider(ctx, rt, providerName)
+		}
+		return EffectiveRulesView{}, err
+	}
+
+	view, err := e.GetEffectiveRules(ctx)
+	if err != nil {
+		return EffectiveRulesView{}, err
+	}
+	if mounted {
+		if prov, ok := view.RuleProviders[providerName]; ok && prov.RuleCount != len(parsedRules) {
+			if prevErr == nil {
+				_ = profile.WriteFileAtomic(absPath, prevBytes, 0600)
+				_, _ = e.refreshLiveRuleProvider(ctx, rt, providerName)
+			}
+			return EffectiveRulesView{}, fmt.Errorf("内核规则集解析条数不一致（预期 %d 条，实际加载 %d 条），已自动回滚，请检查是否存在特殊语法错误", len(parsedRules), prov.RuleCount)
+		}
+	}
+	return view, nil
+}
+
+func (e *Engine) ResetRuleProvider(ctx context.Context, providerName string) (EffectiveRulesView, error) {
+	providerName = strings.TrimSpace(providerName)
+	defText, ok := profile.DefaultBuiltinRulesetText(providerName)
+	if !ok {
+		return EffectiveRulesView{}, fmt.Errorf("规则集 %q 没有可恢复的默认清单", providerName)
+	}
+	return e.SaveRuleProvider(ctx, providerName, defText)
+}
+
+func (e *Engine) SetRuleDisabled(ctx context.Context, indices []int, disabled bool) (EffectiveRulesView, error) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+
+	if len(indices) == 0 {
+		return e.GetEffectiveRules(ctx)
+	}
+	rt := e.ctrl.LastState()
+	if rt.APIPort <= 0 || !e.IsCoreRunning() {
+		return EffectiveRulesView{}, errors.New("内核当前未运行，无法动态开关顶层规则")
+	}
+
+	currentView, err := e.GetEffectiveRules(ctx)
+	if err != nil {
+		return EffectiveRulesView{}, err
+	}
+	byIndex := make(map[int]EffectiveRuleItem, len(currentView.Rules))
+	for _, r := range currentView.Rules {
+		byIndex[r.Index] = r
+	}
+
+	patchMap := make(map[string]bool, len(indices)+2)
+	syncAILockPair := false
+	for _, idx := range indices {
+		r, exists := byIndex[idx]
+		if !exists {
+			return EffectiveRulesView{}, fmt.Errorf("规则索引 #%d 已失效，请先刷新规则列表", idx+1)
+		}
+		if r.Source == "system" || strings.TrimSpace(r.Payload) == profile.InternalDirectRuleProviderName {
+			return EffectiveRulesView{}, errors.New("系统防环回守护规则 (clashfx-internal-direct) 不可禁用")
+		}
+		patchMap[fmt.Sprintf("%d", idx)] = disabled
+		if strings.TrimSpace(r.Payload) == profile.AILockRuleProviderName {
+			syncAILockPair = true
+		}
+	}
+	if syncAILockPair {
+		for _, r := range currentView.Rules {
+			if strings.TrimSpace(r.Payload) == profile.AILockRuleProviderName {
+				patchMap[fmt.Sprintf("%d", r.Index)] = disabled
+			}
+		}
+	}
+
+	rawBody, err := json.Marshal(patchMap)
+	if err != nil {
+		return EffectiveRulesView{}, err
+	}
+	client := &http.Client{Timeout: 4 * time.Second}
+	endpoint := fmt.Sprintf("http://127.0.0.1:%d/rules/disable", rt.APIPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, endpoint, bytes.NewReader(rawBody))
+	if err != nil {
+		return EffectiveRulesView{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if rt.APISecret != "" {
+		req.Header.Set("Authorization", "Bearer "+rt.APISecret)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return EffectiveRulesView{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return EffectiveRulesView{}, fmt.Errorf("切换顶层规则状态失败 (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return e.GetEffectiveRules(ctx)
 }
 
 func (e *Engine) DiagnosticInfo() string {

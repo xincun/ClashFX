@@ -121,12 +121,12 @@ func TestWindowsProcessAndPathMatchersAndDependencySafety(t *testing.T) {
 	}
 	rpMap, _ := toStringMap(root["rule-providers"])
 	aiProv, _ := toStringMap(rpMap[InlineRuleProviderName])
-	if aiProv["type"] != "inline" || aiProv["behavior"] != "classical" {
-		t.Fatalf("unexpected inline rule-provider: %+v", aiProv)
+	if aiProv["type"] != "file" || aiProv["behavior"] != "classical" || aiProv["format"] != "text" || aiProv["path"] != "./ruleset/clashfx-ai-lock.list" {
+		t.Fatalf("unexpected file rule-provider: %+v", aiProv)
 	}
-	payload, _ := aiProv["payload"].([]string)
-	if len(payload) != 2+len(ProtectedDomains) {
-		t.Fatalf("payload len = %d, want %d", len(payload), 2+len(ProtectedDomains))
+	parsedDefault, err := profile.ParseAndValidateClassicalRulesetText(profile.DefaultAILockRulesetText())
+	if err != nil || len(parsedDefault) != 2+len(ProtectedDomains) {
+		t.Fatalf("default AI lock ruleset len = %d (err=%v), want %d", len(parsedDefault), err, 2+len(ProtectedDomains))
 	}
 
 	// GeneralHK IS inside Proxy -> relay must NOT be assigned (would create dialer cycle!)
@@ -259,10 +259,36 @@ rules:
 		t.Fatalf("expected >= 5 hits on LockedAINode, got %d", lockedHits.Load())
 	}
 
-	// 2. Unrelated domain (github.com) is NOT captured by AI Lock -> follows MATCH,Proxy (GeneralNode)!
+	// 2. Unrelated domain (github.com & perplexity.ai) is NOT captured initially -> follows MATCH,Proxy (GeneralNode)!
 	nonAIBody, err := fetchViaProxy(client, "http://github.com/explore")
 	if err != nil || !strings.Contains(nonAIBody, "via=GENERAL_NODE") {
 		t.Fatalf("expected github.com via GENERAL_NODE, got body=%q err=%v", nonAIBody, err)
+	}
+	perpBefore, err := fetchViaProxy(client, "http://perplexity.ai/search")
+	if err != nil || !strings.Contains(perpBefore, "via=GENERAL_NODE") {
+		t.Fatalf("expected perplexity.ai via GENERAL_NODE before hot-update, got body=%q err=%v", perpBefore, err)
+	}
+
+	// 2b. Zero-reload hot update of file-backed ruleset/clashfx-ai-lock.list via PUT /providers/rules/clashfx-ai-lock!
+	rulesetPath := store.BuiltinRulesetPath(InlineRuleProviderName)
+	origRulesetBytes, err := os.ReadFile(rulesetPath)
+	if err != nil {
+		t.Fatalf("read seeded clashfx-ai-lock.list: %v", err)
+	}
+	updatedRuleset := string(origRulesetBytes) + "\nDOMAIN-SUFFIX,perplexity.ai\n"
+	if err := profile.WriteFileAtomic(rulesetPath, []byte(updatedRuleset), 0600); err != nil {
+		t.Fatal(err)
+	}
+	putReq, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("http://127.0.0.1:%d/providers/rules/%s", state.APIPort, InlineRuleProviderName), nil)
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil || (putResp.StatusCode != http.StatusNoContent && putResp.StatusCode != http.StatusOK) {
+		t.Fatalf("PUT /providers/rules/%s failed: resp=%v err=%v", InlineRuleProviderName, putResp, err)
+	}
+	putResp.Body.Close()
+
+	perpAfter, err := fetchViaProxy(client, "http://perplexity.ai/search")
+	if err != nil || !strings.Contains(perpAfter, "via=LOCKED_AI_NODE") {
+		t.Fatalf("expected perplexity.ai via LOCKED_AI_NODE immediately after hot provider update, got body=%q err=%v", perpAfter, err)
 	}
 
 	// 3. Kill LockedAINode while GeneralNode (Proxy) remains healthy -> AI hosts MUST FAIL CLOSED!

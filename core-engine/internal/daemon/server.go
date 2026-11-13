@@ -473,6 +473,44 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			return errResp(err)
 		}
 		return okResp(view)
+	case "save_rule_provider":
+		var p struct {
+			ProviderName string `json:"provider_name"`
+			Content      string `json:"content"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return errResp(err)
+		}
+		view, err := s.engine.SaveRuleProvider(ctx, p.ProviderName, p.Content)
+		if err != nil {
+			return errResp(err)
+		}
+		return okResp(view)
+	case "reset_rule_provider":
+		var p struct {
+			ProviderName string `json:"provider_name"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return errResp(err)
+		}
+		view, err := s.engine.ResetRuleProvider(ctx, p.ProviderName)
+		if err != nil {
+			return errResp(err)
+		}
+		return okResp(view)
+	case "set_rule_disabled":
+		var p struct {
+			Indices  []int `json:"indices"`
+			Disabled bool  `json:"disabled"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return errResp(err)
+		}
+		view, err := s.engine.SetRuleDisabled(ctx, p.Indices, p.Disabled)
+		if err != nil {
+			return errResp(err)
+		}
+		return okResp(view)
 	case "get_diagnostic_info":
 		return okResp(map[string]string{"report": s.engine.DiagnosticInfo()})
 	case "check_updates":

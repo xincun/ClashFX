@@ -396,6 +396,9 @@ func (s *Store) ensureDirResourcesLocked(dir string) error {
 			return err
 		}
 	}
+	if err := EnsureBuiltinRulesetFiles(dir); err != nil {
+		return err
+	}
 	if s.resourceDir != "" {
 		unpackIfMissing(filepath.Join(s.resourceDir, "Country.mmdb.gz"), filepath.Join(dir, "Country.mmdb"))
 		unpackIfMissing(filepath.Join(s.resourceDir, "geosite.dat.gz"), filepath.Join(dir, "geosite.dat"))

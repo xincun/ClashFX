@@ -38,6 +38,7 @@ public slots:
     void openAiLockDialog();
     void openMultiNodeDialog();
     void openRuleEditorDialog();
+    void openActiveRulesDialog();
     void openSubscriptionsDialog();
     void openDiagnosticsDialog(const QString& preselectNode = QString());
     void openSettingsDialog();

@@ -185,6 +185,8 @@ void TrayController::handleExternalCommand(const QString& message) {
         openMultiNodeDialog();
     } else if (message == QStringLiteral("CMD:--open-rules")) {
         openRuleEditorDialog();
+    } else if (message == QStringLiteral("CMD:--open-active-rules")) {
+        openActiveRulesDialog();
     } else if (message == QStringLiteral("CMD:--open-subscriptions")) {
         openSubscriptionsDialog();
     } else if (message == QStringLiteral("CMD:--open-diagnostics")) {
@@ -868,6 +870,13 @@ void TrayController::openRuleEditorDialog() {
     rulesDlg_->show();
     rulesDlg_->raise();
     rulesDlg_->activateWindow();
+}
+
+void TrayController::openActiveRulesDialog() {
+    openRuleEditorDialog();
+    if (rulesDlg_) {
+        rulesDlg_->selectTab(2);
+    }
 }
 
 void TrayController::openSubscriptionsDialog() {

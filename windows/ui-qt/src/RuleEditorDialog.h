@@ -31,6 +31,7 @@ public:
     void refreshFromSnapshot(const QJsonObject& snapshot);
     void reloadMixinFromDaemon();
     void refreshEffectiveRules();
+    void selectTab(int index);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -41,20 +42,31 @@ private slots:
     void onTabChanged(int index);
     void onOpenMixinFolder();
     void onEffectiveSelectionChanged();
+    void onEffectiveItemChanged(QTableWidgetItem* item);
     void onFilterEffectiveRules(const QString& keyword);
+    void onSaveRulesetProvider();
+    void onResetRulesetProvider();
+    void onOpenRulesetFolder();
 
 private:
     void applyMixinDocument(const QJsonObject& doc, bool markClean);
+    void applyEffectiveRulesData(const QJsonObject& obj, int preferredRuleIndex = -1);
     void rebuildCustomTable(int focusRow = -1);
     void populateTargetCombo(QComboBox* combo, const QString& currentTarget) const;
     QJsonArray serializeVisualRulesJson(bool skipBlankPayload) const;
     void setDirty(bool dirty, const QString& savedHint = QString());
-    void renderEffectiveTable();
+    void setRulesetDirty(bool dirty, const QString& savedHint = QString());
+    void updateFooterButtonsForTab();
+    void renderEffectiveTable(int preferredRuleIndex = -1);
+    void loadDetailForRuleObject(const QJsonObject& r, bool forceReloadEditor = false);
     static QString placeholderForRuleType(const QString& ruleType);
 
     DaemonClient* client_ = nullptr;
     bool suppressSignals_ = false;
+    bool suppressEffectiveItemSignals_ = false;
+    bool suppressRulesetSignals_ = false;
     bool dirty_ = false;
+    bool rulesetDirty_ = false;
     bool visualModifiedSinceSync_ = false;
     bool yamlModifiedSinceSync_ = false;
     int lastTabIndex_ = 0;
@@ -72,6 +84,9 @@ private:
 
     QJsonArray effectiveRules_;
     QJsonObject ruleProviders_;
+    QString activeEditableProvider_;
+    QString activeRulesetFilePath_;
+    int lastSelectedEffOrigIdx_ = -1;
 
     QLabel* headerDescLabel_ = nullptr;
     QTabWidget* tabs_ = nullptr;
@@ -88,12 +103,16 @@ private:
     QLabel* yamlPathLabel_ = nullptr;
     QPlainTextEdit* yamlEdit_ = nullptr;
 
-    // Tab 2: Live Effective Rules Inspector
+    // Tab 2: Live Effective Rules Inspector & Dynamic Ruleset Editor
     QLineEdit* searchEdit_ = nullptr;
     QLabel* effSummaryLabel_ = nullptr;
     QPushButton* refreshEffBtn_ = nullptr;
     QTableWidget* effTable_ = nullptr;
     QGroupBox* providerDetailBox_ = nullptr;
+    QLabel* providerMetaLabel_ = nullptr;
+    QPushButton* openRulesetFolderBtn_ = nullptr;
+    QPushButton* resetRulesetBtn_ = nullptr;
+    QPushButton* saveRulesetBtn_ = nullptr;
     QPlainTextEdit* providerDetailEdit_ = nullptr;
 
     // Shared Footer

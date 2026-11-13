@@ -15,15 +15,11 @@ const (
 	InternalDirectRuleProviderName = "clashfx-internal-direct"
 )
 
-const ProcessNamePattern = `(?i)^(claude|codex|codex-app-server|chatgpt|antigravity|antigravity-cli|agy)( helper.*)?(\.exe)?$`
+const ProcessNamePattern = profile.AILockProcessNamePattern
 
-const WindowsProcessPathPattern = `(?i)([\\/](Programs|Program Files( \(x86\))?)[\\/](Claude|AnthropicClaude|Codex|ChatGPT|Antigravity)[\\/].*|[\\/]AppData[\\/]Local[\\/]AnthropicClaude[\\/].*|[\\/]WindowsApps[\\/][^\\/]*(Claude|Anthropic|OpenAI|ChatGPT|Codex|Antigravity)[^\\/]*[\\/].*|(^|[\\/])\.local[\\/](bin|share)[\\/]claude([\\/].*|\.exe)?|(^|[\\/])(\.antigravity|\.gemini[\\/]antigravity-cli)[\\/].*)$`
+const WindowsProcessPathPattern = profile.AILockWindowsPathPattern
 
-var ProtectedDomains = []string{
-	"claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
-	"openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com", "oaistatsig.com", "openaimerge.com",
-	"antigravity.google", "google.com", "googleapis.com",
-}
+var ProtectedDomains = profile.DefaultAILockProtectedDomains
 
 type ProviderSnapshot struct {
 	Name                string           `json:"name"`
@@ -256,16 +252,11 @@ func Apply(root map[string]any, target string, providers []ProviderSnapshot) App
 		}
 	}
 
-	rpMap, ok := toStringMap(finalRoot["rule-providers"])
-	if !ok || rpMap == nil {
-		rpMap = map[string]any{}
-	}
-	rpMap[InlineRuleProviderName] = map[string]any{
-		"type":     "inline",
-		"behavior": "classical",
-		"payload":  RuleProviderPayload(),
-	}
-	finalRoot["rule-providers"] = rpMap
+	profile.SetFileClassicalRuleProvider(
+		finalRoot,
+		InlineRuleProviderName,
+		profile.BuiltinRulesetRelPath(InlineRuleProviderName),
+	)
 	finalRoot["mode"] = "rule"
 	finalRoot["find-process-mode"] = "always"
 	finalRoot["rules"] = outRules
