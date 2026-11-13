@@ -80,15 +80,7 @@ func appendSafePathsEnv(baseEnv []string, extraPaths ...string) []string {
 }
 
 func (b BinaryCoreHelper) ConvertShareLinks(raw []byte) ([]byte, error) {
-	cmd := exec.Command(b.CoreBinaryPath, "-convert-share-links")
-	cmd.Stdin = bytes.NewReader(raw)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("convert share links (%v): %s", err, strings.TrimSpace(stderr.String()))
-	}
-	return stdout.Bytes(), nil
+	return ConvertShareLinksPayload(raw)
 }
 
 func (b BinaryCoreHelper) ValidateConfig(homeDir, configPath string) error {
@@ -367,10 +359,10 @@ func (m *Manager) normalizeSubscriptionContent(raw []byte) ([]byte, error) {
 	}
 	// Check if raw is share links or base64-encoded share links
 	if looksLikeShareLinksOrBase64(raw) {
-		if m.coreHelper == nil {
-			return nil, fmt.Errorf("share-link subscription requires core helper converter")
+		if m.coreHelper != nil {
+			return m.coreHelper.ConvertShareLinks(raw)
 		}
-		return m.coreHelper.ConvertShareLinks(raw)
+		return ConvertShareLinksPayload(raw)
 	}
 	return nil, fmt.Errorf("subscription response is neither a valid Clash YAML profile nor supported share links")
 }

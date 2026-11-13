@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Build Windows arm64 & amd64 mihomo_core.exe + verified official wintun.dll.
+"""Build Windows arm64 & amd64 stock upstream mihomo_core.exe + verified official wintun.dll.
 
 Outputs:
   windows/build/bin/arm64/{mihomo_core.exe, wintun.dll}
   windows/build/bin/amd64/{mihomo_core.exe, wintun.dll}
 
 Guarantees:
-  - Uses ClashFX's fail-closed core_overlay (pinned Mihomo v1.19.24 + sing v0.5.7)
+  - Compiles 100% unmodified upstream github.com/metacubex/mihomo (no custom CLI flags or source overlays)
   - Compiles with `-tags with_gvisor` and `-trimpath`
   - Verifies official WireGuard Wintun 0.14.1 archive SHA256
   - Strictly validates PE/COFF Machine headers (`0xAA64` for arm64, `0x8664` for amd64)
@@ -27,7 +27,7 @@ import urllib.request
 import zipfile
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-GOCLASH_ROOT = REPO_ROOT / "ClashFX" / "goClash"
+CORE_ENGINE_ROOT = REPO_ROOT / "core-engine"
 WINDOWS_BUILD_ROOT = REPO_ROOT / "windows" / "build"
 CACHE_DIR = WINDOWS_BUILD_ROOT / ".cache"
 
@@ -44,17 +44,20 @@ WINTUN_ZIP_MEMBER_BY_ARCH = {
     "amd64": "wintun/bin/amd64/wintun.dll",
 }
 
-sys.path.insert(0, str(GOCLASH_ROOT))
-from core_overlay import core_modfile  # noqa: E402
 
-
-def detect_mihomo_version() -> str:
-    for line in (GOCLASH_ROOT / "go.mod").read_text(encoding="utf-8").splitlines():
-        if "github.com/metacubex/mihomo" in line:
-            parts = line.split()
-            if len(parts) >= 2:
-                return parts[-1].lstrip("v")
-    raise RuntimeError("Unable to detect Mihomo version from ClashFX/goClash/go.mod")
+def resolve_upstream_mihomo() -> tuple[pathlib.Path, str]:
+    out = subprocess.check_output(
+        ["go", "list", "-m", "-f", "{{.Dir}}\t{{.Version}}", "github.com/metacubex/mihomo"],
+        cwd=CORE_ENGINE_ROOT,
+        text=True,
+    ).strip()
+    parts = out.split("\t")
+    if len(parts) != 2 or not parts[0]:
+        raise RuntimeError(f"Failed to resolve upstream github.com/metacubex/mihomo module: {out!r}")
+    mod_dir = pathlib.Path(parts[0])
+    if not (mod_dir / "main.go").is_file():
+        raise RuntimeError(f"Upstream Mihomo module directory missing main.go: {mod_dir}")
+    return mod_dir, parts[1]
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -115,11 +118,13 @@ def extract_wintun_dll(archive_path: pathlib.Path, arch: str, dest_dir: pathlib.
     return target
 
 
-def build_core_for_arch(modfile: str, version: str, build_time: str, arch: str, out_dir: pathlib.Path) -> pathlib.Path:
+def build_core_for_arch(
+    mihomo_dir: pathlib.Path, version: str, build_time: str, arch: str, out_dir: pathlib.Path
+) -> pathlib.Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     output_exe = out_dir / "mihomo_core.exe"
     ldflags = (
-        f'-s -w '
+        f"-s -w "
         f'-X "github.com/metacubex/mihomo/constant.Version={version}" '
         f'-X "github.com/metacubex/mihomo/constant.BuildTime={build_time}"'
     )
@@ -132,7 +137,6 @@ def build_core_for_arch(modfile: str, version: str, build_time: str, arch: str, 
     cmd = [
         "go",
         "build",
-        f"-modfile={modfile}",
         "-trimpath",
         "-tags",
         "with_gvisor",
@@ -140,10 +144,10 @@ def build_core_for_arch(modfile: str, version: str, build_time: str, arch: str, 
         ldflags,
         "-o",
         str(output_exe),
-        "./mihomo-bin/",
+        ".",
     ]
-    print(f"Building mihomo_core.exe for windows/{arch} ...")
-    subprocess.check_call(cmd, cwd=GOCLASH_ROOT, env=env)
+    print(f"Building stock upstream mihomo_core.exe ({version}) for windows/{arch} ...")
+    subprocess.check_call(cmd, cwd=mihomo_dir, env=env)
     verify_pe_machine(output_exe, arch)
     return output_exe
 
@@ -162,48 +166,22 @@ def main() -> int:
         default=WINDOWS_BUILD_ROOT / "bin",
         help="output root directory containing <arch>/ subdirectories",
     )
-    parser.add_argument(
-        "--build-windows-test",
-        action="store_true",
-        help="also cross-compile mihomo_core_test.exe per arch for VM execution",
-    )
     args = parser.parse_args()
 
     arches = ["arm64", "amd64"] if args.arch == "all" else [args.arch]
-    version = detect_mihomo_version()
+    mihomo_dir, version = resolve_upstream_mihomo()
     build_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d-%H%M")
 
     wintun_zip = ensure_wintun_zip()
 
-    with core_modfile() as modfile:
-        for arch in arches:
-            arch_dir = args.output_root.resolve() / arch
-            core_exe = build_core_for_arch(modfile, version, build_time, arch, arch_dir)
-            wintun_dll = extract_wintun_dll(wintun_zip, arch, arch_dir)
-            print(
-                f"  [OK] windows/{arch}: {core_exe.name} ({core_exe.stat().st_size // 1024} KiB, sha256={sha256_file(core_exe)[:12]}), "
-                f"{wintun_dll.name} ({wintun_dll.stat().st_size // 1024} KiB, sha256={sha256_file(wintun_dll)[:12]})"
-            )
-            if args.build_windows_test:
-                test_exe = arch_dir / "mihomo_bin_test.exe"
-                env = dict(os.environ, GOOS="windows", GOARCH=arch, CGO_ENABLED="0")
-                subprocess.check_call(
-                    [
-                        "go",
-                        "test",
-                        f"-modfile={modfile}",
-                        "-tags",
-                        "with_gvisor",
-                        "-c",
-                        "-o",
-                        str(test_exe),
-                        "./mihomo-bin/",
-                    ],
-                    cwd=GOCLASH_ROOT,
-                    env=env,
-                )
-                verify_pe_machine(test_exe, arch)
-                print(f"  [OK] windows/{arch} test binary: {test_exe.name}")
+    for arch in arches:
+        arch_dir = args.output_root.resolve() / arch
+        core_exe = build_core_for_arch(mihomo_dir, version, build_time, arch, arch_dir)
+        wintun_dll = extract_wintun_dll(wintun_zip, arch, arch_dir)
+        print(
+            f"  [OK] windows/{arch}: {core_exe.name} ({core_exe.stat().st_size // 1024} KiB, sha256={sha256_file(core_exe)[:12]}), "
+            f"{wintun_dll.name} ({wintun_dll.stat().st_size // 1024} KiB, sha256={sha256_file(wintun_dll)[:12]})"
+        )
 
     return 0
 

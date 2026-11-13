@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/clashfx/core-engine/internal/ailock"
 	"github.com/clashfx/core-engine/internal/portprobe"
 	"github.com/clashfx/core-engine/internal/profile"
 )
@@ -370,7 +369,7 @@ func ReservedPortsInConfig(root map[string]any) map[int]bool {
 	return ports
 }
 
-func ApplyListeners(root map[string]any, bindings []NodePortBinding, directPort *int, protectionRules []string) {
+func ApplyListeners(root map[string]any, bindings []NodePortBinding, directPort *int) {
 	var listeners []any
 	for _, ln := range mapSliceFromAny(root["listeners"]) {
 		name, _ := ln["name"].(string)
@@ -379,36 +378,29 @@ func ApplyListeners(root map[string]any, bindings []NodePortBinding, directPort 
 		}
 	}
 
-	subRules := map[string]any{}
 	if existingSub, ok := root["sub-rules"].(map[string]any); ok {
+		subRules := map[string]any{}
 		for k, v := range existingSub {
 			if !strings.HasPrefix(k, ListenerPrefix) {
 				subRules[k] = v
 			}
 		}
+		if len(subRules) > 0 {
+			root["sub-rules"] = subRules
+		} else {
+			delete(root, "sub-rules")
+		}
 	}
 
-	makeListener := func(name string, port int, proxy string, udp bool, applyProtection bool) map[string]any {
-		entry := map[string]any{
+	makeListener := func(name string, port int, proxy string, udp bool) map[string]any {
+		return map[string]any{
 			"name":   name,
 			"type":   "mixed",
 			"listen": "127.0.0.1",
 			"port":   port,
 			"udp":    udp,
+			"proxy":  proxy,
 		}
-		if !applyProtection || len(protectionRules) == 0 {
-			entry["proxy"] = proxy
-		} else {
-			ruleName := name + "-rules"
-			entry["rule"] = ruleName
-			rules := make([]any, 0, len(protectionRules)+2)
-			for _, r := range protectionRules {
-				rules = append(rules, r)
-			}
-			rules = append(rules, "MATCH,"+proxy, "MATCH,REJECT")
-			subRules[ruleName] = rules
-		}
-		return entry
 	}
 
 	for _, b := range bindings {
@@ -420,7 +412,6 @@ func ApplyListeners(root map[string]any, bindings []NodePortBinding, directPort 
 			b.Port,
 			b.Name,
 			true,
-			true,
 		))
 	}
 	if directPort != nil && *directPort > 0 {
@@ -429,15 +420,11 @@ func ApplyListeners(root map[string]any, bindings []NodePortBinding, directPort 
 			*directPort,
 			"DIRECT",
 			false,
-			true,
 		))
 	}
 
 	if len(listeners) > 0 || root["listeners"] != nil {
 		root["listeners"] = listeners
-	}
-	if len(subRules) > 0 || root["sub-rules"] != nil {
-		root["sub-rules"] = subRules
 	}
 }
 
@@ -589,8 +576,8 @@ func (s *Store) ActiveBindings(profileName string) ([]NodePortBinding, *int, Set
 	return out, st.Registry.DirectPort, st.Settings, nil
 }
 
-// Prepare mutates root in-place with fixed node listeners + direct-refresh listener + AI Lock sub-rules.
-func (s *Store) Prepare(root map[string]any, profileName string, coreRunning bool, protectionRules []string) ([]NodePortBinding, error) {
+// Prepare mutates root in-place with fixed node listeners + direct-refresh listener (pure 1-port-to-1-node proxy bindings, no sub-rules).
+func (s *Store) Prepare(root map[string]any, profileName string, coreRunning bool) ([]NodePortBinding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -649,7 +636,7 @@ func (s *Store) Prepare(root map[string]any, profileName string, coreRunning boo
 	if st.Settings.PortsEnabled {
 		appliedBindings = bindings
 	}
-	ApplyListeners(root, appliedBindings, directPtr, protectionRules)
+	ApplyListeners(root, appliedBindings, directPtr)
 
 	if err := s.writeLocked(st); err != nil {
 		return nil, err
@@ -666,11 +653,7 @@ func (s *Store) TransformHookForController(isCoreRunning func() bool) func(root 
 		if isCoreRunning != nil {
 			running = isCoreRunning()
 		}
-		var protection []string
-		if settings.AILockEnabled {
-			protection = ailock.Rules(settings.AILockTarget)
-		}
-		_, err := s.Prepare(root, settings.SelectedProfile, running, protection)
+		_, err := s.Prepare(root, settings.SelectedProfile, running)
 		return err
 	}
 }

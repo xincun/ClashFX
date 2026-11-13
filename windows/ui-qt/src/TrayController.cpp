@@ -212,8 +212,11 @@ void TrayController::rebuildTrayVisualsAndMenu() {
     trayMenu_->addSeparator();
 
     // 2. Outbound Mode submenu
-    QMenu* modeMenu = trayMenu_->addMenu(
-        L("出站模式", "Outbound Mode") + QStringLiteral(" (%1)").arg(mode.toUpper()));
+    QString modeTitle = L("出站模式", "Outbound Mode") + QStringLiteral(" (%1)").arg(mode.toUpper());
+    if (aiLocked) {
+        modeTitle += L(" [AI 锁定中]", " [AI Locked]");
+    }
+    QMenu* modeMenu = trayMenu_->addMenu(modeTitle);
     auto* modeGroup = new QActionGroup(modeMenu);
     const QList<QPair<QString, QString>> modes = {
         {QStringLiteral("rule"), L("规则判断 (Rule)", "Rule")},
@@ -290,6 +293,11 @@ void TrayController::rebuildTrayVisualsAndMenu() {
     trayMenu_->addSeparator();
 
     // 4. System Proxy / Enhanced TUN / Turn Off All
+    if (aiLocked) {
+        QAction* lockHint = trayMenu_->addAction(
+            L("已由 AI 专用锁定接管代理开关与规则模式", "Proxy & Rule mode managed by AI Proxy Lock"));
+        lockHint->setEnabled(false);
+    }
     QAction* sysAct = trayMenu_->addAction(L("设置为系统代理", "Set as System Proxy"));
     sysAct->setCheckable(true);
     sysAct->setChecked(sysProxy);

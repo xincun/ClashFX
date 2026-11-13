@@ -38,10 +38,8 @@ private:
     void removeDynamicScripts();
 
     static QString readBundledCompatibilityJS();
-    static QString buildApiGuardJS();
     static QString buildMetaCubeXDConfigJS(int port, const QString& secret);
     static QString buildRulesSnapshotJS(int port, const QString& staleMessage);
-    static QString buildUpgradePolicyJS(const QString& managedMessage);
 
     bool initStarted_ = false;
     bool staticScriptsInstalled_ = false;

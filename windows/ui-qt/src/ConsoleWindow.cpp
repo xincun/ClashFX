@@ -109,6 +109,7 @@ void ConsoleWindow::applySnapshot(bool connected, const QJsonObject& snapshot) {
     const int apiPort = runtime.value(QStringLiteral("api_port")).toInt(19090);
     const QString apiSecret = runtime.value(QStringLiteral("api_secret")).toString();
     const QString dashUrl = snapshot.value(QStringLiteral("dashboard_url")).toString();
+    const QString lastErr = snapshot.value(QStringLiteral("last_error")).toString().trimmed();
 
     if (!coreRunning) {
         statusBadge_->setText(L("内核未就绪", "Core Stopped"));
@@ -134,6 +135,13 @@ void ConsoleWindow::applySnapshot(bool connected, const QJsonObject& snapshot) {
                           .arg(apiPort);
     if (aiLocked && !aiTarget.isEmpty()) {
         summary += QStringLiteral("   |   ") + L("AI 锁定: ", "AI Lock: ") + aiTarget;
+    }
+    if (!coreRunning && !lastErr.isEmpty()) {
+        const QString shortErr = lastErr.size() > 96 ? (lastErr.left(96) + QStringLiteral("...")) : lastErr;
+        summary = L("启动异常: ", "Error: ") + shortErr;
+        detailLabel_->setToolTip(lastErr);
+    } else {
+        detailLabel_->setToolTip(QString());
     }
     detailLabel_->setText(summary);
 

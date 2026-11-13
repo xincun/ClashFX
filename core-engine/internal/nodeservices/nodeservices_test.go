@@ -72,6 +72,21 @@ func TestNodePortRegistryReconcileReorderAndRenameStability(t *testing.T) {
 	if err != nil || dp != 20998 {
 		t.Fatalf("PrepareDirectPort = (%d, %v), want (20998, nil)", dp, err)
 	}
+
+	// Verify ApplyListeners uses pure 1-port-to-1-node proxy binding and cleans up any legacy sub-rules
+	root := map[string]any{
+		"sub-rules": map[string]any{
+			"clashfx-node-service-21000-rules": []any{"MATCH,HK-01"},
+		},
+	}
+	ApplyListeners(root, []NodePortBinding{{Name: "HK-01", Port: 21000, Enabled: true}}, &dp)
+	if _, hasSubRules := root["sub-rules"]; hasSubRules {
+		t.Fatalf("expected legacy clashfx-node-service sub-rules to be removed, got %+v", root["sub-rules"])
+	}
+	lns := mapSliceFromAny(root["listeners"])
+	if len(lns) != 2 || lns[0]["proxy"] != "HK-01" || lns[0]["rule"] != nil || lns[1]["proxy"] != "DIRECT" {
+		t.Fatalf("expected pure proxy listeners without rule field, got %+v", lns)
+	}
 }
 
 func TestRealMihomoCoreMultiNodePortsAILockSubRulesWatchdogAndSpeedTest(t *testing.T) {
@@ -230,9 +245,10 @@ rules:
 		portByName[b.Name] = b.Port
 	}
 
-	// 1. Concurrent multi-port egress split + AI Lock sub-rules enforcement!
+	// 1. Concurrent multi-port egress split: dedicated node ports are pure 1-port-to-1-node (no sub-rules),
+	// while main mixed-port still enforces global AI Proxy Lock!
 	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	checkPort := func(port int, targetURL, expectedTag string) {
 		defer wg.Done()
 		body, reqErr := getThroughNodePort(port, targetURL)
@@ -244,15 +260,26 @@ rules:
 			errCh <- fmt.Errorf("port %d %s got %q, want via=%s", port, targetURL, body, expectedTag)
 		}
 	}
-	wg.Add(3)
+	wg.Add(4)
 	go checkPort(portByName["NodeAlpha"], "http://example.org/whoami", "NODE_ALPHA")
 	go checkPort(portByName["NodeBeta"], "http://example.org/whoami", "NODE_BETA")
-	// Protected AI domain sent into NodeAlpha's dedicated port MUST still route out LOCKED_AI_NODE!
-	go checkPort(portByName["NodeAlpha"], "http://api.anthropic.com/v1/messages", "LOCKED_AI_NODE")
+	// Dedicated multi-node port MUST stay pinned to NODE_ALPHA even for AI domains (no sub-rules hijacking)!
+	go checkPort(portByName["NodeAlpha"], "http://api.anthropic.com/v1/messages", "NODE_ALPHA")
+	// Meanwhile, main mixed-port MUST still route protected AI domains out LOCKED_AI_NODE!
+	go checkPort(state.MixedPort, "http://api.anthropic.com/v1/messages", "LOCKED_AI_NODE")
 	wg.Wait()
 	close(errCh)
 	for e := range errCh {
 		t.Fatal(e)
+	}
+
+	// Verify runtime config contains zero sub-rules injected for clashfx-node-service-*
+	rawRuntime, err := os.ReadFile(filepath.Join(profStore.ActiveConfigDir(), ".runtime-config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawRuntime), "clashfx-node-service-") && strings.Contains(string(rawRuntime), "-rules") {
+		t.Fatalf("expected zero sub-rules in runtime config, got:\n%s", string(rawRuntime))
 	}
 
 	// 2. 204 Watchdog + Consecutive Failures -> Automatic DIRECT Subscription Refresh!

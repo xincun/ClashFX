@@ -2,10 +2,13 @@ package service
 
 import (
 	"fmt"
-	"io"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -15,12 +18,35 @@ func TestRunnerHelperProcess(t *testing.T) {
 	if mode == "" {
 		return
 	}
+	// Strictly reject any non-standard flags (such as -watch-stdin) just like stock upstream mihomo!
+	for _, arg := range os.Args[1:] {
+		if arg == "-watch-stdin" || arg == "-convert-share-links" || arg == "--features" {
+			fmt.Fprintf(os.Stderr, "flag provided but not defined: %s\n", arg)
+			os.Exit(2)
+		}
+	}
 	switch mode {
 	case "ok":
-		fmt.Println("mihomo-bin pid=12345")
-		fmt.Printf("%s /tmp/config.yaml\n", ReadyMarker)
-		_, _ = io.Copy(io.Discard, os.Stdin)
-		fmt.Println("Mihomo shutting down")
+		ctrlAddr := os.Getenv("CLASHFX_TEST_CTRL_ADDR")
+		if ctrlAddr != "" {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/version", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"meta":true,"version":"v1.19.34"}`))
+			})
+			ln, err := net.Listen("tcp", ctrlAddr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "listen %s: %v\n", ctrlAddr, err)
+				os.Exit(1)
+			}
+			defer ln.Close()
+			srv := &http.Server{Handler: mux}
+			go func() { _ = srv.Serve(ln) }()
+		}
+		fmt.Printf("time=\"now\" level=info msg=\"RESTful API listening at: %s\"\n", ctrlAddr)
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		<-sigCh
 		os.Exit(0)
 	case "fail":
 		fmt.Fprintln(os.Stderr, "Parse config error: invalid yaml")
@@ -31,12 +57,21 @@ func TestRunnerHelperProcess(t *testing.T) {
 func TestRunnerLifecycleAndValidation(t *testing.T) {
 	trustedDir := t.TempDir()
 	homeDir := t.TempDir()
+
+	// Pick an ephemeral port for external-controller readiness check
+	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrlAddr := probeLn.Addr().String()
+	_ = probeLn.Close()
+
 	cfgPath := filepath.Join(homeDir, "config.yaml")
-	if err := os.WriteFile(cfgPath, []byte("mixed-port: 7890\n"), 0600); err != nil {
+	cfgYAML := fmt.Sprintf("external-controller: %s\n", ctrlAddr)
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0600); err != nil {
 		t.Fatal(err)
 	}
 
-	// Copy current test binary into trustedDir as fake mihomo_core wrapper script/binary
 	selfExe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -59,13 +94,14 @@ func TestRunnerLifecycleAndValidation(t *testing.T) {
 	}
 
 	// Startup failure surfaces stderr cleanly
+	t.Setenv("CLASHFX_TEST_CTRL_ADDR", ctrlAddr)
 	t.Setenv("CLASHFX_TEST_CORE_MODE", "fail")
 	resp := runner.Handle(Request{Action: "start_core", HomeDir: homeDir, ConfigFile: cfgPath})
 	if resp.OK || !strings.Contains(resp.Message, "Parse config error") {
 		t.Fatalf("expected startup failure with parse error, got %+v", resp)
 	}
 
-	// Successful start + status + graceful stop
+	// Successful start with stock Mihomo flags + HTTP /version readiness + status + graceful stop
 	t.Setenv("CLASHFX_TEST_CORE_MODE", "ok")
 	resp = runner.Handle(Request{Action: "start_core", HomeDir: homeDir, ConfigFile: cfgPath})
 	if !resp.OK || resp.Status == nil || !resp.Status.Running || resp.Status.PID <= 0 {

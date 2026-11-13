@@ -2,22 +2,26 @@ package service
 
 import (
 	"bufio"
-	"errors"
+	"context"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
 	ServiceName     = "ClashFXService"
 	ServicePipeName = `\\.\pipe\ClashFXService`
-	ReadyMarker     = "mihomo-bin started, config:"
 )
 
 type Request struct {
@@ -41,9 +45,10 @@ type Response struct {
 	Status  *Status `json:"status,omitempty"`
 }
 
-// Runner supervises a single child mihomo_core binary located strictly inside
-// trustedDir (the service executable's own directory). Callers can never
-// override the executable path over IPC.
+// Runner supervises a single stock upstream mihomo_core binary located strictly inside
+// trustedDir (the service executable's own directory). Callers can never override the
+// executable path over IPC, and zero non-standard CLI flags are passed so any official
+// Mihomo release (or in-place online core upgrade) runs natively.
 type Runner struct {
 	mu           sync.Mutex
 	trustedDir   string
@@ -52,7 +57,7 @@ type Runner struct {
 	stopTimeout  time.Duration
 
 	cmd        *exec.Cmd
-	stdin      io.WriteCloser
+	guard      *childGuard
 	doneCh     chan error
 	homeDir    string
 	configFile string
@@ -69,7 +74,7 @@ func NewRunner(trustedDir string) *Runner {
 	return &Runner{
 		trustedDir:   trustedDir,
 		coreExeName:  exeName,
-		readyTimeout: 10 * time.Second,
+		readyTimeout: 12 * time.Second,
 		stopTimeout:  6 * time.Second,
 	}
 }
@@ -139,6 +144,102 @@ func validateCleanAbsPath(label, p string, mustExist bool, wantDir bool) (string
 	return cleaned, nil
 }
 
+type configProbeEndpoints struct {
+	controllerAddr string
+	secret         string
+	mixedPort      int
+}
+
+func extractConfigEndpoints(configPath string) configProbeEndpoints {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return configProbeEndpoints{}
+	}
+	var doc struct {
+		ExternalController string `yaml:"external-controller"`
+		Secret             string `yaml:"secret"`
+		MixedPort          int    `yaml:"mixed-port"`
+	}
+	if yaml.Unmarshal(raw, &doc) != nil {
+		return configProbeEndpoints{}
+	}
+	ctrl := strings.TrimSpace(doc.ExternalController)
+	if ctrl != "" {
+		host, portStr, splitErr := net.SplitHostPort(ctrl)
+		if splitErr == nil {
+			p, pErr := strconv.Atoi(portStr)
+			if pErr == nil && p > 0 {
+				if host == "" || host == "0.0.0.0" || host == "::" || host == "*" {
+					host = "127.0.0.1"
+				}
+				ctrl = net.JoinHostPort(host, strconv.Itoa(p))
+			} else {
+				ctrl = ""
+			}
+		} else {
+			ctrl = ""
+		}
+	}
+	return configProbeEndpoints{
+		controllerAddr: ctrl,
+		secret:         doc.Secret,
+		mixedPort:      doc.MixedPort,
+	}
+}
+
+func isStockMihomoReadyLogLine(line string) bool {
+	return strings.Contains(line, "RESTful API listening at:") ||
+		strings.Contains(line, "Mixed(http+socks) proxy listening at:") ||
+		strings.Contains(line, "HTTP proxy listening at:") ||
+		strings.Contains(line, "SOCKS proxy listening at:") ||
+		strings.Contains(line, "Start initial compatible provider") ||
+		strings.Contains(line, "mihomo-bin started, config:")
+}
+
+func probeHTTPReadiness(ctx context.Context, ep configProbeEndpoints, readyOnce *sync.Once, readyCh chan struct{}) {
+	if ep.controllerAddr == "" {
+		return
+	}
+	client := &http.Client{Timeout: 350 * time.Millisecond}
+	url := "http://" + ep.controllerAddr + "/version"
+	ticker := time.NewTicker(60 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err == nil {
+			if ep.secret != "" {
+				req.Header.Set("Authorization", "Bearer "+ep.secret)
+			}
+			resp, doErr := client.Do(req)
+			if doErr == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					portReady := true
+					if ep.mixedPort > 0 {
+						conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", ep.mixedPort), 200*time.Millisecond)
+						if dialErr != nil {
+							portReady = false
+						} else {
+							_ = conn.Close()
+						}
+					}
+					if portReady {
+						readyOnce.Do(func() { close(readyCh) })
+						return
+					}
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 	cleanHome, err := validateCleanAbsPath("home_dir", homeDir, true, true)
 	if err != nil {
@@ -169,7 +270,8 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 		return r.statusLocked(), fmt.Errorf("trusted core binary missing at %s", corePath)
 	}
 
-	args := []string{"-d", cleanHome, "-f", cleanConfig, "-watch-stdin"}
+	// Standard stock upstream Mihomo CLI arguments only (-d, -f, optional -ext-ui).
+	args := []string{"-d", cleanHome, "-f", cleanConfig}
 	if cleanUI != "" {
 		args = append(args, "-ext-ui", cleanUI)
 	}
@@ -193,18 +295,12 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 	}
 	configureChildProcess(cmd)
 
-	stdinPipe, err := cmd.StdinPipe()
-	if err != nil {
-		return r.statusLocked(), fmt.Errorf("create core stdin pipe: %w", err)
-	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		_ = stdinPipe.Close()
 		return r.statusLocked(), fmt.Errorf("create core stdout pipe: %w", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		_ = stdinPipe.Close()
 		return r.statusLocked(), fmt.Errorf("create core stderr pipe: %w", err)
 	}
 
@@ -212,10 +308,12 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 	r.recentLogs = nil
 	r.logMu.Unlock()
 
+	endpoints := extractConfigEndpoints(cleanConfig)
+
 	if err := cmd.Start(); err != nil {
-		_ = stdinPipe.Close()
 		return r.statusLocked(), fmt.Errorf("start core process: %w", err)
 	}
+	guard := attachChildGuard(cmd)
 
 	readyCh := make(chan struct{})
 	var readyOnce sync.Once
@@ -227,7 +325,7 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 		for scanner.Scan() {
 			line := scanner.Text()
 			r.appendLog(line)
-			if strings.Contains(line, ReadyMarker) {
+			if endpoints.controllerAddr == "" && isStockMihomoReadyLogLine(line) {
 				readyOnce.Do(func() { close(readyCh) })
 			}
 		}
@@ -238,8 +336,14 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 		doneCh <- cmd.Wait()
 	}()
 
+	probeCtx, cancelProbe := context.WithCancel(context.Background())
+	defer cancelProbe()
+	if endpoints.controllerAddr != "" {
+		go probeHTTPReadiness(probeCtx, endpoints, &readyOnce, readyCh)
+	}
+
 	r.cmd = cmd
-	r.stdin = stdinPipe
+	r.guard = guard
 	r.doneCh = doneCh
 	r.homeDir = cleanHome
 	r.configFile = cleanConfig
@@ -248,9 +352,9 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 	case <-readyCh:
 		return r.statusLocked(), nil
 	case waitErr := <-doneCh:
-		_ = stdinPipe.Close()
+		guard.closeHandles()
 		r.cmd = nil
-		r.stdin = nil
+		r.guard = nil
 		r.doneCh = nil
 		logs := strings.Join(r.snapshotLogs(), " | ")
 		if waitErr != nil {
@@ -271,43 +375,23 @@ func (r *Runner) Stop() error {
 }
 
 func (r *Runner) stopLocked() error {
-	if r.cmd == nil || r.doneCh == nil {
+	if r.cmd == nil && r.guard == nil {
 		return nil
 	}
-	// Check if already exited
-	select {
-	case <-r.doneCh:
-		if r.stdin != nil {
-			_ = r.stdin.Close()
+	running, _ := r.guard.activePID(r.cmd, r.doneCh)
+	if !running {
+		if r.guard != nil {
+			r.guard.closeHandles()
 		}
 		r.cmd = nil
-		r.stdin = nil
+		r.guard = nil
 		r.doneCh = nil
 		return nil
-	default:
 	}
 
-	if r.stdin != nil {
-		_ = r.stdin.Close()
-		r.stdin = nil
-	}
-
-	var stopErr error
-	select {
-	case <-r.doneCh:
-	case <-time.After(r.stopTimeout):
-		if r.cmd.Process != nil {
-			if killErr := r.cmd.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
-				stopErr = fmt.Errorf("kill unresponsive core: %w", killErr)
-			}
-		}
-		select {
-		case <-r.doneCh:
-		case <-time.After(2 * time.Second):
-		}
-	}
-
+	stopErr := r.guard.terminate(r.cmd, r.doneCh, r.stopTimeout)
 	r.cmd = nil
+	r.guard = nil
 	r.doneCh = nil
 	return stopErr
 }
@@ -319,24 +403,24 @@ func (r *Runner) Status() Status {
 }
 
 func (r *Runner) statusLocked() Status {
-	if r.cmd != nil && r.doneCh != nil {
-		select {
-		case <-r.doneCh:
-			if r.stdin != nil {
-				_ = r.stdin.Close()
+	running, pid := false, 0
+	if r.guard != nil || r.cmd != nil {
+		running, pid = r.guard.activePID(r.cmd, r.doneCh)
+		if !running {
+			if r.guard != nil {
+				r.guard.closeHandles()
 			}
 			r.cmd = nil
-			r.stdin = nil
+			r.guard = nil
 			r.doneCh = nil
-		default:
 		}
 	}
 	st := Status{
 		RecentLogs: r.snapshotLogs(),
 	}
-	if r.cmd != nil && r.cmd.Process != nil {
+	if running {
 		st.Running = true
-		st.PID = r.cmd.Process.Pid
+		st.PID = pid
 		st.HomeDir = r.homeDir
 		st.ConfigFile = r.configFile
 	}

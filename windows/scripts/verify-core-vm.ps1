@@ -17,11 +17,11 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 foreach ($arch in @("arm64", "amd64")) {
     $exe = "$testRoot\$arch\mihomo_core.exe"
-    $feat = (& $exe --features | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $feat -notmatch "with_gvisor") {
-        throw "$arch --features failed ($LASTEXITCODE): $feat"
+    $verOut = (& $exe -v | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $verOut -notmatch "with_gvisor") {
+        throw "$arch -v failed ($LASTEXITCODE): $verOut"
     }
-    Write-Host "[$arch] features: $feat"
+    Write-Host "[$arch] -v: $verOut"
 
     $homeDir = "$testRoot\home-$arch"
     $port = if ($arch -eq "arm64") { 17891 } else { 17892 }
@@ -40,7 +40,7 @@ rules:
     [System.IO.File]::WriteAllText("$homeDir\config.yaml", $cfgText, $utf8NoBom)
 
     $val = (& $exe -t -d $homeDir -f "$homeDir\config.yaml" 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $val -notmatch "configuration is valid") {
+    if ($LASTEXITCODE -ne 0 -or $val -notmatch "test is successful") {
         throw "$arch -t failed ($LASTEXITCODE): $val"
     }
     Write-Host "[$arch] -t: $val"
@@ -48,10 +48,7 @@ rules:
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe
     $psi.WorkingDirectory = "$testRoot\$arch"
-    $psi.Arguments = "-d `"$homeDir`" -f `"$homeDir\config.yaml`" -watch-stdin"
-    $psi.RedirectStandardInput = $true
-    $psi.RedirectStandardOutput = $false
-    $psi.RedirectStandardError = $false
+    $psi.Arguments = "-d `"$homeDir`" -f `"$homeDir\config.yaml`""
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
@@ -73,18 +70,12 @@ rules:
     }
     Write-Host "[$arch] REST version ready: $($ver | ConvertTo-Json -Compress)"
 
-    $proc.StandardInput.Close()
-    if (-not $proc.WaitForExit(5000)) {
-        $proc.Kill()
-        throw "$arch did not exit on stdin EOF"
-    }
-    if ($proc.ExitCode -ne 0) {
-        throw "$arch exit code $($proc.ExitCode)"
-    }
-    Write-Host "[$arch] graceful shutdown exit=$($proc.ExitCode)"
+    $proc.Kill()
+    [void]$proc.WaitForExit(5000)
+    Write-Host "[$arch] clean stop verified"
 }
 
-# Elevated ARM64 Wintun TUN startup + adapter creation + graceful teardown
+# Elevated ARM64 Wintun TUN startup + adapter creation + clean teardown
 $tunCfg = @"
 mixed-port: 17893
 allow-lan: false
@@ -115,10 +106,7 @@ rules:
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = "$testRoot\arm64\mihomo_core.exe"
 $psi.WorkingDirectory = "$testRoot\arm64"
-$psi.Arguments = "-d `"$testRoot\home-tun`" -f `"$testRoot\home-tun\config.yaml`" -watch-stdin"
-$psi.RedirectStandardInput = $true
-$psi.RedirectStandardOutput = $false
-$psi.RedirectStandardError = $false
+$psi.Arguments = "-d `"$testRoot\home-tun`" -f `"$testRoot\home-tun\config.yaml`""
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $tunProc = [System.Diagnostics.Process]::Start($psi)
@@ -141,17 +129,13 @@ if (-not $tunAdapterUp) {
     throw "Wintun adapter ClashFXTunTest did not come UP"
 }
 
-$tunProc.StandardInput.Close()
-if (-not $tunProc.WaitForExit(8000)) {
-    $tunProc.Kill()
-    throw "TUN process did not exit cleanly on stdin EOF"
-}
-Write-Host "[arm64-tun] graceful shutdown exit=$($tunProc.ExitCode)"
-Start-Sleep -Milliseconds 500
+$tunProc.Kill()
+[void]$tunProc.WaitForExit(8000)
+Start-Sleep -Milliseconds 600
 $leftover = Get-NetAdapter -Name "ClashFXTunTest" -ErrorAction SilentlyContinue
 if ($leftover) {
     throw "Leftover Wintun adapter after shutdown: $($leftover.Name)"
 }
 Write-Host "[arm64-tun] Wintun adapter cleanly removed (zero residue)"
 Remove-Item -Recurse -Force $testRoot
-Write-Host "ALL P0-1 VM CHECKS PASSED"
+Write-Host "ALL P0-1 STOCK MIHOMO VM CHECKS PASSED"

@@ -307,8 +307,6 @@ void WebView2Widget::applyScriptsAndNavigate(bool forceNavigate) {
             const std::wstring w = compatJs.toStdWString();
             webview_->AddScriptToExecuteOnDocumentCreated(w.c_str(), nullptr);
         }
-        const std::wstring guardW = buildApiGuardJS().toStdWString();
-        webview_->AddScriptToExecuteOnDocumentCreated(guardW.c_str(), nullptr);
     }
 
     const bool configChanged = (appliedPort_ != apiPort_) ||
@@ -326,12 +324,10 @@ void WebView2Widget::applyScriptsAndNavigate(bool forceNavigate) {
 
     const QString staleMsg = L("内核重载中，当前显示最近一次规则快照",
                                "Core unavailable; showing the last valid rules snapshot");
-    const QString managedMsg = L("由 ClashFX 统一托管", "Managed by ClashFX");
 
     const QStringList dynamicScripts = {
         buildMetaCubeXDConfigJS(apiPort_, apiSecret_),
         buildRulesSnapshotJS(apiPort_, staleMsg),
-        buildUpgradePolicyJS(managedMsg),
     };
 
     auto remaining = std::make_shared<int>(dynamicScripts.size());
@@ -376,49 +372,6 @@ QString WebView2Widget::readBundledCompatibilityJS() {
         }
     }
     return QString();
-}
-
-QString WebView2Widget::buildApiGuardJS() {
-    return QStringLiteral(R"JS(
-(function() {
-  var BLOCKED = ['/upgrade', '/restart'];
-  var orig = window.fetch;
-  window.fetch = function(input, init) {
-    var url = (typeof input === 'string') ? input : (input.url || '');
-    for (var i = 0; i < BLOCKED.length; i++) {
-      if (url.indexOf(BLOCKED[i]) !== -1) {
-        var method = ((init && init.method) || 'GET').toUpperCase();
-        if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
-          return Promise.resolve(new Response(
-            JSON.stringify({message: 'Managed by ClashFX'}),
-            {status: 403, headers: {'Content-Type': 'application/json'}}
-          ));
-        }
-      }
-    }
-    return orig.apply(this, arguments);
-  };
-  var origXHR = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(method, url) {
-    for (var i = 0; i < BLOCKED.length; i++) {
-      if (url.indexOf(BLOCKED[i]) !== -1 && /^(POST|PUT|PATCH)$/i.test(method)) {
-        this._blocked = true;
-      }
-    }
-    return origXHR.apply(this, arguments);
-  };
-  var origSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.send = function() {
-    if (this._blocked) {
-      Object.defineProperty(this, 'status', {get: function(){return 403}});
-      Object.defineProperty(this, 'responseText', {get: function(){return '{"message":"Managed by ClashFX"}'}});
-      if (typeof this.onload === 'function') this.onload();
-      return;
-    }
-    return origSend.apply(this, arguments);
-  };
-})();
-)JS");
 }
 
 QString WebView2Widget::buildMetaCubeXDConfigJS(int port, const QString& secret) {
@@ -534,63 +487,6 @@ QString WebView2Widget::buildRulesSnapshotJS(int port, const QString& staleMessa
 #else
     Q_UNUSED(port);
     Q_UNUSED(staleMessage);
-    return QString();
-#endif
-}
-
-QString WebView2Widget::buildUpgradePolicyJS(const QString& managedMessage) {
-#ifdef Q_OS_WIN
-    const QString msg = escapeJsSingleQuoted(managedMessage);
-    QString tpl = QStringLiteral(R"JS(
-(function() {
-  var MANAGED_MESSAGE = '__MANAGED__';
-  var VERSION_PATTERN = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
-  var HIDE_LABELS = ['GEO Databases', 'Dashboard UI', 'Restart', 'Upgrade'];
-  function hideItems(root) {
-    var labels = root.querySelectorAll('div');
-    for (var i = 0; i < labels.length; i++) {
-      var el = labels[i];
-      if (el.children.length > 0) continue;
-      var txt = el.textContent.trim();
-      for (var j = 0; j < HIDE_LABELS.length; j++) {
-        if (txt.indexOf(HIDE_LABELS[j]) !== -1) {
-          var row = el.parentElement;
-          if (row) row.style.display = 'none';
-          break;
-        }
-      }
-    }
-  }
-  function manageVersionButtons(root) {
-    var buttons = root.querySelectorAll('button');
-    for (var i = 0; i < buttons.length; i++) {
-      var button = buttons[i];
-      var text = button.textContent.trim();
-      var collapsedTitle = button.getAttribute('title') || '';
-      var isExpanded = VERSION_PATTERN.test(text);
-      var isCollapsed = /^UI\s+v?\d+\.\d+\.\d+.*Core\s+v?\d+\.\d+\.\d+/.test(collapsedTitle);
-      if (!isExpanded && !isCollapsed) continue;
-      button.dataset.clashfxManagedVersion = 'true';
-      button.style.cursor = 'default';
-      button.style.pointerEvents = 'none';
-      var versionText = isCollapsed ? collapsedTitle.split(' — ')[0] : text;
-      button.setAttribute('title', versionText + ' — ' + MANAGED_MESSAGE);
-    }
-  }
-  function applyPolicy() {
-    hideItems(document);
-    manageVersionButtons(document);
-  }
-  var mo = new MutationObserver(applyPolicy);
-  mo.observe(document.documentElement, {childList: true, subtree: true});
-  document.addEventListener('DOMContentLoaded', applyPolicy);
-  applyPolicy();
-})();
-)JS");
-    tpl.replace(QStringLiteral("__MANAGED__"), msg);
-    return tpl;
-#else
-    Q_UNUSED(managedMessage);
     return QString();
 #endif
 }

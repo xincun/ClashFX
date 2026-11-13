@@ -72,6 +72,7 @@ type DaemonSnapshot struct {
 	NodeServices       nodeservices.RuntimeSnapshot        `json:"node_services"`
 	ActiveNetwork      features.ActiveNetworkSignature     `json:"active_network"`
 	SuspendedByNetwork string                              `json:"suspended_by_network,omitempty"`
+	LastError          string                              `json:"last_error,omitempty"`
 }
 
 type Engine struct {
@@ -89,6 +90,7 @@ type Engine struct {
 	coreViaService  bool
 	allowPromptUAC  bool
 	suspendedByNet  string
+	lastApplyErr    string
 	proxyGroupsMu   sync.RWMutex
 	proxyGroups     []ProxyGroupView
 	aiCandidates    []ailock.CandidateNode
@@ -326,6 +328,11 @@ func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUA
 	}
 	state, err := e.ctrl.Apply(ctx, includeRecovery)
 	e.allowPromptUAC = false
+	if err != nil {
+		e.lastApplyErr = err.Error()
+	} else {
+		e.lastApplyErr = ""
+	}
 	e.opMu.Unlock()
 
 	if err != nil {
@@ -333,10 +340,42 @@ func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUA
 		return state, err
 	}
 
+	if includeRecovery && state.APIPort > 0 && e.IsCoreRunning() {
+		e.replaySavedSelections(ctx, state.APIPort, state.APISecret, e.store.Settings().SelectedProfile)
+	}
+
 	e.reconcileSystemProxy()
 	e.refreshLiveCoreMetadata(ctx)
 	e.notifyStateChanged()
 	return state, nil
+}
+
+func (e *Engine) replaySavedSelections(ctx context.Context, apiPort int, secret string, profileName string) {
+	saved := e.store.RecoverySelectionsForProfile(profileName)
+	if len(saved) == 0 {
+		return
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	for group, target := range saved {
+		body, _ := json.Marshal(map[string]string{"name": target})
+		req, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodPut,
+			fmt.Sprintf("http://127.0.0.1:%d/proxies/%s", apiPort, url.PathEscape(group)),
+			bytes.NewReader(body),
+		)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if secret != "" {
+			req.Header.Set("Authorization", "Bearer "+secret)
+		}
+		if resp, doErr := client.Do(req); doErr == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+	}
 }
 
 func (e *Engine) reconcileSystemProxy() {
@@ -423,6 +462,7 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 	e.opMu.Lock()
 	suspended := e.suspendedByNet
 	viaSvc := e.coreViaService
+	lastErr := e.lastApplyErr
 	e.opMu.Unlock()
 
 	logsDir := filepath.Join(e.store.AppDataDir(), "logs")
@@ -448,6 +488,7 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 		NodeServices:       nsSnap,
 		ActiveNetwork:      sig,
 		SuspendedByNetwork: suspended,
+		LastError:          lastErr,
 	}
 }
 
@@ -714,6 +755,24 @@ func (e *Engine) SelectProxy(ctx context.Context, group, target string) error {
 func (e *Engine) RestoreAutoSelection(ctx context.Context, group string) error {
 	if err := e.store.ClearProxySelection(e.store.Settings().SelectedProfile, group); err != nil {
 		return err
+	}
+	rt := e.ctrl.LastState()
+	if rt.APIPort > 0 && e.IsCoreRunning() {
+		req, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodDelete,
+			fmt.Sprintf("http://127.0.0.1:%d/proxies/%s", rt.APIPort, url.PathEscape(group)),
+			nil,
+		)
+		if err == nil {
+			if rt.APISecret != "" {
+				req.Header.Set("Authorization", "Bearer "+rt.APISecret)
+			}
+			if resp, doErr := (&http.Client{Timeout: 4 * time.Second}).Do(req); doErr == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+			}
+		}
 	}
 	_, err := e.applyAndSync(ctx, false, false)
 	return err
