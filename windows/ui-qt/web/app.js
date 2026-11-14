@@ -206,10 +206,8 @@ function renderChrome() {
   if (tbTitle) tbTitle.textContent = t(pageDef.titleZh || pageDef.zh, pageDef.titleEn || pageDef.en);
   if (consoleTools) {
     consoleTools.hidden = store.page !== 0;
-    const termBtn = document.getElementById('btn-copy-term');
     const reloadPanelBtn = document.getElementById('btn-reload-panel');
     const openBrowserBtn = document.getElementById('btn-open-browser');
-    if (termBtn) termBtn.innerHTML = `${ICONS.terminal} <span>${t('终端代理', 'Terminal Env')}</span>`;
     if (reloadPanelBtn) reloadPanelBtn.innerHTML = `${ICONS.refresh} <span>${t('刷新面板', 'Reload Panel')}</span>`;
     if (openBrowserBtn) {
       openBrowserBtn.innerHTML = ICONS.externalLink;
@@ -378,16 +376,6 @@ function wireWindowControls() {
   });
 
   document.getElementById('btn-lang-toggle')?.addEventListener('click', () => toggleLanguage());
-
-  document.getElementById('btn-copy-term')?.addEventListener('click', async () => {
-    const snap = store.snapshot || {};
-    const runtime = snap.runtime || {};
-    const settings = snap.settings || {};
-    const mixedPort = runtime.mixed_port || settings.port_override || 7890;
-    const cmd = `$env:HTTP_PROXY="http://127.0.0.1:${mixedPort}"; $env:HTTPS_PROXY="http://127.0.0.1:${mixedPort}"; $env:ALL_PROXY="socks5://127.0.0.1:${mixedPort}"`;
-    await native('copy_text', { text: cmd });
-    showToast(t(`已复制 PowerShell 代理命令 (:${mixedPort})`, `Copied PowerShell proxy command (:${mixedPort})`), 'ok');
-  });
 
   document.getElementById('btn-reload-panel')?.addEventListener('click', () => {
     syncConsoleHost(true);
