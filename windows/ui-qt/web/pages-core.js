@@ -445,7 +445,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
           <select class="select mono" id="new-rule-type">
             ${RULE_TYPES.map((rt) => `<option value="${rt}">${rt}</option>`).join('')}
           </select>
-          <input type="text" class="input mono" id="new-rule-payload" placeholder="openai.com / 192.168.0.0/16 / cursor.exe" />
+          <input type="text" class="input mono" id="new-rule-payload" placeholder="${store.platform === 'darwin' ? 'openai.com / 192.168.0.0/16 / Cursor' : 'openai.com / 192.168.0.0/16 / cursor.exe'}" />
           <select class="select" id="new-rule-target">
             ${targets.map((tg) => `<option value="${esc(tg)}">${esc(tg)}</option>`).join('')}
           </select>
@@ -679,7 +679,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
       if (!newPayloadEl) return;
       const isMatch = newTypeEl.value === 'MATCH';
       newPayloadEl.disabled = isMatch;
-      newPayloadEl.placeholder = isMatch ? '(MATCH)' : 'openai.com / 192.168.0.0/16 / cursor.exe';
+      newPayloadEl.placeholder = isMatch ? '(MATCH)' : (store.platform === 'darwin' ? 'openai.com / 192.168.0.0/16 / Cursor' : 'openai.com / 192.168.0.0/16 / cursor.exe');
     });
     root.querySelector('#btn-add-rule')?.addEventListener('click', () => {
       const type = root.querySelector('#new-rule-type')?.value || 'DOMAIN-SUFFIX';

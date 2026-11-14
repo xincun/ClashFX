@@ -707,7 +707,7 @@ function formatKeyEventToChord(e) {
   if (e.ctrlKey) mods.push('Ctrl');
   if (e.altKey) mods.push('Alt');
   if (e.shiftKey) mods.push('Shift');
-  if (e.metaKey) mods.push('Win');
+  if (e.metaKey) mods.push(store.platform === 'darwin' ? 'Cmd' : 'Win');
   const k = e.key;
   if (['Control', 'Alt', 'Shift', 'Meta'].includes(k)) return null;
   if (!mods.length) return null;
@@ -763,7 +763,7 @@ export function renderSettingsPage(root) {
           </div>
         </div>
         <div class="form-row">
-          <div class="form-label-col"><div class="form-label">${t('开机自动启动', 'Launch at Windows Login')}</div></div>
+          <div class="form-label-col"><div class="form-label">${t('开机自动启动', store.platform === 'darwin' ? 'Launch at Login' : 'Launch at Windows Login')}</div></div>
           <label class="switch"><input type="checkbox" data-set-bool="launch_at_login" ${d.launch_at_login ? 'checked' : ''} /><span class="switch-track"></span></label>
         </div>
       </div>
@@ -811,7 +811,7 @@ export function renderSettingsPage(root) {
         <div class="form-row">
           <div class="form-label-col"><div class="form-label">${t('TUN 网卡名称 / MTU', 'Interface / MTU')}</div></div>
           <div class="form-control">
-            <input type="text" class="input mono" placeholder="ClashFX-TUN" data-set-str="tun_interface_name" value="${esc(d.tun_interface_name || '')}" style="width:125px;" />
+            <input type="text" class="input mono" placeholder="${store.platform === 'darwin' ? 'utun0 (auto)' : 'ClashFX-TUN'}" data-set-str="tun_interface_name" value="${esc(d.tun_interface_name || '')}" style="width:125px;" />
             <input type="number" class="input mono" data-set-num="tun_mtu" value="${d.tun_mtu || 1500}" style="width:78px;" />
           </div>
         </div>
@@ -836,7 +836,7 @@ export function renderSettingsPage(root) {
       <div class="card">
         <div class="card-head"><div class="card-title">${ICONS.aiLock} ${t('快捷键与环境挂起', 'Hotkeys & Auto-Suspend')}</div></div>
         <div class="form-row">
-          <div class="form-label-col"><div class="form-label">${t('切换系统代理快捷键', 'Toggle System Proxy Hotkey')}</div><div class="form-desc">${t('点击输入框后按下组合键 (如 Ctrl+Alt+P)', 'Click box and press key chord (e.g. Ctrl+Alt+P)')}</div></div>
+          <div class="form-label-col"><div class="form-label">${t('切换系统代理快捷键', 'Toggle System Proxy Hotkey')}</div><div class="form-desc">${t(`点击输入框后按下组合键 (如 ${store.platform === 'darwin' ? 'Cmd+Shift+P' : 'Ctrl+Alt+P'})`, `Click box and press key chord (e.g. ${store.platform === 'darwin' ? 'Cmd+Shift+P' : 'Ctrl+Alt+P'})`)}</div></div>
           <div class="form-control">
             <input type="text" readonly class="input mono hotkey-input ${settingsState.recordingKey === 'toggle_system_proxy' ? 'recording' : ''}" data-hk-rec="toggle_system_proxy" value="${esc(settingsState.recordingKey === 'toggle_system_proxy' ? t('请按键…', 'Press keys…') : hk.toggle_system_proxy || '')}" placeholder="${t('未设置', 'None')}" />
             <button type="button" class="btn btn-sm" data-hk-clear="toggle_system_proxy">×</button>

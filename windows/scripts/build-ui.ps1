@@ -141,10 +141,10 @@ if errorlevel 1 exit /b 1
     # Copy bundled resources (MetaCubeXD dashboard, clashfx-compat.js, GEO archives, app icon)
     $stageRes = Join-Path $stageDir "resources"
     New-Item -ItemType Directory -Force -Path $stageRes | Out-Null
-    Copy-Item -Recurse -Force (Join-Path $RepoRoot "ClashFX\Resources\dashboard") (Join-Path $stageRes "dashboard")
-    Copy-Item -Force (Join-Path $RepoRoot "ClashFX\Resources\DashboardCompatibility\clashfx-compat.js") (Join-Path $stageRes "clashfx-compat.js")
-    Copy-Item -Force (Join-Path $RepoRoot "ClashFX\Resources\Country.mmdb.gz") (Join-Path $stageRes "Country.mmdb.gz")
-    Copy-Item -Force (Join-Path $RepoRoot "ClashFX\Resources\geosite.dat.gz") (Join-Path $stageRes "geosite.dat.gz")
+    Copy-Item -Recurse -Force (Join-Path $RepoRoot "macos\resources\dashboard") (Join-Path $stageRes "dashboard")
+    Copy-Item -Force (Join-Path $RepoRoot "macos\resources\DashboardCompatibility\clashfx-compat.js") (Join-Path $stageRes "clashfx-compat.js")
+    Copy-Item -Force (Join-Path $RepoRoot "macos\resources\Country.mmdb.gz") (Join-Path $stageRes "Country.mmdb.gz")
+    Copy-Item -Force (Join-Path $RepoRoot "macos\resources\geosite.dat.gz") (Join-Path $stageRes "geosite.dat.gz")
     Copy-Item -Force (Join-Path $RepoRoot "windows\ui-qt\resources\clashfx.ico") (Join-Path $stageRes "clashfx.ico")
     $stageUi = Join-Path $stageRes "ui"
     if (Test-Path $stageUi) { Remove-Item -Recurse -Force $stageUi }

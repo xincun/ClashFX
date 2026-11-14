@@ -80,7 +80,7 @@ body {
   overflow: hidden;
   background: var(--bg-canvas);
   color: var(--text-primary);
-  font-family: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", system-ui, -apple-system, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
   font-size: 13px;
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
@@ -125,8 +125,14 @@ pre,
 .win-resize-sw { bottom: 0; left: 0; width: 8px; height: 8px; cursor: sw-resize; }
 .win-resize-se { bottom: 0; right: 0; width: 8px; height: 8px; cursor: se-resize; }
 
-html.is-maximized .win-resize {
-  display: none;
+html.is-maximized .win-resize,
+html[data-platform="darwin"] .win-resize,
+html[data-platform="darwin"] .win-captions {
+  display: none !important;
+}
+
+html[data-platform="darwin"]:not([data-fullscreen="1"]) .sidebar {
+  padding-top: 38px;
 }
 
 /* Main App Layout */

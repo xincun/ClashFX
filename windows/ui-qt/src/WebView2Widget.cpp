@@ -452,7 +452,7 @@ QString WebView2Widget::readBundledCompatibilityJS() {
     const QStringList candidates{
         QDir(appDir).filePath(QStringLiteral("resources/clashfx-compat.js")),
         QDir(appDir).filePath(QStringLiteral("resources/DashboardCompatibility/clashfx-compat.js")),
-        QDir(appDir).filePath(QStringLiteral("../../ClashFX/Resources/DashboardCompatibility/clashfx-compat.js")),
+        QDir(appDir).filePath(QStringLiteral("../../macos/resources/DashboardCompatibility/clashfx-compat.js")),
     };
     for (const QString& path : candidates) {
         QFile f(path);
