@@ -170,3 +170,77 @@ func TestListProfilesHidesUnmodifiedStarterConfigWhenInactive(t *testing.T) {
 	}
 	assertProfilesEqual(t, profs, "config", "custom-local", "sub1")
 }
+
+func TestEagerProfileMixinUpgradeAndInternalWriteWatcherSuppression(t *testing.T) {
+	// 1. NewStore eagerly creates .profile_mixin.yaml with default CN & LAN direct rules
+	dir := t.TempDir()
+	s1, err := NewStore(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mixinPath := s1.ProfileMixinPath()
+	got, err := os.ReadFile(mixinPath)
+	if err != nil {
+		t.Fatalf("expected .profile_mixin.yaml eagerly created: %v", err)
+	}
+	if string(got) != DefaultProfileMixinTemplate {
+		t.Fatalf("unexpected initial mixin contents:\n%s", string(got))
+	}
+	s1.Close()
+
+	// 2. Untouched legacy comment-only .profile_mixin.yaml is upgraded on startup
+	if err := WriteFileAtomic(mixinPath, []byte(LegacyEmptyProfileMixinTemplate), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := NewStore(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(mixinPath)
+	if err != nil || string(got) != DefaultProfileMixinTemplate {
+		t.Fatalf("expected legacy untouched mixin to be upgraded, got %q (%v)", string(got), err)
+	}
+	s2.Close()
+
+	// 3. Explicit-off mixin (profile: {}) is preserved across restarts
+	if err := WriteFileAtomic(mixinPath, []byte(DisabledProfileMixinTemplate), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s3, err := NewStore(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3.Close()
+	got, err = os.ReadFile(mixinPath)
+	if err != nil || string(got) != DisabledProfileMixinTemplate {
+		t.Fatalf("expected explicit-off mixin preserved, got %q (%v)", string(got), err)
+	}
+
+	// 4. Watcher suppresses internal write bounce, while still firing for external writes
+	var notifyCount atomic.Int32
+	if err := s3.WatchActiveConfigDir(func(_ string) {
+		notifyCount.Add(1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s3.MarkInternalWrite(mixinPath)
+	if err := WriteFileAtomic(mixinPath, []byte(DefaultProfileMixinTemplate), 0600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if notifyCount.Load() != 0 {
+		t.Fatalf("expected internal write to be suppressed, got notifyCount=%d", notifyCount.Load())
+	}
+
+	extPath := filepath.Join(dir, "external.yaml")
+	if err := WriteFileAtomic(extPath, []byte("mixed-port: 7890\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && notifyCount.Load() == 0 {
+		time.Sleep(30 * time.Millisecond)
+	}
+	if notifyCount.Load() == 0 {
+		t.Fatal("expected external write to trigger fsnotify callback")
+	}
+}

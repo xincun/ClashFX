@@ -171,3 +171,28 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 		t.Fatalf("unexpected lab update result: %+v (%v)", lab, err)
 	}
 }
+
+func TestProfileMixinDefaultOnAndExplicitOffPersistence(t *testing.T) {
+	defDoc, err := ParseProfileMixinDocument([]byte(profile.DefaultProfileMixinTemplate), "JMS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !defDoc.BypassCNWeb || !defDoc.BypassLAN || len(defDoc.Rules) != 0 {
+		t.Fatalf("expected default template to enable both CN and LAN direct without extra custom rules, got %+v", defDoc)
+	}
+
+	disabledYAML, err := BuildProfileMixinYAML(nil, false, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.IsLegacyUntouchedProfileMixin(disabledYAML) {
+		t.Fatalf("explicitly disabled mixin must not match LegacyEmptyProfileMixinTemplate")
+	}
+	offDoc, err := ParseProfileMixinDocument(disabledYAML, "JMS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offDoc.BypassCNWeb || offDoc.BypassLAN || len(offDoc.Rules) != 0 {
+		t.Fatalf("expected explicit-off mixin to stay off after round-trip, got %+v", offDoc)
+	}
+}

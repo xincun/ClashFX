@@ -17,7 +17,7 @@ const (
 	ProxyTargetPlaceholder         = "PROXY"
 )
 
-const DefaultProfileMixinTemplate = `# Profile Mixin is merged into the selected profile at runtime.
+const LegacyEmptyProfileMixinTemplate = `# Profile Mixin is merged into the selected profile at runtime.
 # Example:
 # proxy-groups:
 #   - name: Auto 1x
@@ -34,6 +34,30 @@ const DefaultProfileMixinTemplate = `# Profile Mixin is merged into the selected
 #
 # PROCESS-NAME and PROCESS-PATH rules require Enhanced Mode (TUN).
 `
+
+const DefaultProfileMixinTemplate = `# ClashFX Profile Mixin — merged into every profile at runtime.
+# Managed rules from the ClashFX UI live under profile.prepend-rules;
+# any extra top-level keys (dns, sniffer, tun, hosts, rules, etc.) are preserved intact.
+profile:
+  prepend-rules:
+    - GEOSITE,private,DIRECT
+    - GEOIP,LAN,DIRECT,no-resolve
+    - GEOSITE,cn,DIRECT
+    - GEOIP,CN,DIRECT,no-resolve
+`
+
+const DisabledProfileMixinTemplate = `# ClashFX Profile Mixin — merged into every profile at runtime.
+profile: {}
+`
+
+// IsLegacyUntouchedProfileMixin reports whether raw still matches the legacy
+// comment-only starter mixin template before default CN/LAN direct rules existed.
+func IsLegacyUntouchedProfileMixin(raw []byte) bool {
+	normalize := func(s string) string {
+		return strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n"))
+	}
+	return normalize(string(raw)) == normalize(LegacyEmptyProfileMixinTemplate)
+}
 
 func IsProfileMixinFileName(name string) bool {
 	return name == ProfileMixinDotFile || name == ProfileMixinNamedFile

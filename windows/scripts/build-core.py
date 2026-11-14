@@ -29,6 +29,7 @@ import zipfile
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 CORE_ENGINE_ROOT = REPO_ROOT / "core-engine"
 WINDOWS_BUILD_ROOT = REPO_ROOT / "windows" / "build"
+DIST_ROOT = REPO_ROOT / "windows" / "dist"
 CACHE_DIR = WINDOWS_BUILD_ROOT / ".cache"
 
 WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
@@ -82,6 +83,13 @@ def verify_pe_machine(path: pathlib.Path, expected_arch: str) -> None:
             f"PE architecture mismatch in {path}: got {machine:#06x}, "
             f"expected {expected_machine:#06x} ({expected_arch})"
         )
+    if path.suffix.lower() == ".exe":
+        (opt_magic,) = struct.unpack_from("<H", data, pe_offset + 24)
+        if opt_magic != 0x020B:
+            raise RuntimeError(f"PE OptionalHeader magic mismatch in {path}: got {opt_magic:#06x}, expected 0x020b")
+        (subsystem,) = struct.unpack_from("<H", data, pe_offset + 92)
+        if subsystem != 2:
+            raise RuntimeError(f"PE Subsystem mismatch in {path}: got {subsystem}, expected 2 (WINDOWS_GUI)")
 
 
 def ensure_wintun_zip() -> pathlib.Path:
@@ -124,7 +132,7 @@ def build_core_for_arch(
     out_dir.mkdir(parents=True, exist_ok=True)
     output_exe = out_dir / "mihomo_core.exe"
     ldflags = (
-        f"-s -w "
+        f"-H=windowsgui -s -w "
         f'-X "github.com/metacubex/mihomo/constant.Version={version}" '
         f'-X "github.com/metacubex/mihomo/constant.BuildTime={build_time}"'
     )
@@ -178,6 +186,9 @@ def main() -> int:
         arch_dir = args.output_root.resolve() / arch
         core_exe = build_core_for_arch(mihomo_dir, version, build_time, arch, arch_dir)
         wintun_dll = extract_wintun_dll(wintun_zip, arch, arch_dir)
+        dist_stage = DIST_ROOT / f"windows-{arch}"
+        if dist_stage.is_dir():
+            shutil.copy2(core_exe, dist_stage / core_exe.name)
         print(
             f"  [OK] windows/{arch}: {core_exe.name} ({core_exe.stat().st_size // 1024} KiB, sha256={sha256_file(core_exe)[:12]}), "
             f"{wintun_dll.name} ({wintun_dll.stat().st_size // 1024} KiB, sha256={sha256_file(wintun_dll)[:12]})"

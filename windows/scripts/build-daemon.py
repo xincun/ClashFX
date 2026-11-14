@@ -34,6 +34,13 @@ def verify_pe_machine(path: pathlib.Path, expected_machine: int) -> None:
     machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
     if machine != expected_machine:
         raise RuntimeError(f"{path} PE machine=0x{machine:04X}, expected 0x{expected_machine:04X}")
+    if path.suffix.lower() == ".exe":
+        opt_magic = struct.unpack_from("<H", data, pe_offset + 24)[0]
+        if opt_magic != 0x020B:
+            raise RuntimeError(f"{path} unexpected OptionalHeader magic=0x{opt_magic:04X}, expected 0x020B")
+        subsystem = struct.unpack_from("<H", data, pe_offset + 92)[0]
+        if subsystem != 2:
+            raise RuntimeError(f"{path} PE Subsystem={subsystem}, expected 2 (WINDOWS_GUI)")
 
 
 def main() -> int:
@@ -47,7 +54,7 @@ def main() -> int:
         for exe_name, pkg in BINARIES:
             out_path = out_dir / exe_name
             subprocess.check_call(
-                ["go", "build", "-trimpath", "-ldflags=-s -w", "-o", str(out_path), pkg],
+                ["go", "build", "-trimpath", "-ldflags=-H=windowsgui -s -w", "-o", str(out_path), pkg],
                 cwd=str(CORE_ENGINE_DIR),
                 env=env,
             )

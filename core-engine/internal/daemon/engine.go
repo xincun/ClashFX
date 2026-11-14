@@ -1724,7 +1724,8 @@ func (e *Engine) GetProfileMixin() (features.ProfileMixinDocument, error) {
 
 func (e *Engine) ConvertProfileMixin(direction, rawYAML string, bypassCNWeb, bypassLAN bool, rules []features.MixinRuleItem) (features.ProfileMixinDocument, error) {
 	defTarget, _ := e.currentProfileDefaultTarget()
-	if strings.EqualFold(strings.TrimSpace(direction), "from_yaml") {
+	dir := strings.TrimSpace(direction)
+	if strings.EqualFold(dir, "from_yaml") || strings.EqualFold(dir, "to_structured") {
 		return features.ParseProfileMixinDocument([]byte(rawYAML), defTarget)
 	}
 	built, err := features.BuildProfileMixinYAML([]byte(rawYAML), bypassCNWeb, bypassLAN, rules)
@@ -1737,7 +1738,8 @@ func (e *Engine) ConvertProfileMixin(direction, rawYAML string, bypassCNWeb, byp
 func (e *Engine) SaveProfileMixin(ctx context.Context, mode, rawYAML, baseYAML string, bypassCNWeb, bypassLAN bool, rules []features.MixinRuleItem) (features.ProfileMixinDocument, error) {
 	var finalYAML []byte
 	var err error
-	if strings.EqualFold(strings.TrimSpace(mode), "yaml") {
+	m := strings.TrimSpace(mode)
+	if strings.EqualFold(m, "yaml") || strings.EqualFold(m, "raw") {
 		if _, parseErr := profile.UnmarshalYAMLMap([]byte(rawYAML)); parseErr != nil {
 			return features.ProfileMixinDocument{}, fmt.Errorf("YAML 格式错误: %w", parseErr)
 		}
@@ -1759,12 +1761,14 @@ func (e *Engine) SaveProfileMixin(ctx context.Context, mode, rawYAML, baseYAML s
 	}
 	prevBytes, prevErr := os.ReadFile(path)
 
+	e.store.MarkInternalWrite(path)
 	if err := profile.WriteFileAtomic(path, finalYAML, 0600); err != nil {
 		return features.ProfileMixinDocument{}, err
 	}
 
 	if _, err := e.applyAndSync(ctx, false, false); err != nil {
 		if prevErr == nil {
+			e.store.MarkInternalWrite(path)
 			_ = profile.WriteFileAtomic(path, prevBytes, 0600)
 			_, _ = e.applyAndSync(ctx, false, false)
 		}

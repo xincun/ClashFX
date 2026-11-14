@@ -1282,6 +1282,7 @@ html[data-theme="light"] .region-badge.nl { color: #b45309; }
   padding: 5px 12px;
   border-radius: 7px;
   cursor: pointer;
+  white-space: nowrap;
   transition: all 0.14s ease;
 }
 .subtab-btn:hover {

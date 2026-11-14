@@ -148,6 +148,9 @@ type Store struct {
 	watcher    *fsnotify.Watcher
 	watchStop  chan struct{}
 	watchedDir string
+
+	internalWriteMu sync.Mutex
+	internalWrites  map[string]time.Time
 }
 
 func NewStore(appDataDir, bundledResourceDir string) (*Store, error) {
@@ -328,12 +331,70 @@ func (s *Store) ProfileMixinPath() string {
 	return filepath.Join(dir, ProfileMixinDotFile)
 }
 
-func (s *Store) EnsureProfileMixinFile() (string, error) {
-	path := s.ProfileMixinPath()
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := WriteFileAtomic(path, []byte(DefaultProfileMixinTemplate), 0600); err != nil {
-			return "", err
+func normalizeWatchPath(p string) string {
+	clean := filepath.Clean(strings.TrimSpace(p))
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(clean)
+	}
+	return clean
+}
+
+// MarkInternalWrite records paths modified directly by ClashFX so WatchActiveConfigDir
+// suppresses redundant self-triggered reloads while still detecting external user edits.
+func (s *Store) MarkInternalWrite(paths ...string) {
+	if len(paths) == 0 {
+		return
+	}
+	now := time.Now()
+	s.internalWriteMu.Lock()
+	defer s.internalWriteMu.Unlock()
+	if s.internalWrites == nil {
+		s.internalWrites = make(map[string]time.Time)
+	}
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
 		}
+		s.internalWrites[normalizeWatchPath(p)] = now
+	}
+}
+
+func (s *Store) isRecentInternalWrite(path string) bool {
+	const suppressWindow = 1200 * time.Millisecond
+	key := normalizeWatchPath(path)
+	now := time.Now()
+	s.internalWriteMu.Lock()
+	defer s.internalWriteMu.Unlock()
+	if len(s.internalWrites) == 0 {
+		return false
+	}
+	for k, ts := range s.internalWrites {
+		if now.Sub(ts) > suppressWindow {
+			delete(s.internalWrites, k)
+		}
+	}
+	ts, ok := s.internalWrites[key]
+	return ok && now.Sub(ts) <= suppressWindow
+}
+
+func (s *Store) EnsureProfileMixinFile() (string, error) {
+	return s.ensureProfileMixinInDir(s.ActiveConfigDir())
+}
+
+func (s *Store) ensureProfileMixinInDir(dir string) (string, error) {
+	namedPath := filepath.Join(dir, ProfileMixinNamedFile)
+	path := filepath.Join(dir, ProfileMixinDotFile)
+	if _, err := os.Stat(namedPath); err == nil {
+		path = namedPath
+	}
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) || (err == nil && IsLegacyUntouchedProfileMixin(raw)) {
+		s.MarkInternalWrite(path)
+		if writeErr := WriteFileAtomic(path, []byte(DefaultProfileMixinTemplate), 0600); writeErr != nil {
+			return "", writeErr
+		}
+	} else if err != nil {
+		return "", err
 	}
 	return path, nil
 }
@@ -412,11 +473,15 @@ func (s *Store) ensureDirResourcesLocked(dir string) error {
 	}
 	defaultCfg := filepath.Join(dir, "config.yaml")
 	if _, err := os.Stat(defaultCfg); os.IsNotExist(err) {
+		s.MarkInternalWrite(defaultCfg)
 		if err := WriteFileAtomic(defaultCfg, []byte(DefaultStarterConfigYAML), 0600); err != nil {
 			return err
 		}
 	}
 	if err := EnsureBuiltinRulesetFiles(dir); err != nil {
+		return err
+	}
+	if _, err := s.ensureProfileMixinInDir(dir); err != nil {
 		return err
 	}
 	if s.resourceDir != "" {
@@ -479,12 +544,18 @@ func (s *Store) WatchActiveConfigDir(onChange func(changedFile string)) error {
 				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) == 0 {
 					continue
 				}
+				if s.isRecentInternalWrite(ev.Name) {
+					continue
+				}
 				lastFile = ev.Name
 				if debounce != nil {
 					debounce.Stop()
 				}
 				captured := lastFile
 				debounce = time.AfterFunc(300*time.Millisecond, func() {
+					if s.isRecentInternalWrite(captured) {
+						return
+					}
 					if onChange != nil {
 						onChange(captured)
 					}

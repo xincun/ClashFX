@@ -380,7 +380,7 @@ func BuildProfileMixinYAML(baseYAML []byte, bypassCNWeb, bypassLAN bool, items [
 	}
 
 	if len(doc) == 0 {
-		return []byte(profile.DefaultProfileMixinTemplate), nil
+		return []byte(profile.DisabledProfileMixinTemplate), nil
 	}
 
 	marshaled, err := yaml.Marshal(doc)

@@ -42,8 +42,8 @@ const rulesState = {
   mixinPath: '',
   baseYaml: '',
   yamlText: '',
-  bypassCnWeb: false,
-  bypassLan: false,
+  bypassCnWeb: true,
+  bypassLan: true,
   rules: [],
   defaultTarget: 'Proxy',
   effectiveLoaded: false,
@@ -346,7 +346,7 @@ function sourceBadge(source = '') {
   if (s === 'system') return `<span class="pill pill-green">${t('系统守护', 'System')}</span>`;
   if (s === 'ai_lock') return `<span class="pill pill-purple">${t('AI 锁定', 'AI Lock')}</span>`;
   if (s === 'cn_apps') return `<span class="pill pill-blue">${t('CN 直连', 'CN Direct')}</span>`;
-  if (s === 'mixin') return `<span class="pill pill-amber">${t('Mixin 补丁', 'Mixin')}</span>`;
+  if (s === 'mixin') return `<span class="pill pill-amber">${t('自定义分流', 'Custom Routing')}</span>`;
   return `<span class="pill">${t('订阅规则', 'Profile')}</span>`;
 }
 
@@ -370,14 +370,14 @@ export async function renderRulesPage(root, initialSubTab = -1) {
   const headerHtml = `
     <div class="row-flex" style="justify-content:space-between;">
       <div class="row-flex">
-        <span class="pill pill-green">${t('切换订阅自动保留', 'Preserved Across Profiles')}</span>
-        ${rulesState.mixinDirty || rulesState.providerDirty ? `<span class="pill pill-amber">${t('有未保存改动', 'Unsaved Changes')}</span>` : ''}
+        <span class="pill pill-green">${t('全局覆写 · 切换订阅自动保留', 'Global Override · Kept Across Profiles')}</span>
+        <span class="pill pill-amber" id="rules-dirty-badge" ${rulesState.mixinDirty || rulesState.providerDirty ? '' : 'hidden'}>${t('有未保存改动', 'Unsaved Changes')}</span>
       </div>
       <div class="row-flex">
         <div class="subtabs">
-          <button type="button" class="subtab-btn ${rulesState.subTab === 0 ? 'active' : ''}" data-rule-tab="0">${t('可视化分流', 'Visual Mixin')}</button>
-          <button type="button" class="subtab-btn ${rulesState.subTab === 1 ? 'active' : ''}" data-rule-tab="1">${t('YAML 补丁源码', 'YAML Source')}</button>
-          <button type="button" class="subtab-btn ${rulesState.subTab === 2 ? 'active' : ''}" data-rule-tab="2">${t('当前生效与热更新', 'Live & .list Studio')} (${eff.total_rules || 0})</button>
+          <button type="button" class="subtab-btn ${rulesState.subTab === 0 ? 'active' : ''}" data-rule-tab="0">${t('自定义分流规则', 'Custom Routing')}</button>
+          <button type="button" class="subtab-btn ${rulesState.subTab === 1 ? 'active' : ''}" data-rule-tab="1">${t('全局 YAML 覆写', 'Global YAML Override')}</button>
+          <button type="button" class="subtab-btn ${rulesState.subTab === 2 ? 'active' : ''}" data-rule-tab="2">${t('生效规则与规则集', 'Active Rules & RuleSets')} (${eff.total_rules || 0})</button>
         </div>
         <button type="button" class="btn btn-sm btn-icon" id="rules-reload-btn" title="${t('重新加载', 'Refresh')}">${ICONS.refresh}</button>
       </div>
@@ -421,7 +421,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
         <div class="card card-tight row-flex" style="justify-content:space-between;">
           <div>
             <div class="form-label">${t('国内网站直连 (CN Web Direct)', 'Bypass China Web Traffic')}</div>
-            <div class="form-desc">${t('在 Mixin 末尾注入 GEOSITE,cn 与 GEOIP,cn 直连兜底', 'Append GEOSITE,cn and GEOIP,cn -> DIRECT')}</div>
+            <div class="form-desc">${t('自动直连大陆域名与 IP (GEOSITE,cn / GEOIP,cn)', 'Direct route for China domains & IPs (GEOSITE,cn / GEOIP,cn)')}</div>
           </div>
           <label class="switch">
             <input type="checkbox" id="mixin-cn-web" ${rulesState.bypassCnWeb ? 'checked' : ''} />
@@ -431,7 +431,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
         <div class="card card-tight row-flex" style="justify-content:space-between;">
           <div>
             <div class="form-label">${t('局域网及私有地址直连 (LAN Direct)', 'Bypass LAN & Private IP')}</div>
-            <div class="form-desc">${t('优先直连 GEOSITE,private 与 GEOIP,lan', 'Route GEOSITE,private & GEOIP,lan -> DIRECT')}</div>
+            <div class="form-desc">${t('自动直连内网与私有地址段 (GEOSITE,private / GEOIP,lan)', 'Direct route for LAN & private subnets (GEOSITE,private / GEOIP,lan)')}</div>
           </div>
           <label class="switch">
             <input type="checkbox" id="mixin-lan" ${rulesState.bypassLan ? 'checked' : ''} />
@@ -470,7 +470,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
 
       <div class="row-flex" style="justify-content:space-between;">
         <span class="metric-sub mono selectable">${esc(rulesState.mixinPath || snap.profile_mixin_path || '')}</span>
-        <button type="button" class="btn btn-primary" id="btn-save-visual-mixin">${ICONS.check} ${t('保存并应用 Mixin 补丁', 'Save & Apply Mixin')}</button>
+        <button type="button" class="btn btn-primary" id="btn-save-visual-mixin">${ICONS.check} ${t('保存分流规则', 'Save Routing Rules')}</button>
       </div>
     `;
   } else if (rulesState.subTab === 1) {
@@ -479,7 +479,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
         <span class="metric-sub mono selectable">${esc(rulesState.mixinPath || snap.profile_mixin_path || '')}</span>
         <div class="row-flex">
           <button type="button" class="btn btn-sm" id="btn-open-mixin-dir">${ICONS.folder} ${t('打开所在目录', 'Open Folder')}</button>
-          <button type="button" class="btn btn-sm btn-primary" id="btn-save-yaml-mixin">${ICONS.check} ${t('保存并应用 YAML', 'Save & Apply YAML')}</button>
+          <button type="button" class="btn btn-sm btn-primary" id="btn-save-yaml-mixin">${ICONS.check} ${t('保存 YAML 覆写', 'Save YAML Override')}</button>
         </div>
       </div>
       <textarea class="code-editor" id="mixin-yaml-editor" spellcheck="false">${esc(rulesState.yamlText)}</textarea>
@@ -530,7 +530,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
               <option value="system" ${rulesState.effSource === 'system' ? 'selected' : ''}>${t('系统守护', 'System')}</option>
               <option value="ai_lock" ${rulesState.effSource === 'ai_lock' ? 'selected' : ''}>${t('AI 锁定', 'AI Lock')}</option>
               <option value="cn_apps" ${rulesState.effSource === 'cn_apps' ? 'selected' : ''}>${t('CN 直连', 'CN Direct')}</option>
-              <option value="mixin" ${rulesState.effSource === 'mixin' ? 'selected' : ''}>${t('Mixin 补丁', 'Mixin')}</option>
+              <option value="mixin" ${rulesState.effSource === 'mixin' ? 'selected' : ''}>${t('自定义分流', 'Custom Routing')}</option>
               <option value="subscription" ${rulesState.effSource === 'subscription' ? 'selected' : ''}>${t('订阅规则', 'Profile')}</option>
             </select>
             <span class="pill">${filtered.length} / ${allEffRules.length}</span>
@@ -600,7 +600,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
         if (res.ok && res.data) rulesState.yamlText = res.data.yaml || rulesState.yamlText;
       } else if (rulesState.subTab === 1 && next === 0) {
         const res = await rpc('convert_profile_mixin', {
-          direction: 'to_structured',
+          direction: 'from_yaml',
           yaml: rulesState.yamlText,
         });
         if (res.ok && res.data) {
@@ -627,13 +627,51 @@ export async function renderRulesPage(root, initialSubTab = -1) {
   });
 
   if (rulesState.subTab === 0) {
+    const syncDirtyBadge = () => {
+      const badge = root.querySelector('#rules-dirty-badge');
+      if (badge) badge.hidden = !(rulesState.mixinDirty || rulesState.providerDirty);
+    };
+    const saveQuickBypassToggle = async (field, nextVal, labelOk) => {
+      const prevCn = rulesState.bypassCnWeb;
+      const prevLan = rulesState.bypassLan;
+      rulesState[field] = nextVal;
+      const cnEl = root.querySelector('#mixin-cn-web');
+      const lanEl = root.querySelector('#mixin-lan');
+      if (cnEl) cnEl.disabled = true;
+      if (lanEl) lanEl.disabled = true;
+      const res = await rpc('save_profile_mixin', {
+        mode: 'structured',
+        base_yaml: rulesState.baseYaml,
+        bypass_cn_web: rulesState.bypassCnWeb,
+        bypass_lan: rulesState.bypassLan,
+        rules: rulesState.rules,
+      });
+      if (res.ok) {
+        rulesState.mixinDirty = false;
+        rulesState.effectiveLoaded = false;
+        await ensureRulesDataLoaded(true);
+        showToast(labelOk, 'ok');
+      } else {
+        rulesState.bypassCnWeb = prevCn;
+        rulesState.bypassLan = prevLan;
+      }
+      renderRulesPage(root);
+    };
     root.querySelector('#mixin-cn-web')?.addEventListener('change', (e) => {
-      rulesState.bypassCnWeb = e.target.checked;
-      rulesState.mixinDirty = true;
+      const next = Boolean(e.target.checked);
+      saveQuickBypassToggle(
+        'bypassCnWeb',
+        next,
+        next ? t('已开启国内网站直连', 'CN Web Direct enabled') : t('已关闭国内网站直连', 'CN Web Direct disabled')
+      );
     });
     root.querySelector('#mixin-lan')?.addEventListener('change', (e) => {
-      rulesState.bypassLan = e.target.checked;
-      rulesState.mixinDirty = true;
+      const next = Boolean(e.target.checked);
+      saveQuickBypassToggle(
+        'bypassLan',
+        next,
+        next ? t('已开启局域网直连', 'LAN Direct enabled') : t('已关闭局域网直连', 'LAN Direct disabled')
+      );
     });
     const newTypeEl = root.querySelector('#new-rule-type');
     const newPayloadEl = root.querySelector('#new-rule-payload');
@@ -663,6 +701,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
         if (!rulesState.rules[idx]) return;
         rulesState.rules[idx][field] = el.value;
         rulesState.mixinDirty = true;
+        syncDirtyBadge();
       });
     });
     root.querySelectorAll('[data-rule-move]').forEach((btn) => {
@@ -699,20 +738,22 @@ export async function renderRulesPage(root, initialSubTab = -1) {
         rulesState.effectiveLoaded = false;
         await ensureRulesDataLoaded(true);
         renderRulesPage(root);
-        showToast(t('Mixin 分流补丁已保存并应用', 'Mixin patch saved and applied'), 'ok');
+        showToast(t('分流规则已保存并应用', 'Routing rules saved and applied'), 'ok');
       }
     });
   } else if (rulesState.subTab === 1) {
     root.querySelector('#mixin-yaml-editor')?.addEventListener('input', (e) => {
       rulesState.yamlText = e.target.value;
       rulesState.mixinDirty = true;
+      const badge = root.querySelector('#rules-dirty-badge');
+      if (badge) badge.hidden = false;
     });
     root.querySelector('#btn-open-mixin-dir')?.addEventListener('click', () => {
       if (snap.config_dir) native('open_path', { path: snap.config_dir });
     });
     root.querySelector('#btn-save-yaml-mixin')?.addEventListener('click', async () => {
       const res = await rpc('save_profile_mixin', {
-        mode: 'raw',
+        mode: 'yaml',
         yaml: rulesState.yamlText,
       });
       if (res.ok) {
@@ -720,7 +761,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
         rulesState.effectiveLoaded = false;
         await ensureRulesDataLoaded(true);
         renderRulesPage(root);
-        showToast(t('YAML 补丁源码已保存并应用', 'YAML Mixin saved and applied'), 'ok');
+        showToast(t('YAML 覆写已保存并应用', 'YAML override saved and applied'), 'ok');
       }
     });
   } else {

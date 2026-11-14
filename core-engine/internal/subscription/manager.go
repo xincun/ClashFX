@@ -299,6 +299,7 @@ func (m *Manager) Refresh(ctx context.Context, name string, directProxyPort int)
 	}
 
 	destPath := m.store.ProfilePath(finalName)
+	m.store.MarkInternalWrite(destPath)
 	if err := profile.WriteFileAtomic(destPath, yamlBytes, 0600); err != nil {
 		return ManagedSubscription{}, err
 	}
