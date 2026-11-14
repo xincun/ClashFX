@@ -451,6 +451,8 @@ html[data-platform="darwin"]:not([data-fullscreen="1"]) .sidebar {
 .main-column {
   flex: 1;
   min-width: 0;
+  position: relative;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -624,6 +626,17 @@ html[data-platform="darwin"]:not([data-fullscreen="1"]) .sidebar {
   flex-direction: column;
   overflow: hidden;
   background: var(--bg-canvas);
+}
+
+.console-host.is-inactive {
+  position: absolute;
+  top: 46px;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  visibility: hidden;
+  pointer-events: none;
+  z-index: -1;
 }
 
 .console-banner {

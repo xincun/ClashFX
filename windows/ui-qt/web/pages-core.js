@@ -47,14 +47,21 @@ const rulesState = {
   rules: [],
   defaultTarget: 'Proxy',
   effectiveLoaded: false,
+  effectiveKey: '',
   effective: null,
+  loadingMixin: false,
+  loadingEffective: false,
   effSearch: '',
   effSource: 'all',
+  effLimit: 250,
   selectedProvider: '',
   providerDraftText: '',
   providerDirty: false,
   editingRuleIdx: -1,
 };
+
+let rulesFetchSeq = 0;
+let lastRenderedRulesSubTab = -1;
 
 const subDraft = {
   url: '',
@@ -296,40 +303,137 @@ export function renderSubscriptionsPage(root) {
   });
 }
 
-async function ensureRulesDataLoaded(force = false) {
+function computeEffectiveKey() {
+  const snap = store.snapshot || {};
+  const s = snap.settings || {};
+  return [
+    store.connected ? '1' : '0',
+    snap.core_running ? '1' : '0',
+    s.selected_profile || '',
+    (s.outbound_mode || 'rule').toLowerCase(),
+    s.claudeProxyLockEnabled ? '1' : '0',
+    s.claudeProxyLockTarget || '',
+    s.bypass_cn_apps ? '1' : '0',
+  ].join('|');
+}
+
+function applyProfileMixinPayload(d, activeProfile) {
+  if (!d) return;
+  rulesState.loadedProfile = activeProfile;
+  rulesState.mixinPath = d.path || store.snapshot?.profile_mixin_path || '';
+  rulesState.yamlText = d.yaml || '';
+  rulesState.baseYaml = d.yaml || '';
+  rulesState.bypassCnWeb = Boolean(d.bypass_cn_web);
+  rulesState.bypassLan = Boolean(d.bypass_lan);
+  rulesState.rules = Array.isArray(d.rules) ? d.rules.map((r) => ({ ...r })) : [];
+  rulesState.defaultTarget = d.default_target || store.snapshot?.default_rule_target || 'Proxy';
+  rulesState.mixinDirty = false;
+}
+
+function applyEffectiveRulesPayload(data, key = computeEffectiveKey()) {
+  if (!data) return;
+  rulesState.effectiveLoaded = true;
+  rulesState.effectiveKey = key;
+  rulesState.effective = data;
+  const providers = Object.values(data.rule_providers || {}).filter((p) => p && (p.editable || p.raw_text));
+  if (providers.length && (!rulesState.selectedProvider || !data.rule_providers?.[rulesState.selectedProvider])) {
+    rulesState.selectedProvider = providers[0].name;
+    rulesState.providerDraftText = providers[0].raw_text || '';
+    rulesState.providerDirty = false;
+  } else if (rulesState.selectedProvider && !rulesState.providerDirty) {
+    const cur = data.rule_providers?.[rulesState.selectedProvider];
+    if (cur) rulesState.providerDraftText = cur.raw_text || '';
+  }
+}
+
+function isFocusedRulesEditor(root) {
+  const el = document.activeElement;
+  if (!el || !root || !root.contains(el)) return false;
+  if (el.id === 'eff-search') return false;
+  return (
+    el.id === 'mixin-yaml-editor' ||
+    el.id === 'prov-editor' ||
+    el.id === 'new-rule-payload' ||
+    el.hasAttribute('data-rule-field')
+  );
+}
+
+async function triggerRulesDataLoad(root, { force = false } = {}) {
   if (!store.connected) {
     rulesState.effectiveLoaded = false;
+    rulesState.effectiveKey = '';
+    rulesState.loadingMixin = false;
+    rulesState.loadingEffective = false;
     return;
   }
   const activeProfile = store.snapshot?.settings?.selected_profile || '';
-  if (force || (rulesState.loadedProfile !== activeProfile && !rulesState.mixinDirty)) {
-    const res = await rpc('get_profile_mixin', {}, { silent: true });
-    if (res.ok && res.data) {
-      const d = res.data;
-      rulesState.loadedProfile = activeProfile;
-      rulesState.mixinPath = d.path || store.snapshot?.profile_mixin_path || '';
-      rulesState.yamlText = d.yaml || '';
-      rulesState.baseYaml = d.yaml || '';
-      rulesState.bypassCnWeb = Boolean(d.bypass_cn_web);
-      rulesState.bypassLan = Boolean(d.bypass_lan);
-      rulesState.rules = Array.isArray(d.rules) ? d.rules.map((r) => ({ ...r })) : [];
-      rulesState.defaultTarget = d.default_target || store.snapshot?.default_rule_target || 'Proxy';
-      rulesState.mixinDirty = false;
-    }
+  const effKey = computeEffectiveKey();
+  const needMixin = force || (rulesState.loadedProfile !== activeProfile && !rulesState.mixinDirty);
+  const needEffective = force || !rulesState.effectiveLoaded || rulesState.effectiveKey !== effKey;
+  if (!needMixin && !needEffective) {
+    return;
   }
-  if (force || !rulesState.effectiveLoaded) {
-    const eff = await rpc('get_effective_rules', {}, { silent: true });
-    if (eff.ok && eff.data) {
-      rulesState.effectiveLoaded = true;
-      rulesState.effective = eff.data;
-      const providers = Object.values(eff.data.rule_providers || {}).filter((p) => p && (p.editable || p.raw_text));
-      if (providers.length && (!rulesState.selectedProvider || !eff.data.rule_providers?.[rulesState.selectedProvider])) {
-        rulesState.selectedProvider = providers[0].name;
-        rulesState.providerDraftText = providers[0].raw_text || '';
-        rulesState.providerDirty = false;
-      } else if (rulesState.selectedProvider && !rulesState.providerDirty) {
-        const cur = eff.data.rule_providers?.[rulesState.selectedProvider];
-        if (cur) rulesState.providerDraftText = cur.raw_text || '';
+  if (!force && ((needMixin && rulesState.loadingMixin) || !needMixin) && ((needEffective && rulesState.loadingEffective) || !needEffective)) {
+    return;
+  }
+
+  const seq = ++rulesFetchSeq;
+  if (needMixin) rulesState.loadingMixin = true;
+  if (needEffective) rulesState.loadingEffective = true;
+  const reloadBtn = root?.querySelector('#rules-reload-btn');
+  if (reloadBtn) reloadBtn.classList.add('spin');
+
+  const [mixinRes, effRes] = await Promise.all([
+    needMixin ? rpc('get_profile_mixin', {}, { silent: true }) : Promise.resolve(null),
+    needEffective ? rpc('get_effective_rules', {}, { silent: true }) : Promise.resolve(null),
+  ]);
+
+  if (seq === rulesFetchSeq) {
+    rulesState.loadingMixin = false;
+    rulesState.loadingEffective = false;
+  }
+
+  let updated = false;
+  if (mixinRes?.ok && mixinRes.data && (!rulesState.mixinDirty || force)) {
+    applyProfileMixinPayload(mixinRes.data, activeProfile);
+    updated = true;
+  }
+  if (effRes?.ok && effRes.data) {
+    applyEffectiveRulesPayload(effRes.data, effKey);
+    updated = true;
+  }
+
+  if (seq === rulesFetchSeq && store.page === 2) {
+    const activeEl = document.activeElement;
+    const keepSearchFocus = activeEl && root?.contains(activeEl) && activeEl.id === 'eff-search';
+    const selStart = keepSearchFocus ? activeEl.selectionStart : null;
+    const selEnd = keepSearchFocus ? activeEl.selectionEnd : null;
+
+    if (!updated) {
+      root?.querySelector('#rules-reload-btn')?.classList.remove('spin');
+      if (rulesState.subTab === 2 && !rulesState.effective) {
+        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+      }
+      return;
+    }
+
+    if (isFocusedRulesEditor(root)) {
+      root?.querySelector('#rules-reload-btn')?.classList.remove('spin');
+      const tab2 = root?.querySelector('[data-rule-tab="2"]');
+      if (tab2) {
+        tab2.textContent = `${t('生效规则与规则集', 'Active Rules & RuleSets')} (${rulesState.effective?.total_rules || 0})`;
+      }
+      return;
+    }
+
+    renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+    if (keepSearchFocus) {
+      const next = root.querySelector('#eff-search');
+      if (next) {
+        next.focus();
+        if (selStart !== null && selEnd !== null) {
+          next.setSelectionRange(selStart, selEnd);
+        }
       }
     }
   }
@@ -351,11 +455,17 @@ function sourceBadge(source = '') {
   return `<span class="pill">${t('订阅规则', 'Profile')}</span>`;
 }
 
-export async function renderRulesPage(root, initialSubTab = -1) {
+export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, preserveScroll = false } = {}) {
   if (initialSubTab >= 0 && initialSubTab <= 2) {
+    if (rulesState.subTab !== initialSubTab) {
+      rulesState.effLimit = 250;
+    }
     rulesState.subTab = initialSubTab;
   }
-  await ensureRulesDataLoaded(false);
+
+  const prevWrap =
+    preserveScroll && lastRenderedRulesSubTab === rulesState.subTab ? root.querySelector('.table-wrap') : null;
+  const prevScrollTop = prevWrap ? prevWrap.scrollTop : 0;
 
   const snap = store.snapshot || {};
   const groups = Array.isArray(snap.proxy_groups) ? snap.proxy_groups.map((g) => g.name) : [];
@@ -367,6 +477,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
     rulesState.selectedProvider = activeProv.name;
     rulesState.providerDraftText = activeProv.raw_text || '';
   }
+  const isBusy = rulesState.loadingMixin || rulesState.loadingEffective;
 
   const headerHtml = `
     <div class="row-flex" style="justify-content:space-between;">
@@ -380,7 +491,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
           <button type="button" class="subtab-btn ${rulesState.subTab === 1 ? 'active' : ''}" data-rule-tab="1">${t('全局 YAML 覆写', 'Global YAML Override')}</button>
           <button type="button" class="subtab-btn ${rulesState.subTab === 2 ? 'active' : ''}" data-rule-tab="2">${t('生效规则与规则集', 'Active Rules & RuleSets')} (${eff.total_rules || 0})</button>
         </div>
-        <button type="button" class="btn btn-sm btn-icon" id="rules-reload-btn" title="${t('重新加载', 'Refresh')}">${ICONS.refresh}</button>
+        <button type="button" class="btn btn-sm btn-icon ${isBusy ? 'spin' : ''}" id="rules-reload-btn" title="${t('重新加载', 'Refresh')}">${ICONS.refresh}</button>
       </div>
     </div>`;
 
@@ -494,8 +605,29 @@ export async function renderRulesPage(root, initialSubTab = -1) {
       return `${r.type} ${r.payload} ${r.proxy} ${r.source}`.toLowerCase().includes(q);
     });
 
-    const effRowsHtml = filtered.length
-      ? filtered
+    const shown = filtered.slice(0, rulesState.effLimit);
+    const remaining = filtered.length - shown.length;
+    const moreRowHtml =
+      remaining > 0
+        ? `<tr><td colspan="6" style="text-align:center;padding:10px;">
+            <div class="row-flex" style="justify-content:center;">
+              <button type="button" class="btn btn-sm" id="eff-show-more">${t(`显示更多 (${shown.length} / ${filtered.length})`, `Show More (${shown.length} / ${filtered.length})`)}</button>
+              ${
+                filtered.length <= 3000
+                  ? `<button type="button" class="btn btn-sm btn-ghost" id="eff-show-all">${t(`显示全部 (${filtered.length})`, `Show All (${filtered.length})`)}</button>`
+                  : ''
+              }
+            </div>
+          </td></tr>`
+        : '';
+
+    const emptyEffText =
+      rulesState.loadingEffective && !rulesState.effective
+        ? t('正在加载生效规则…', 'Loading effective rules…')
+        : t('无匹配的生效规则', 'No matching runtime rules');
+
+    const effRowsHtml = shown.length
+      ? shown
           .map((r) => {
             const isSetMatch =
               r.type === 'RuleSet' &&
@@ -513,8 +645,8 @@ export async function renderRulesPage(root, initialSubTab = -1) {
               <td class="mono" style="width:90px;text-align:right;color:var(--text-secondary);">${r.hit_count ?? 0} / ${r.miss_count ?? 0}</td>
             </tr>`;
           })
-          .join('')
-      : `<tr><td colspan="6" class="empty-state">${t('无匹配的生效规则', 'No matching runtime rules')}</td></tr>`;
+          .join('') + moreRowHtml
+      : `<tr><td colspan="6" class="empty-state">${emptyEffText}</td></tr>`;
 
     const provRuleCount = activeProv ? activeProv.rule_count || countListLines(rulesState.providerDraftText) : 0;
 
@@ -584,46 +716,72 @@ export async function renderRulesPage(root, initialSubTab = -1) {
   }
 
   root.innerHTML = `<div class="rules-shell">${headerHtml}${bodyHtml}</div>`;
+  lastRenderedRulesSubTab = rulesState.subTab;
+  if (prevScrollTop > 0) {
+    const nextWrap = root.querySelector('.table-wrap');
+    if (nextWrap) nextWrap.scrollTop = prevScrollTop;
+  }
 
-  // Sub-tab switch with bidirectional Visual <-> YAML conversion
+  // Sub-tab switch: update UI immediately (<1ms) and convert/load async in background
   root.querySelectorAll('[data-rule-tab]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
+    btn.addEventListener('click', () => {
+      const prevTab = rulesState.subTab;
       const next = Number(btn.getAttribute('data-rule-tab'));
-      if (next === rulesState.subTab) return;
-      if (rulesState.subTab === 0 && next === 1) {
-        const res = await rpc('convert_profile_mixin', {
-          direction: 'to_yaml',
-          yaml: rulesState.baseYaml,
-          bypass_cn_web: rulesState.bypassCnWeb,
-          bypass_lan: rulesState.bypassLan,
-          rules: rulesState.rules,
-        });
-        if (res.ok && res.data) rulesState.yamlText = res.data.yaml || rulesState.yamlText;
-      } else if (rulesState.subTab === 1 && next === 0) {
-        const res = await rpc('convert_profile_mixin', {
-          direction: 'from_yaml',
-          yaml: rulesState.yamlText,
-        });
-        if (res.ok && res.data) {
-          rulesState.bypassCnWeb = Boolean(res.data.bypass_cn_web);
-          rulesState.bypassLan = Boolean(res.data.bypass_lan);
-          rulesState.rules = Array.isArray(res.data.rules) ? res.data.rules : [];
-          rulesState.baseYaml = rulesState.yamlText;
-        }
-      }
+      if (next === prevTab) return;
       rulesState.subTab = next;
-      if (next === 2) {
-        await ensureRulesDataLoaded(true);
+      rulesState.effLimit = 250;
+      renderRulesPage(root, -1, { skipFetch: true });
+
+      if (prevTab === 0 && next === 1) {
+        rpc(
+          'convert_profile_mixin',
+          {
+            direction: 'to_yaml',
+            yaml: rulesState.baseYaml,
+            bypass_cn_web: rulesState.bypassCnWeb,
+            bypass_lan: rulesState.bypassLan,
+            rules: rulesState.rules,
+          },
+          { silent: true }
+        ).then((res) => {
+          if (res.ok && res.data && !rulesState.mixinDirty && store.page === 2 && rulesState.subTab === 1) {
+            rulesState.yamlText = res.data.yaml || rulesState.yamlText;
+            const ed = root.querySelector('#mixin-yaml-editor');
+            if (ed && document.activeElement !== ed) ed.value = rulesState.yamlText;
+          }
+        });
+      } else if (prevTab === 1 && next === 0) {
+        rpc(
+          'convert_profile_mixin',
+          {
+            direction: 'from_yaml',
+            yaml: rulesState.yamlText,
+          },
+          { silent: true }
+        ).then((res) => {
+          if (res.ok && res.data) {
+            rulesState.bypassCnWeb = Boolean(res.data.bypass_cn_web);
+            rulesState.bypassLan = Boolean(res.data.bypass_lan);
+            rulesState.rules = Array.isArray(res.data.rules) ? res.data.rules : [];
+            rulesState.baseYaml = rulesState.yamlText;
+            if (store.page === 2 && rulesState.subTab === 0 && !isFocusedRulesEditor(root)) {
+              renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+            }
+          }
+        });
       }
-      renderRulesPage(root);
+      if (next === 2) {
+        triggerRulesDataLoad(root, { force: false });
+      }
     });
   });
 
   root.querySelector('#rules-reload-btn')?.addEventListener('click', async () => {
     rulesState.mixinDirty = false;
     rulesState.providerDirty = false;
-    await ensureRulesDataLoaded(true);
-    renderRulesPage(root);
+    rulesState.effectiveLoaded = false;
+    rulesState.effectiveKey = '';
+    await triggerRulesDataLoad(root, { force: true });
     showToast(t('规则状态已刷新', 'Rules reloaded'), 'ok');
   });
 
@@ -650,13 +808,16 @@ export async function renderRulesPage(root, initialSubTab = -1) {
       if (res.ok) {
         rulesState.mixinDirty = false;
         rulesState.effectiveLoaded = false;
-        await ensureRulesDataLoaded(true);
+        rulesState.effectiveKey = '';
+        if (res.data) applyProfileMixinPayload(res.data, store.snapshot?.settings?.selected_profile || '');
         showToast(labelOk, 'ok');
+        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+        triggerRulesDataLoad(root, { force: true });
       } else {
         rulesState.bypassCnWeb = prevCn;
         rulesState.bypassLan = prevLan;
+        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
       }
-      renderRulesPage(root);
     };
     root.querySelector('#mixin-cn-web')?.addEventListener('change', (e) => {
       const next = Boolean(e.target.checked);
@@ -692,7 +853,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
       }
       rulesState.rules.unshift({ type, payload: type === 'MATCH' ? '' : payload, target });
       rulesState.mixinDirty = true;
-      renderRulesPage(root);
+      renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
     });
     root.querySelectorAll('[data-rule-field]').forEach((el) => {
       const ev = el.tagName === 'INPUT' ? 'input' : 'change';
@@ -715,7 +876,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
         rulesState.rules[idx] = rulesState.rules[targetIdx];
         rulesState.rules[targetIdx] = tmp;
         rulesState.mixinDirty = true;
-        renderRulesPage(root);
+        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
       });
     });
     root.querySelectorAll('[data-rule-del]').forEach((btn) => {
@@ -723,7 +884,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
         const idx = Number(btn.getAttribute('data-rule-del'));
         rulesState.rules.splice(idx, 1);
         rulesState.mixinDirty = true;
-        renderRulesPage(root);
+        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
       });
     });
     root.querySelector('#btn-save-visual-mixin')?.addEventListener('click', async () => {
@@ -737,8 +898,10 @@ export async function renderRulesPage(root, initialSubTab = -1) {
       if (res.ok) {
         rulesState.mixinDirty = false;
         rulesState.effectiveLoaded = false;
-        await ensureRulesDataLoaded(true);
-        renderRulesPage(root);
+        rulesState.effectiveKey = '';
+        if (res.data) applyProfileMixinPayload(res.data, store.snapshot?.settings?.selected_profile || '');
+        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+        triggerRulesDataLoad(root, { force: true });
         showToast(t('分流规则已保存并应用', 'Routing rules saved and applied'), 'ok');
       }
     });
@@ -760,8 +923,10 @@ export async function renderRulesPage(root, initialSubTab = -1) {
       if (res.ok) {
         rulesState.mixinDirty = false;
         rulesState.effectiveLoaded = false;
-        await ensureRulesDataLoaded(true);
-        renderRulesPage(root);
+        rulesState.effectiveKey = '';
+        if (res.data) applyProfileMixinPayload(res.data, store.snapshot?.settings?.selected_profile || '');
+        renderRulesPage(root, -1, { skipFetch: true });
+        triggerRulesDataLoad(root, { force: true });
         showToast(t('YAML 覆写已保存并应用', 'YAML override saved and applied'), 'ok');
       }
     });
@@ -769,8 +934,9 @@ export async function renderRulesPage(root, initialSubTab = -1) {
     const effSearchEl = root.querySelector('#eff-search');
     effSearchEl?.addEventListener('input', (e) => {
       rulesState.effSearch = e.target.value;
+      rulesState.effLimit = 250;
       const caret = e.target.selectionStart;
-      renderRulesPage(root);
+      renderRulesPage(root, -1, { skipFetch: true });
       const next = root.querySelector('#eff-search');
       if (next) {
         next.focus();
@@ -779,7 +945,17 @@ export async function renderRulesPage(root, initialSubTab = -1) {
     });
     root.querySelector('#eff-source')?.addEventListener('change', (e) => {
       rulesState.effSource = e.target.value;
-      renderRulesPage(root);
+      rulesState.effLimit = 250;
+      renderRulesPage(root, -1, { skipFetch: true });
+    });
+    root.querySelector('#eff-show-more')?.addEventListener('click', () => {
+      rulesState.effLimit += 500;
+      renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+    });
+    root.querySelector('#eff-show-all')?.addEventListener('click', () => {
+      const allCount = Array.isArray(eff.rules) ? eff.rules.length : 0;
+      rulesState.effLimit = Math.max(rulesState.effLimit, allCount);
+      renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
     });
     root.querySelectorAll('[data-rule-enable]').forEach((cb) => {
       cb.addEventListener('click', (e) => e.stopPropagation());
@@ -787,8 +963,8 @@ export async function renderRulesPage(root, initialSubTab = -1) {
         const index = Number(cb.getAttribute('data-rule-enable'));
         const res = await rpc('set_rule_disabled', { indices: [index], disabled: !e.target.checked });
         if (res.ok) {
-          await ensureRulesDataLoaded(true);
-          renderRulesPage(root);
+          if (res.data) applyEffectiveRulesPayload(res.data);
+          renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
           showToast(e.target.checked ? t('规则已启用', 'Rule enabled') : t('规则已禁用', 'Rule disabled'), 'ok');
         }
       });
@@ -801,7 +977,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
           rulesState.selectedProvider = matched.name;
           rulesState.providerDraftText = matched.raw_text || '';
           rulesState.providerDirty = false;
-          renderRulesPage(root);
+          renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
         }
       });
     });
@@ -811,7 +987,7 @@ export async function renderRulesPage(root, initialSubTab = -1) {
       rulesState.selectedProvider = nextName;
       rulesState.providerDraftText = matched?.raw_text || '';
       rulesState.providerDirty = false;
-      renderRulesPage(root);
+      renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
     });
     root.querySelector('#prov-editor')?.addEventListener('input', (e) => {
       rulesState.providerDraftText = e.target.value;
@@ -832,8 +1008,8 @@ export async function renderRulesPage(root, initialSubTab = -1) {
       const res = await rpc('reset_rule_provider', { provider_name: activeProv.name });
       if (res.ok) {
         rulesState.providerDirty = false;
-        await ensureRulesDataLoaded(true);
-        renderRulesPage(root);
+        if (res.data) applyEffectiveRulesPayload(res.data);
+        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
         showToast(t('已恢复内置默认并热更新', 'Restored default and reloaded'), 'ok');
       }
     });
@@ -845,10 +1021,14 @@ export async function renderRulesPage(root, initialSubTab = -1) {
       });
       if (res.ok) {
         rulesState.providerDirty = false;
-        await ensureRulesDataLoaded(true);
-        renderRulesPage(root);
+        if (res.data) applyEffectiveRulesPayload(res.data);
+        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
         showToast(t(`规则集「${activeProv.name}」已保存并零断流热更新`, `Hot-reloaded "${activeProv.name}"`), 'ok');
       }
     });
+  }
+
+  if (!skipFetch) {
+    triggerRulesDataLoad(root, { force: false });
   }
 }

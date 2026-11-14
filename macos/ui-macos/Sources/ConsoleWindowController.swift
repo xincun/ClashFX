@@ -376,28 +376,115 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
 
     func collectSmokeDomSummary(completion: @escaping ([String: Any]) -> Void) {
         let js = """
-        (function() {
-          var navBtns = document.querySelectorAll('.nav-item');
-          var activeBtn = document.querySelector('.nav-item.active');
-          var chip = document.getElementById('topbar-chip');
-          var frame = document.getElementById('metacubexd-frame');
-          var standby = document.getElementById('console-standby');
-          return {
-            platformAttr: document.documentElement ? document.documentElement.getAttribute('data-platform') : '',
-            navCount: navBtns ? navBtns.length : 0,
-            activeNavText: activeBtn ? String(activeBtn.textContent || '').trim() : '',
-            chipText: chip ? String(chip.textContent || '').trim() : '',
-            iframeSrc: frame ? String(frame.getAttribute('src') || frame.src || '') : '',
-            standbyHidden: standby ? Boolean(standby.hidden) : false,
-            bodyLen: document.body ? document.body.innerHTML.length : 0
-          };
-        })();
+        var navBtns = document.querySelectorAll('.nav-item');
+        var activeBtn = document.querySelector('.nav-item.active');
+        var chip = document.getElementById('topbar-chip');
+        var frame = document.getElementById('metacubexd-frame');
+        var standby = document.getElementById('console-standby');
+        var summary = {
+          platformAttr: document.documentElement ? document.documentElement.getAttribute('data-platform') : '',
+          navCount: navBtns ? navBtns.length : 0,
+          activeNavText: activeBtn ? String(activeBtn.textContent || '').trim() : '',
+          chipText: chip ? String(chip.textContent || '').trim() : '',
+          iframeSrc: frame ? String(frame.getAttribute('src') || frame.src || '') : '',
+          standbyHidden: standby ? Boolean(standby.hidden) : false,
+          bodyLen: document.body ? document.body.innerHTML.length : 0
+        };
+
+        var sleep = function(ms) {
+          return new Promise(function(resolve) { setTimeout(resolve, ms); });
+        };
+
+        var sequence = [1, 2, 3, 4, 5, 6, 2];
+        var maxTabPaintMs = 0;
+        var tabLatenciesMs = {};
+        var renderedOk = true;
+        var pageEl = document.getElementById('page-content');
+        var consoleHost = document.getElementById('console-host');
+
+        for (var i = 0; i < sequence.length; i++) {
+          var navId = sequence[i];
+          var btn = document.querySelector('.nav-item[data-nav-id="' + navId + '"]');
+          if (!btn) {
+            renderedOk = false;
+            continue;
+          }
+          var t0 = performance.now();
+          btn.click();
+          var dt = Math.round((performance.now() - t0) * 100) / 100;
+          tabLatenciesMs[String(navId)] = dt;
+          if (dt > maxTabPaintMs) maxTabPaintMs = dt;
+
+          var curActive = document.querySelector('.nav-item.active');
+          var activeId = curActive ? curActive.getAttribute('data-nav-id') : '';
+          var hasPageContent = pageEl ? String(pageEl.innerHTML || '').trim().length > 0 : false;
+          var consoleInactive = consoleHost ? consoleHost.classList.contains('is-inactive') : true;
+          if (activeId !== String(navId) || !hasPageContent || !consoleInactive) {
+            renderedOk = false;
+          }
+          await sleep(16);
+        }
+
+        var effTabBtn = document.querySelector('[data-rule-tab="2"]');
+        if (effTabBtn) {
+          var rt0 = performance.now();
+          effTabBtn.click();
+          var rdt = Math.round((performance.now() - rt0) * 100) / 100;
+          tabLatenciesMs['ruleTab2'] = rdt;
+          if (rdt > maxTabPaintMs) maxTabPaintMs = rdt;
+        } else {
+          renderedOk = false;
+        }
+
+        var rulesSubTabCountText = '';
+        var rulesRowCount = 0;
+        var deadline = performance.now() + 1500;
+        while (performance.now() < deadline) {
+          var liveTab = document.querySelector('[data-rule-tab="2"]');
+          rulesSubTabCountText = liveTab ? String(liveTab.textContent || '').trim() : '';
+          var rows = document.querySelectorAll('#page-content tbody tr[data-eff-row-type]');
+          rulesRowCount = rows ? rows.length : 0;
+          if (rulesRowCount > 0 && rulesSubTabCountText && rulesSubTabCountText.indexOf('(0)') === -1) {
+            break;
+          }
+          await sleep(50);
+        }
+        if (rulesRowCount === 0) {
+          renderedOk = false;
+        }
+
+        var homeBtn = document.querySelector('.nav-item[data-nav-id="0"]');
+        if (homeBtn) {
+          var h0 = performance.now();
+          homeBtn.click();
+          var hdt = Math.round((performance.now() - h0) * 100) / 100;
+          tabLatenciesMs['0'] = hdt;
+          if (hdt > maxTabPaintMs) maxTabPaintMs = hdt;
+          var homeConsoleInactive = consoleHost ? consoleHost.classList.contains('is-inactive') : true;
+          if (homeConsoleInactive) {
+            renderedOk = false;
+          }
+        } else {
+          renderedOk = false;
+        }
+
+        summary.maxTabPaintMs = maxTabPaintMs;
+        summary.tabLatenciesMs = tabLatenciesMs;
+        summary.rulesSubTabCountText = rulesSubTabCountText;
+        summary.rulesRowCount = rulesRowCount;
+        summary.allTabsRendered = renderedOk;
+        return summary;
         """
-        webView.evaluateJavaScript(js) { value, err in
-            if let dict = value as? [String: Any] {
-                completion(dict)
-            } else {
-                completion(["evalError": err?.localizedDescription ?? "unknown"])
+        webView.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { result in
+            switch result {
+            case .success(let value):
+                if let dict = value as? [String: Any] {
+                    completion(dict)
+                } else {
+                    completion(["evalError": "unexpected return type"])
+                }
+            case .failure(let error):
+                completion(["evalError": error.localizedDescription])
             }
         }
     }

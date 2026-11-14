@@ -131,12 +131,15 @@ type Engine struct {
 	coreViaService    bool
 	suspendedByNet    string
 	lastApplyErr      string
+	cachedNetSig      features.ActiveNetworkSignature
+	cachedNetSigAt    time.Time
 	proxyGroupsMu     sync.RWMutex
 	proxyGroups       []ProxyGroupView
 	defaultRuleTarget string
 	aiCandidates      []ailock.CandidateNode
 	aiRelay           string
 	providerSubInfo   *subscription.UserInfo
+	logsDir           string
 
 	stopBgCh   chan struct{}
 	stopPower  func()
@@ -175,6 +178,8 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 	sysProxy := sysproxy.NewManager(store.AppDataDir(), nil)
 	nodeStore := nodeservices.NewStore(store.AppDataDir())
 	localRunner := service.NewRunner(cfg.BinDir)
+	logsDir := filepath.Join(store.AppDataDir(), "logs")
+	_ = os.MkdirAll(logsDir, 0700)
 
 	eng := &Engine{
 		cfg:         cfg,
@@ -184,6 +189,7 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 		nodeStore:   nodeStore,
 		localRunner: localRunner,
 		coreHelper:  helper,
+		logsDir:     logsDir,
 		stopBgCh:    make(chan struct{}),
 		onPush:      onPush,
 	}
@@ -513,10 +519,38 @@ func (e *Engine) replaySavedSelections(ctx context.Context, apiPort int, secret 
 	}
 }
 
+func cloneNetworkSignature(sig features.ActiveNetworkSignature) features.ActiveNetworkSignature {
+	return features.ActiveNetworkSignature{
+		ProfileNames: append([]string(nil), sig.ProfileNames...),
+		Interfaces:   append([]string(nil), sig.Interfaces...),
+		DNSSuffixes:  append([]string(nil), sig.DNSSuffixes...),
+		Gateways:     append([]string(nil), sig.Gateways...),
+	}
+}
+
+func (e *Engine) currentNetworkSignature(forceRefresh bool) features.ActiveNetworkSignature {
+	if !forceRefresh {
+		e.statusMu.RLock()
+		if !e.cachedNetSigAt.IsZero() && time.Since(e.cachedNetSigAt) < 15*time.Second {
+			cached := cloneNetworkSignature(e.cachedNetSig)
+			e.statusMu.RUnlock()
+			return cached
+		}
+		e.statusMu.RUnlock()
+	}
+
+	sig := features.DetectActiveNetworkSignature()
+	e.statusMu.Lock()
+	e.cachedNetSig = cloneNetworkSignature(sig)
+	e.cachedNetSigAt = time.Now()
+	e.statusMu.Unlock()
+	return sig
+}
+
 func (e *Engine) reconcileSystemProxy() {
 	settings := e.store.Settings()
 	rt := e.ctrl.LastState()
-	sig := features.DetectActiveNetworkSignature()
+	sig := e.currentNetworkSignature(true)
 	matchedRule, shouldSuspend := features.MatchSuspendNetwork(sig, settings.SuspendNetworks)
 	if settings.AILockEnabled {
 		// AI Proxy Lock never suspends system proxy on network matches!
@@ -785,7 +819,7 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 	rt := e.ctrl.LastState()
 	profiles, _ := e.store.ListProfiles()
 	nsSnap, _ := e.nodeCoord.Snapshot(settings.SelectedProfile)
-	sig := features.DetectActiveNetworkSignature()
+	sig := e.currentNetworkSignature(false)
 
 	e.proxyGroupsMu.RLock()
 	groups := append([]ProxyGroupView(nil), e.proxyGroups...)
@@ -808,18 +842,23 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 	suspended := e.suspendedByNet
 	viaSvc := e.coreViaService
 	lastErr := e.lastApplyErr
+	logsDir := e.logsDir
 	e.statusMu.RUnlock()
+	if logsDir == "" {
+		logsDir = filepath.Join(e.store.AppDataDir(), "logs")
+		_ = os.MkdirAll(logsDir, 0700)
+	}
 
-	logsDir := filepath.Join(e.store.AppDataDir(), "logs")
-	_ = os.MkdirAll(logsDir, 0700)
+	coreRunning := e.IsCoreRunning()
+	svcInstalled := (viaSvc && coreRunning) || IsPrivilegedServiceInstalled(service.ServiceName)
 
 	return DaemonSnapshot{
 		Version:                AppVersion,
 		Platform:               runtime.GOOS,
 		Arch:                   runtime.GOARCH,
-		CoreRunning:            e.IsCoreRunning(),
+		CoreRunning:            coreRunning,
 		CoreViaService:         viaSvc,
-		ServiceInstalled:       IsPrivilegedServiceInstalled(service.ServiceName),
+		ServiceInstalled:       svcInstalled,
 		Settings:               settings,
 		Runtime:                rt,
 		DashboardURL:           buildDashboardURL(rt.APIPort, rt.APISecret),

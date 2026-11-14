@@ -44,6 +44,151 @@ const consoleTools = document.getElementById('console-topbar-tools');
 let pendingPageRender = false;
 let renderSeq = 0;
 let loadedConsoleKey = '';
+let sidebarNavBuilt = false;
+let sidebarDockBuilt = false;
+let dockProfileSig = '';
+let lastPageSig = '';
+
+function ensureSidebarNavBuilt(navEl) {
+  if (!navEl || sidebarNavBuilt) return;
+  navEl.innerHTML = PAGES.map(
+    (p) => `
+      <button type="button" class="nav-item" data-nav-id="${p.id}">
+        ${ICONS[p.icon]}
+        <span class="nav-label"></span>
+        <span class="nav-trailing" hidden></span>
+      </button>`
+  ).join('');
+  navEl.querySelectorAll('[data-nav-id]').forEach((btn) => {
+    btn.addEventListener('click', () => go(Number(btn.getAttribute('data-nav-id'))));
+  });
+  sidebarNavBuilt = true;
+}
+
+function ensureSidebarDockBuilt(dockEl) {
+  if (!dockEl || sidebarDockBuilt) return;
+  dockEl.innerHTML = `
+    <div class="dock-row-grid">
+      <button type="button" class="dock-toggle-card" id="dock-sys-btn">
+        <div class="dock-toggle-top">
+          <span class="dock-toggle-label" id="dock-sys-label"></span>
+          <span class="mini-pill"></span>
+        </div>
+        <span class="dock-toggle-sub" id="dock-sys-sub"></span>
+      </button>
+
+      <button type="button" class="dock-toggle-card" id="dock-tun-btn">
+        <div class="dock-toggle-top">
+          <span class="dock-toggle-label" id="dock-tun-label"></span>
+          <span class="mini-pill"></span>
+        </div>
+        <span class="dock-toggle-sub" id="dock-tun-sub"></span>
+      </button>
+    </div>
+
+    <div class="dock-profile-box">
+      <div class="dock-profile-head">
+        <span id="dock-profile-label"></span>
+        <span class="dock-speed-inline" id="dock-speed">↑ 0 B/s · ↓ 0 B/s</span>
+      </div>
+      <div class="dock-profile-controls">
+        <select class="select select-sm" id="dock-profile-select"></select>
+        <button type="button" class="btn btn-sm btn-icon" id="dock-refresh-sub">${ICONS.refresh}</button>
+      </div>
+    </div>
+  `;
+
+  dockEl.querySelector('#dock-sys-btn')?.addEventListener('click', () => {
+    const cur = Boolean(store.snapshot?.settings?.system_proxy_enabled);
+    rpc('set_system_proxy', { enabled: !cur });
+  });
+  dockEl.querySelector('#dock-tun-btn')?.addEventListener('click', () => {
+    const cur = Boolean(store.snapshot?.settings?.enhanced_mode);
+    rpc('set_enhanced_mode', { enabled: !cur });
+  });
+  dockEl.querySelector('#dock-profile-select')?.addEventListener('change', async (e) => {
+    const name = e.target.value;
+    const res = await rpc('select_profile', { name });
+    if (res.ok) showToast(t(`已切换配置: ${name}`, `Active profile: ${name}`), 'ok');
+  });
+  dockEl.querySelector('#dock-refresh-sub')?.addEventListener('click', async () => {
+    const snapNow = store.snapshot || {};
+    const profNow = snapNow.settings?.selected_profile || 'config';
+    const hasSub = (snapNow.subscriptions || []).some((s) => s.name === profNow);
+    const res = hasSub
+      ? await rpc('refresh_subscription', { name: profNow })
+      : await rpc('reload_config', {});
+    if (res.ok) {
+      showToast(hasSub ? t(`订阅「${profNow}」已更新`, `Updated "${profNow}"`) : t('配置已重载', 'Config reloaded'), 'ok');
+    }
+  });
+  sidebarDockBuilt = true;
+}
+
+function computePageRenderSignature() {
+  const snap = store.snapshot || {};
+  const settings = snap.settings || {};
+  switch (store.page) {
+    case 0:
+      return 'console';
+    case 1:
+      return JSON.stringify([
+        store.connected,
+        store.language,
+        settings.selected_profile || '',
+        snap.config_dir || '',
+        snap.profiles || [],
+        snap.subscriptions || [],
+      ]);
+    case 2:
+      return JSON.stringify([
+        store.connected,
+        store.language,
+        Boolean(snap.core_running),
+        settings.selected_profile || '',
+        settings.outbound_mode || 'rule',
+        Boolean(settings.claudeProxyLockEnabled),
+        settings.claudeProxyLockTarget || '',
+        Boolean(settings.bypass_cn_apps),
+        snap.profile_mixin_path || '',
+        snap.default_rule_target || '',
+        (snap.proxy_groups || []).map((g) => g.name),
+      ]);
+    case 3:
+      return JSON.stringify([
+        store.connected,
+        store.language,
+        Boolean(settings.claudeProxyLockEnabled),
+        settings.claudeProxyLockTarget || '',
+        snap.ai_lock_relay || '',
+        snap.ai_lock_candidates || [],
+        snap.proxy_groups || [],
+      ]);
+    case 4:
+      return JSON.stringify([store.connected, store.language, snap.node_services || null]);
+    case 5:
+      return JSON.stringify([
+        store.connected,
+        store.language,
+        snap.logs_dir || '',
+        snap.active_network || null,
+        (snap.ai_lock_candidates || []).map((c) => c.name),
+        (snap.proxy_groups || []).map((g) => [g.name, (g.items || []).map((i) => i.name)]),
+      ]);
+    case 6:
+      return JSON.stringify([
+        store.connected,
+        store.language,
+        store.theme,
+        snap.version || '',
+        snap.config_dir || '',
+        snap.active_network || null,
+        settings,
+      ]);
+    default:
+      return '';
+  }
+}
 
 function isUserTypingInPage() {
   const el = document.activeElement;
@@ -110,86 +255,85 @@ function renderChrome() {
     btn.classList.toggle('active', mode === m);
   });
 
-  // Sidebar Navigation
+  // Sidebar Navigation (in-place updates to preserve nodes and avoid DOM rebuild lag)
   const navEl = document.getElementById('sidebar-nav');
   if (navEl) {
-    navEl.innerHTML = PAGES.map((p) => {
-      const active = store.page === p.id;
-      let trailing = '';
-      if (p.id === 0) trailing = `<span class="nav-count">XD</span>`;
-      else if (p.id === 3 && aiOn) trailing = `<span class="nav-dot" title="AI Lock Active"></span>`;
-      else if (p.id === 1 && subsCount > 0) trailing = `<span class="nav-count">${subsCount}</span>`;
-      else if (p.id === 4 && snap.node_services?.settings?.ports_enabled && nsCount > 0) trailing = `<span class="nav-count">${nsCount}</span>`;
-      return `
-        <button type="button" class="nav-item ${active ? 'active' : ''}" data-nav-id="${p.id}">
-          ${ICONS[p.icon]}
-          <span class="nav-label">${esc(t(p.zh, p.en))}</span>
-          ${trailing}
-        </button>`;
-    }).join('');
-    navEl.querySelectorAll('[data-nav-id]').forEach((btn) => {
-      btn.addEventListener('click', () => go(Number(btn.getAttribute('data-nav-id'))));
-    });
+    ensureSidebarNavBuilt(navEl);
+    for (const p of PAGES) {
+      const btn = navEl.querySelector(`[data-nav-id="${p.id}"]`);
+      if (!btn) continue;
+      btn.classList.toggle('active', store.page === p.id);
+      const labelEl = btn.querySelector('.nav-label');
+      const nextLabel = t(p.zh, p.en);
+      if (labelEl && labelEl.textContent !== nextLabel) labelEl.textContent = nextLabel;
+
+      const trailingEl = btn.querySelector('.nav-trailing');
+      if (trailingEl) {
+        if (p.id === 0) {
+          trailingEl.hidden = false;
+          trailingEl.className = 'nav-trailing nav-count';
+          trailingEl.textContent = 'XD';
+          trailingEl.title = '';
+        } else if (p.id === 3 && aiOn) {
+          trailingEl.hidden = false;
+          trailingEl.className = 'nav-trailing nav-dot';
+          trailingEl.textContent = '';
+          trailingEl.title = 'AI Lock Active';
+        } else if (p.id === 1 && subsCount > 0) {
+          trailingEl.hidden = false;
+          trailingEl.className = 'nav-trailing nav-count';
+          trailingEl.textContent = String(subsCount);
+          trailingEl.title = '';
+        } else if (p.id === 4 && snap.node_services?.settings?.ports_enabled && nsCount > 0) {
+          trailingEl.hidden = false;
+          trailingEl.className = 'nav-trailing nav-count';
+          trailingEl.textContent = String(nsCount);
+          trailingEl.title = '';
+        } else {
+          trailingEl.hidden = true;
+          trailingEl.className = 'nav-trailing';
+          trailingEl.textContent = '';
+          trailingEl.title = '';
+        }
+      }
+    }
   }
 
-  // Sidebar Bottom Quick Dock
+  // Sidebar Bottom Quick Dock (in-place updates)
   const dockEl = document.getElementById('sidebar-dock');
   if (dockEl) {
-    dockEl.innerHTML = `
-      <div class="dock-row-grid">
-        <button type="button" class="dock-toggle-card ${sysOn ? 'is-on' : ''}" id="dock-sys-btn">
-          <div class="dock-toggle-top">
-            <span class="dock-toggle-label">${t('系统代理', 'Sys Proxy')}</span>
-            <span class="mini-pill"></span>
-          </div>
-          <span class="dock-toggle-sub">${sysOn ? `:${port}` : t('已关闭', 'Off')}</span>
-        </button>
+    ensureSidebarDockBuilt(dockEl);
+    const sysBtn = dockEl.querySelector('#dock-sys-btn');
+    const tunBtn = dockEl.querySelector('#dock-tun-btn');
+    const sysLbl = dockEl.querySelector('#dock-sys-label');
+    const tunLbl = dockEl.querySelector('#dock-tun-label');
+    const sysSub = dockEl.querySelector('#dock-sys-sub');
+    const tunSub = dockEl.querySelector('#dock-tun-sub');
+    const profLbl = dockEl.querySelector('#dock-profile-label');
+    const spdEl = dockEl.querySelector('#dock-speed');
+    const refBtn = dockEl.querySelector('#dock-refresh-sub');
+    const selectEl = dockEl.querySelector('#dock-profile-select');
 
-        <button type="button" class="dock-toggle-card ${tunOn ? 'is-on' : ''}" id="dock-tun-btn">
-          <div class="dock-toggle-top">
-            <span class="dock-toggle-label">${t('TUN 增强', 'TUN Mode')}</span>
-            <span class="mini-pill"></span>
-          </div>
-          <span class="dock-toggle-sub">${tunOn ? esc(settings.tun_stack || 'mixed') : t('已关闭', 'Off')}</span>
-        </button>
-      </div>
+    if (sysBtn) sysBtn.classList.toggle('is-on', sysOn);
+    if (tunBtn) tunBtn.classList.toggle('is-on', tunOn);
+    if (sysLbl) sysLbl.textContent = t('系统代理', 'Sys Proxy');
+    if (tunLbl) tunLbl.textContent = t('TUN 增强', 'TUN Mode');
+    if (sysSub) sysSub.textContent = sysOn ? `:${port}` : t('已关闭', 'Off');
+    if (tunSub) tunSub.textContent = tunOn ? String(settings.tun_stack || 'mixed') : t('已关闭', 'Off');
+    if (profLbl) profLbl.textContent = t('当前配置', 'Profile');
+    if (spdEl) spdEl.textContent = `↑ ${formatSpeed(store.telemetry.up)} · ↓ ${formatSpeed(store.telemetry.down)}`;
+    if (refBtn) refBtn.title = t('更新当前订阅 / 配置', 'Refresh active profile');
 
-      <div class="dock-profile-box">
-        <div class="dock-profile-head">
-          <span>${t('当前配置', 'Profile')}</span>
-          <span class="dock-speed-inline" id="dock-speed">↑ ${formatSpeed(store.telemetry.up)} · ↓ ${formatSpeed(store.telemetry.down)}</span>
-        </div>
-        <div class="dock-profile-controls">
-          <select class="select select-sm" id="dock-profile-select">
-            ${
-              profiles.length
-                ? profiles.map((p) => `<option value="${esc(p)}" ${p === activeProf ? 'selected' : ''}>${esc(p)}</option>`).join('')
-                : `<option value="${esc(activeProf)}">${esc(activeProf)}</option>`
-            }
-          </select>
-          <button type="button" class="btn btn-sm btn-icon" id="dock-refresh-sub" title="${t('更新当前订阅 / 配置', 'Refresh active profile')}">${ICONS.refresh}</button>
-        </div>
-      </div>
-    `;
-
-    dockEl.querySelector('#dock-sys-btn')?.addEventListener('click', () => {
-      rpc('set_system_proxy', { enabled: !sysOn });
-    });
-    dockEl.querySelector('#dock-tun-btn')?.addEventListener('click', () => {
-      rpc('set_enhanced_mode', { enabled: !tunOn });
-    });
-    dockEl.querySelector('#dock-profile-select')?.addEventListener('change', async (e) => {
-      const name = e.target.value;
-      const res = await rpc('select_profile', { name });
-      if (res.ok) showToast(t(`已切换配置: ${name}`, `Active profile: ${name}`), 'ok');
-    });
-    dockEl.querySelector('#dock-refresh-sub')?.addEventListener('click', async () => {
-      const hasSub = (snap.subscriptions || []).some((s) => s.name === activeProf);
-      const res = hasSub
-        ? await rpc('refresh_subscription', { name: activeProf })
-        : await rpc('reload_config', {});
-      if (res.ok) showToast(hasSub ? t(`订阅「${activeProf}」已更新`, `Updated "${activeProf}"`) : t('配置已重载', 'Config reloaded'), 'ok');
-    });
+    if (selectEl && document.activeElement !== selectEl) {
+      const nextProfSig = JSON.stringify([activeProf, profiles]);
+      if (nextProfSig !== dockProfileSig) {
+        dockProfileSig = nextProfSig;
+        selectEl.innerHTML = profiles.length
+          ? profiles.map((p) => `<option value="${esc(p)}" ${p === activeProf ? 'selected' : ''}>${esc(p)}</option>`).join('')
+          : `<option value="${esc(activeProf)}">${esc(activeProf)}</option>`;
+        selectEl.value = activeProf;
+      }
+    }
   }
 
   // Topbar metadata & buttons
@@ -261,7 +405,11 @@ function postSyncToConsoleFrame({ forceTheme = false, forceLang = false } = {}) 
 
 function syncConsoleHost(forceReload = false) {
   const onConsole = store.page === 0;
-  if (consoleHost) consoleHost.hidden = !onConsole;
+  if (consoleHost) {
+    consoleHost.hidden = false;
+    consoleHost.classList.toggle('is-inactive', !onConsole);
+    consoleHost.inert = !onConsole;
+  }
   if (pageRoot) pageRoot.hidden = onConsole;
   if (!onConsole) return;
 
@@ -385,7 +533,7 @@ function syncConsoleHost(forceReload = false) {
   }
 }
 
-async function renderPageContent() {
+function renderPageContent() {
   if (!pageRoot || store.page === 0) return;
   const seq = ++renderSeq;
   const scrollBefore = pageRoot.scrollTop;
@@ -395,7 +543,7 @@ async function renderPageContent() {
   if (store.page === 1) {
     renderSubscriptionsPage(pageRoot, handlers);
   } else if (store.page === 2) {
-    await renderRulesPage(pageRoot, -1);
+    renderRulesPage(pageRoot, -1);
   } else if (store.page === 3) {
     renderAiLockPage(pageRoot, handlers);
   } else if (store.page === 4) {
@@ -413,11 +561,21 @@ async function renderPageContent() {
 function renderAll(forcePage = false) {
   renderChrome();
   syncConsoleHost(false);
+  if (store.page === 0) {
+    lastPageSig = '0:console';
+    pendingPageRender = false;
+    return;
+  }
+  const nextSig = `${store.page}:${computePageRenderSignature()}`;
+  if (!forcePage && nextSig === lastPageSig) {
+    return;
+  }
   if (!forcePage && isUserTypingInPage()) {
     pendingPageRender = true;
     return;
   }
   pendingPageRender = false;
+  lastPageSig = nextSig;
   renderPageContent();
 }
 
@@ -483,6 +641,7 @@ function wireWindowControls() {
     () => {
       if (pendingPageRender && !isUserTypingInPage()) {
         pendingPageRender = false;
+        lastPageSig = `${store.page}:${computePageRenderSignature()}`;
         renderPageContent();
       }
     },

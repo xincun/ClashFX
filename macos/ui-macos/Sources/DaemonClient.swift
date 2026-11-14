@@ -122,9 +122,11 @@ final class DaemonClient {
     private func allocateRequestID() -> Int64 {
         stateLock.lock()
         defer {
-            nextReqID += 1
+            stateLock.unlock()
         }
-        return nextReqID
+        let id = nextReqID
+        nextReqID += 1
+        return id
     }
 
     private func dialSocket(receiveTimeoutSec: Int) -> Int32 {
@@ -288,6 +290,7 @@ final class DaemonClient {
 
         var lineBuf = Data()
         var chunk = [UInt8](repeating: 0, count: 16384)
+        var scanOffset = 0
         while true {
             let n = Darwin.read(fd, &chunk, chunk.count)
             if n < 0 {
@@ -298,10 +301,12 @@ final class DaemonClient {
                 break
             }
             lineBuf.append(contentsOf: chunk[0..<n])
-            if let nlRange = lineBuf.firstRange(of: Data([0x0A])) {
-                lineBuf = lineBuf.subdata(in: 0..<nlRange.lowerBound)
+            let searchStart = lineBuf.index(lineBuf.startIndex, offsetBy: scanOffset)
+            if let nlIndex = lineBuf[searchStart..<lineBuf.endIndex].firstIndex(of: 0x0A) {
+                lineBuf = lineBuf.subdata(in: lineBuf.startIndex..<nlIndex)
                 break
             }
+            scanOffset = lineBuf.count
         }
 
         guard !lineBuf.isEmpty,
@@ -377,6 +382,7 @@ final class DaemonClient {
     private func readSubscribeStream(fd: Int32) {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 32768)
+        var scanOffset = 0
         while true {
             let n = Darwin.read(fd, &chunk, chunk.count)
             if n < 0 {
@@ -387,16 +393,26 @@ final class DaemonClient {
                 return
             }
             buffer.append(contentsOf: chunk[0..<n])
-            while let nlRange = buffer.firstRange(of: Data([0x0A])) {
-                let lineData = buffer.subdata(in: 0..<nlRange.lowerBound)
-                buffer.removeSubrange(0..<nlRange.upperBound)
-                guard !lineData.isEmpty,
-                      let obj = try? JSONSerialization.jsonObject(with: lineData, options: []) as? [String: Any]
-                else {
-                    continue
+            var lineStart = buffer.startIndex
+            var searchFrom = buffer.index(buffer.startIndex, offsetBy: scanOffset)
+            while searchFrom < buffer.endIndex,
+                  let nlIndex = buffer[searchFrom..<buffer.endIndex].firstIndex(of: 0x0A) {
+                let lineData = buffer.subdata(in: lineStart..<nlIndex)
+                if !lineData.isEmpty,
+                   let obj = try? JSONSerialization.jsonObject(with: lineData, options: []) as? [String: Any] {
+                    handleStreamObject(obj)
                 }
-                handleStreamObject(obj)
+                lineStart = buffer.index(after: nlIndex)
+                searchFrom = lineStart
             }
+            if lineStart > buffer.startIndex {
+                if lineStart == buffer.endIndex {
+                    buffer.removeAll(keepingCapacity: true)
+                } else {
+                    buffer = Data(buffer[lineStart..<buffer.endIndex])
+                }
+            }
+            scanOffset = buffer.count
         }
     }
 

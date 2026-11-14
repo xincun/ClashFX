@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -589,5 +590,107 @@ func TestReloadConfigParsesAllowUACAndDisableAILockDowngradesEnhanced(t *testing
 	}
 	if supportsPrivilegedService() && st.EnhancedMode {
 		t.Fatalf("expected EnhancedMode downgraded to false when disabling AI lock without privileged service")
+	}
+}
+
+func TestConcurrentReadRPCsOverIPCCachedNetworkSignature(t *testing.T) {
+	sockDir, err := os.MkdirTemp("", "cfx-rpc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+
+	appData := t.TempDir()
+	t.Setenv("CLASHFX_SERVICE_SOCK", filepath.Join(appData, "nonexistent-service.sock"))
+	t.Setenv("CLASHFX_DISABLE_LAUNCH_AGENT", "1")
+
+	endpoint := filepath.Join(sockDir, "d.sock")
+	if runtime.GOOS == "windows" {
+		endpoint = fmt.Sprintf(`\\.\pipe\ClashFXDaemonConcurrentTest-%d`, time.Now().UnixNano())
+	}
+
+	ln, err := ListenIPC(endpoint)
+	if err != nil {
+		t.Fatalf("ListenIPC failed: %v", err)
+	}
+	eng, err := NewEngine(Config{AppDataDir: appData}, nil)
+	if err != nil {
+		_ = ln.Close()
+		t.Fatal(err)
+	}
+	defer eng.Shutdown()
+
+	srv := &Server{
+		endpoint: endpoint,
+		engine:   eng,
+		ln:       ln,
+		clients:  map[*clientConn]struct{}{},
+		quitCh:   make(chan struct{}),
+	}
+	go srv.acceptLoop()
+	defer func() {
+		_ = ln.Close()
+		srv.clientsMu.Lock()
+		for c := range srv.clients {
+			_ = c.conn.Close()
+		}
+		srv.clients = map[*clientConn]struct{}{}
+		srv.clientsMu.Unlock()
+	}()
+
+	// Warm the network signature cache once before timing concurrent calls.
+	_ = eng.Snapshot()
+
+	methods := []string{"get_state", "get_profile_mixin", "get_effective_rules", "get_diagnostic_info"}
+	const workers = 8
+	const iters = 3
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers*iters*len(methods))
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for iter := 0; iter < iters; iter++ {
+				for idx, method := range methods {
+					conn, dErr := DialIPC(endpoint)
+					if dErr != nil {
+						errCh <- fmt.Errorf("w=%d dial %s: %w", workerID, method, dErr)
+						continue
+					}
+					reqID := int64(workerID*100 + iter*10 + idx + 1)
+					frame, _ := json.Marshal(RPCRequest{ID: reqID, Method: method})
+					frame = append(frame, '\n')
+					_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+					if _, wErr := conn.Write(frame); wErr != nil {
+						_ = conn.Close()
+						errCh <- fmt.Errorf("w=%d write %s: %w", workerID, method, wErr)
+						continue
+					}
+					_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+					line, rErr := bufio.NewReader(conn).ReadBytes('\n')
+					_ = conn.Close()
+					if rErr != nil {
+						errCh <- fmt.Errorf("w=%d read %s: %w", workerID, method, rErr)
+						continue
+					}
+					var resp RPCResponse
+					if jErr := json.Unmarshal(line, &resp); jErr != nil || !resp.OK || resp.ID != reqID {
+						errCh <- fmt.Errorf("w=%d bad resp %s: err=%v resp=%+v", workerID, method, jErr, resp)
+					}
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		t.Fatal(e)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("concurrent IPC RPC batch took unexpectedly long: %v", elapsed)
 	}
 }
