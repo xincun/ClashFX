@@ -18,6 +18,15 @@ import (
 
 const DefaultWindowsProxyBypass = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*"
 
+const DefaultDarwinProxyBypass = "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,127.0.0.1,localhost,*.local,timestamp.apple.com,sequoia.apple.com,seed-sequoia.siri.apple.com"
+
+func DefaultProxyBypass() string {
+	if runtime.GOOS == "darwin" {
+		return DefaultDarwinProxyBypass
+	}
+	return DefaultWindowsProxyBypass
+}
+
 const DefaultStarterConfigYAML = `mixed-port: 7890
 allow-lan: false
 mode: rule
@@ -107,7 +116,7 @@ func DefaultSettings() AppSettings {
 		LogLevel:              "info",
 		TunMTU:                1500,
 		TunStack:              "mixed",
-		ProxyBypassList:       DefaultWindowsProxyBypass,
+		ProxyBypassList:       DefaultProxyBypass(),
 		AutoUpdateSubs:        true,
 		AutoUpdateIntervalSec: 7200,
 		TrayIconPreset:        "default",
@@ -595,6 +604,7 @@ func (s *Store) settingsPathLocked() string {
 func (s *Store) loadSettingsLocked() error {
 	data, err := os.ReadFile(s.settingsPathLocked())
 	if os.IsNotExist(err) {
+		migrateLegacyDarwinPreferences(s.appDataDir, &s.settings)
 		return writeJSONAtomic(s.settingsPathLocked(), s.settings)
 	}
 	if err != nil {

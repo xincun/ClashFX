@@ -162,13 +162,17 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 	}))
 	defer relSrv.Close()
 
-	stable, err := CheckForUpdates(context.Background(), "v1.19.24", "stable", relSrv.URL)
-	if err != nil || !stable.UpdateAvailable || stable.LatestVersion != "v2.0.0" || stable.DownloadURL == "" {
-		t.Fatalf("unexpected stable update result: %+v (%v)", stable, err)
+	stableWin, err := CheckForUpdatesForPlatform(context.Background(), "v1.19.24", "stable", relSrv.URL, 0, "windows", "arm64")
+	if err != nil || !stableWin.UpdateAvailable || stableWin.LatestVersion != "v2.0.0" || stableWin.DownloadURL != "https://example.com/arm64.exe" {
+		t.Fatalf("unexpected Windows stable update result: %+v (%v)", stableWin, err)
 	}
-	lab, err := CheckForUpdates(context.Background(), "v2.0.0", "lab", relSrv.URL)
-	if err != nil || !lab.UpdateAvailable || lab.LatestVersion != "v2.1.0-beta.1" {
-		t.Fatalf("unexpected lab update result: %+v (%v)", lab, err)
+	labWin, err := CheckForUpdatesForPlatform(context.Background(), "v2.0.0", "lab", relSrv.URL, 0, "windows", "amd64")
+	if err != nil || !labWin.UpdateAvailable || labWin.LatestVersion != "v2.1.0-beta.1" || labWin.DownloadURL != "https://example.com/amd64-beta.exe" {
+		t.Fatalf("unexpected Windows lab update result: %+v (%v)", labWin, err)
+	}
+	stableMac, err := CheckForUpdatesForPlatform(context.Background(), "v1.19.24", "stable", relSrv.URL, 0, "darwin", "arm64")
+	if err != nil || !stableMac.UpdateAvailable || stableMac.LatestVersion != "v9.9.9" || stableMac.DownloadURL != "https://example.com/ClashFX.dmg" {
+		t.Fatalf("unexpected macOS stable update result: %+v (%v)", stableMac, err)
 	}
 }
 

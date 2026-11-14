@@ -48,19 +48,28 @@ func main() {
 		*binDir = defaultBinDir
 	}
 	if *resourceDir == "" {
-		cand := filepath.Join(*binDir, "resources")
-		if st, sErr := os.Stat(cand); sErr == nil && st.IsDir() {
-			*resourceDir = cand
+		for _, cand := range []string{
+			filepath.Join(*binDir, "resources"),
+			filepath.Clean(filepath.Join(*binDir, "..", "Resources")),
+		} {
+			if st, sErr := os.Stat(cand); sErr == nil && st.IsDir() {
+				*resourceDir = cand
+				break
+			}
 		}
 	}
-	if *dashboardDir == "" {
-		cand := filepath.Join(*binDir, "resources", "dashboard")
+	if *dashboardDir == "" && *resourceDir != "" {
+		cand := filepath.Join(*resourceDir, "dashboard")
 		if st, sErr := os.Stat(cand); sErr == nil && st.IsDir() {
 			*dashboardDir = cand
 		}
 	}
 
-	unlock, err := daemon.AcquireSingleInstanceLock(*mutexKey)
+	effectiveMutexKey := *mutexKey
+	if effectiveMutexKey == "" && (*pipeEndpoint != "" || *dataDir != "") {
+		effectiveMutexKey = *pipeEndpoint + "|" + *dataDir
+	}
+	unlock, err := daemon.AcquireSingleInstanceLock(effectiveMutexKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)

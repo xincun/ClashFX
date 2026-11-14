@@ -74,6 +74,19 @@ func TestWindowsProcessAndPathMatchersAndDependencySafety(t *testing.T) {
 		}
 	}
 
+	darwinPathRe := regexp.MustCompile(DarwinProcessPathPattern)
+	for _, darwinMatch := range []string{
+		`/Applications/Claude.app/Contents/MacOS/Claude`,
+		`/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper`,
+		`/Users/alice/Applications/Antigravity.app/Contents/MacOS/Antigravity`,
+		`/Applications/Codex.app/Contents/MacOS/Codex`,
+		`/Applications/ChatGPT.app/Contents/MacOS/ChatGPT`,
+	} {
+		if !darwinPathRe.MatchString(darwinMatch) {
+			t.Fatalf("expected macOS AI install path %q to match DarwinProcessPathPattern", darwinMatch)
+		}
+	}
+
 	// Verify safe relay assignment vs cycle avoidance + concrete node filtering + inline rule-provider
 	root := map[string]any{
 		"proxies": []any{
@@ -125,8 +138,8 @@ func TestWindowsProcessAndPathMatchersAndDependencySafety(t *testing.T) {
 		t.Fatalf("unexpected file rule-provider: %+v", aiProv)
 	}
 	parsedDefault, err := profile.ParseAndValidateClassicalRulesetText(profile.DefaultAILockRulesetText())
-	if err != nil || len(parsedDefault) != 2+len(ProtectedDomains) {
-		t.Fatalf("default AI lock ruleset len = %d (err=%v), want %d", len(parsedDefault), err, 2+len(ProtectedDomains))
+	if err != nil || len(parsedDefault) != 3+len(ProtectedDomains) {
+		t.Fatalf("default AI lock ruleset len = %d (err=%v), want %d", len(parsedDefault), err, 3+len(ProtectedDomains))
 	}
 
 	// GeneralHK IS inside Proxy -> relay must NOT be assigned (would create dialer cycle!)

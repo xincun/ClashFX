@@ -306,7 +306,11 @@ func SystemGuardPrefixCount(rules []string) int {
 			strings.HasPrefix(trimmed, "RULE-SET,"+AILockRuleProviderName+",") ||
 			trimmed == "PROCESS-NAME,mihomo_core.exe,DIRECT" ||
 			trimmed == "PROCESS-NAME,clashfx-daemon.exe,DIRECT" ||
-			trimmed == "PROCESS-NAME,clashfx-service.exe,DIRECT" {
+			trimmed == "PROCESS-NAME,clashfx-service.exe,DIRECT" ||
+			trimmed == "PROCESS-NAME,mihomo_core,DIRECT" ||
+			trimmed == "PROCESS-NAME,clashfx-daemon,DIRECT" ||
+			trimmed == "PROCESS-NAME,clashfx-service,DIRECT" ||
+			trimmed == "PROCESS-NAME,ClashFX,DIRECT" {
 			idx++
 			continue
 		}

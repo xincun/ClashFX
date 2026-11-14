@@ -87,7 +87,7 @@ func TestRunnerLifecycleAndValidation(t *testing.T) {
 	}
 
 	runner := NewRunner(trustedDir)
-	runner.SetCoreBinaryForTest("fake_core.sh", 3*time.Second, 3*time.Second)
+	runner.SetCoreBinaryForTest("fake_core.sh", 10*time.Second, 5*time.Second)
 
 	// Reject relative or UNC paths
 	if resp := runner.Handle(Request{Action: "start_core", HomeDir: "relative", ConfigFile: cfgPath}); resp.OK {

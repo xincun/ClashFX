@@ -179,7 +179,7 @@ rules:
 		t.Fatalf("get_diagnostic_info failed: %s", diagBundle.Error)
 	}
 	bundleStr := fmt.Sprint(diagBundle.Data)
-	if !strings.Contains(bundleStr, "ClashFX Windows Diagnostic Report") {
+	if !strings.Contains(bundleStr, "ClashFX ") || !strings.Contains(bundleStr, "Diagnostic Report") {
 		t.Fatalf("unexpected diagnostic bundle: %s", bundleStr)
 	}
 
@@ -272,8 +272,8 @@ rules:
 	var resetView EffectiveRulesView
 	rawReset, _ := json.Marshal(resetProvResp.Data)
 	_ = json.Unmarshal(rawReset, &resetView)
-	if resetView.RuleProviders["clashfx-ai-lock"].RuleCount != 15 {
-		t.Fatalf("expected 15 default rules after reset, got %d", resetView.RuleProviders["clashfx-ai-lock"].RuleCount)
+	if resetView.RuleProviders["clashfx-ai-lock"].RuleCount != 16 {
+		t.Fatalf("expected 16 default rules after reset, got %d", resetView.RuleProviders["clashfx-ai-lock"].RuleCount)
 	}
 }
 

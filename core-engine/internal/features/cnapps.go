@@ -6,12 +6,12 @@ import (
 
 // CommonCNAppProcesses lists mainstream Windows Chinese desktop client executables
 // bypassed via DIRECT when BypassCNApps is enabled in Enhanced Mode (TUN).
-var CommonCNAppProcesses = profile.DefaultCommonCNAppProcesses
+var CommonCNAppProcesses = append(append([]string(nil), profile.DefaultCommonCNAppProcesses...), profile.DefaultDarwinCNAppProcesses...)
 
 func CNAppRuleProviderPayload() []string {
 	payload := make([]string, 0, len(CommonCNAppProcesses))
-	for _, exe := range CommonCNAppProcesses {
-		payload = append(payload, "PROCESS-NAME,"+exe)
+	for _, proc := range CommonCNAppProcesses {
+		payload = append(payload, "PROCESS-NAME,"+proc)
 	}
 	return payload
 }

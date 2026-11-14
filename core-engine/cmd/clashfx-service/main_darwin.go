@@ -1,0 +1,280 @@
+//go:build darwin
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/clashfx/core-engine/internal/service"
+)
+
+func acceptLoop(ln net.Listener, runner *service.Runner) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			continue
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(20 * time.Second))
+			if err := service.VerifyPipePeer(c, runner.TrustedDir()); err != nil {
+				_ = json.NewEncoder(c).Encode(service.Response{OK: false, Message: err.Error()})
+				return
+			}
+			var req service.Request
+			if err := json.NewDecoder(c).Decode(&req); err != nil {
+				_ = json.NewEncoder(c).Encode(service.Response{OK: false, Message: err.Error()})
+				return
+			}
+			resp := runner.Handle(req)
+			_ = json.NewEncoder(c).Encode(resp)
+		}(conn)
+	}
+}
+
+func resolveTrustedDir() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return filepath.Dir(exe), nil
+}
+
+func runDaemon() error {
+	dir, err := resolveTrustedDir()
+	if err != nil {
+		return err
+	}
+	ln, err := service.ListenSecurePipe()
+	if err != nil {
+		return err
+	}
+	runner := service.NewRunner(dir)
+	go acceptLoop(ln, runner)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	_ = ln.Close()
+	_ = runner.Stop()
+	_ = os.Remove(service.ServiceSocketPath())
+	return nil
+}
+
+func copyRootOwnedExecutable(srcPath, dstPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", srcPath, err)
+	}
+	defer src.Close()
+
+	dstDir := filepath.Dir(dstPath)
+	if err := os.MkdirAll(dstDir, 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dstDir, ".cfx-bin-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := io.Copy(tmp, src); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0755); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	_ = os.Chown(tmpPath, 0, 0)
+	if err := os.Rename(tmpPath, dstPath); err != nil {
+		return err
+	}
+	cleanup = false
+	_ = exec.Command("/usr/bin/xattr", "-d", "com.apple.quarantine", dstPath).Run()
+	return nil
+}
+
+func buildLaunchDaemonPlist() string {
+	binPath := filepath.Join(service.DarwinPrivilegedBinDir, "clashfx-service")
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>%s</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%s</string>
+		<string>daemon</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/var/log/clashfx-service.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/clashfx-service.log</string>
+</dict>
+</plist>
+`, service.DarwinLaunchDaemonLabel, binPath)
+}
+
+func installAndStartService(sourceDir string) error {
+	if os.Geteuid() != 0 {
+		return errors.New("install must be run as root")
+	}
+	srcDir := strings.TrimSpace(sourceDir)
+	if srcDir == "" {
+		dir, err := resolveTrustedDir()
+		if err != nil {
+			return err
+		}
+		srcDir = dir
+	}
+
+	if err := os.MkdirAll(service.DarwinPrivilegedBinDir, 0755); err != nil {
+		return err
+	}
+	_ = os.Chown(service.DarwinPrivilegedBinDir, 0, 0)
+
+	// Boot out existing service before replacing binaries if already registered.
+	_ = exec.Command("/bin/launchctl", "bootout", "system", service.DarwinLaunchDaemonPlist).Run()
+	time.Sleep(200 * time.Millisecond)
+
+	for _, name := range []string{"clashfx-service", "mihomo_core"} {
+		src := filepath.Join(srcDir, name)
+		dst := filepath.Join(service.DarwinPrivilegedBinDir, name)
+		if err := copyRootOwnedExecutable(src, dst); err != nil {
+			return fmt.Errorf("install %s: %w", name, err)
+		}
+	}
+
+	plistData := []byte(buildLaunchDaemonPlist())
+	if err := os.WriteFile(service.DarwinLaunchDaemonPlist, plistData, 0644); err != nil {
+		return fmt.Errorf("write LaunchDaemon plist: %w", err)
+	}
+	_ = os.Chown(service.DarwinLaunchDaemonPlist, 0, 0)
+
+	if out, err := exec.Command("/bin/launchctl", "bootstrap", "system", service.DarwinLaunchDaemonPlist).CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl bootstrap failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	_ = exec.Command("/bin/launchctl", "kickstart", "-k", "system/"+service.DarwinLaunchDaemonLabel).Run()
+
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		resp, err := service.Call(ctx, service.Request{Action: "status"})
+		cancel()
+		if err == nil && resp.OK {
+			return nil
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return fmt.Errorf("service started but did not respond at %s", service.ServiceSocketPath())
+}
+
+func uninstallService() error {
+	if os.Geteuid() != 0 {
+		return errors.New("uninstall must be run as root")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _ = service.Call(ctx, service.Request{Action: "stop_core"})
+	cancel()
+	_ = exec.Command("/bin/launchctl", "bootout", "system", service.DarwinLaunchDaemonPlist).Run()
+	_ = os.Remove(service.DarwinLaunchDaemonPlist)
+	_ = os.Remove(service.ServiceSocketPath())
+	_ = os.RemoveAll(service.DarwinPrivilegedBinDir)
+	return nil
+}
+
+func controlService(start bool) error {
+	if os.Geteuid() != 0 {
+		return errors.New("start/stop must be run as root")
+	}
+	if start {
+		if out, err := exec.Command("/bin/launchctl", "kickstart", "-k", "system/"+service.DarwinLaunchDaemonLabel).CombinedOutput(); err != nil {
+			if bOut, bErr := exec.Command("/bin/launchctl", "bootstrap", "system", service.DarwinLaunchDaemonPlist).CombinedOutput(); bErr != nil {
+				return fmt.Errorf("launchctl start failed: %v (%s) / %v (%s)", err, strings.TrimSpace(string(out)), bErr, strings.TrimSpace(string(bOut)))
+			}
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _ = service.Call(ctx, service.Request{Action: "stop_core"})
+	cancel()
+	_ = exec.Command("/bin/launchctl", "kill", "SIGTERM", "system/"+service.DarwinLaunchDaemonLabel).Run()
+	return nil
+}
+
+func main() {
+	cmd := "status"
+	args := os.Args[1:]
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		cmd = args[0]
+		args = args[1:]
+	}
+
+	var err error
+	switch cmd {
+	case "daemon", "console":
+		err = runDaemon()
+	case "install":
+		fs := flag.NewFlagSet("install", flag.ContinueOnError)
+		srcDir := fs.String("source-dir", "", "source directory containing clashfx-service and mihomo_core")
+		if err = fs.Parse(args); err == nil {
+			err = installAndStartService(*srcDir)
+		}
+	case "uninstall":
+		err = uninstallService()
+	case "start":
+		err = controlService(true)
+	case "stop":
+		err = controlService(false)
+	case "status":
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		var resp service.Response
+		resp, err = service.Call(ctx, service.Request{Action: "status"})
+		if err == nil {
+			_ = json.NewEncoder(os.Stdout).Encode(resp)
+		}
+	case "version":
+		fmt.Println("clashfx-service 1.0")
+	default:
+		err = fmt.Errorf("usage: %s [daemon|install|uninstall|start|stop|status|console|version]", filepath.Base(os.Args[0]))
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}

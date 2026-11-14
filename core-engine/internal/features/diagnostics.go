@@ -286,7 +286,11 @@ type DiagnosticBundleInput struct {
 // subscription URLs, credentials, or raw proxy server addresses.
 func BuildRedactedDiagnosticReport(in DiagnosticBundleInput) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "=== ClashFX Windows Diagnostic Report ===\n")
+	osTitle := "Windows"
+	if runtime.GOOS == "darwin" {
+		osTitle = "macOS"
+	}
+	fmt.Fprintf(&b, "=== ClashFX %s Diagnostic Report ===\n", osTitle)
 	fmt.Fprintf(&b, "Timestamp: %s\n", time.Now().Format(time.RFC3339))
 	fmt.Fprintf(&b, "Version: %s (%s/%s)\n", in.AppVersion, runtime.GOOS, runtime.GOARCH)
 	fmt.Fprintf(&b, "Core Running: %v (via_service=%v, service_installed=%v)\n", in.CoreRunning, in.CoreViaService, in.ServiceInstalled)

@@ -44,6 +44,10 @@ func CheckForUpdates(ctx context.Context, currentVersion, channel, apiURL string
 }
 
 func CheckForUpdatesWithProxy(ctx context.Context, currentVersion, channel, apiURL string, localProxyPort int) (UpdateCheckResult, error) {
+	return CheckForUpdatesForPlatform(ctx, currentVersion, channel, apiURL, localProxyPort, runtime.GOOS, runtime.GOARCH)
+}
+
+func CheckForUpdatesForPlatform(ctx context.Context, currentVersion, channel, apiURL string, localProxyPort int, targetOS, targetArch string) (UpdateCheckResult, error) {
 	channel = strings.ToLower(strings.TrimSpace(channel))
 	if channel != "lab" {
 		channel = "stable"
@@ -51,13 +55,19 @@ func CheckForUpdatesWithProxy(ctx context.Context, currentVersion, channel, apiU
 	if strings.TrimSpace(apiURL) == "" {
 		apiURL = DefaultGitHubReleasesURL
 	}
+	if strings.TrimSpace(targetOS) == "" {
+		targetOS = runtime.GOOS
+	}
+	if strings.TrimSpace(targetArch) == "" {
+		targetArch = runtime.GOARCH
+	}
 
 	res := UpdateCheckResult{
 		CurrentVersion: currentVersion,
 		Channel:        channel,
 	}
 
-	bodyBytes, statusCode, err := fetchReleasesFeed(ctx, apiURL, currentVersion, localProxyPort)
+	bodyBytes, statusCode, err := fetchReleasesFeed(ctx, apiURL, currentVersion, localProxyPort, targetOS)
 	if err != nil {
 		return res, err
 	}
@@ -83,7 +93,7 @@ func CheckForUpdatesWithProxy(ctx context.Context, currentVersion, channel, apiU
 		if channel == "stable" && rel.Prerelease {
 			continue
 		}
-		if !isWindowsCompatibleRelease(rel) {
+		if !isCompatibleRelease(rel, targetOS) {
 			continue
 		}
 		if chosen == nil || compareSemver(rel.TagName, chosen.TagName) > 0 {
@@ -99,32 +109,22 @@ func CheckForUpdatesWithProxy(ctx context.Context, currentVersion, channel, apiU
 	res.ReleaseNotes = chosen.Body
 	res.PublishedAt = chosen.PublishedAt
 	res.UpdateAvailable = compareSemver(chosen.TagName, currentVersion) > 0
-
-	archTag := runtime.GOARCH // "arm64" or "amd64"
-	for _, asset := range chosen.Assets {
-		lower := strings.ToLower(asset.Name)
-		if strings.HasSuffix(lower, ".dsym.zip") || strings.HasSuffix(lower, ".dmg") {
-			continue
-		}
-		if !strings.HasSuffix(lower, ".exe") && !strings.HasSuffix(lower, ".msi") && !strings.HasSuffix(lower, ".zip") {
-			continue
-		}
-		if strings.Contains(lower, archTag) || (archTag == "amd64" && strings.Contains(lower, "x64")) {
-			res.DownloadURL = asset.BrowserDownloadURL
-			break
-		}
-	}
+	res.DownloadURL = selectReleaseDownloadURL(chosen.Assets, targetOS, targetArch)
 	return res, nil
 }
 
-func fetchReleasesFeed(ctx context.Context, apiURL, currentVersion string, localProxyPort int) ([]byte, int, error) {
+func fetchReleasesFeed(ctx context.Context, apiURL, currentVersion string, localProxyPort int, targetOS string) ([]byte, int, error) {
+	uaPrefix := "ClashFX-Windows/"
+	if targetOS == "darwin" {
+		uaPrefix = "ClashFX-macOS/"
+	}
 	doOnce := func(proxyPort int, timeout time.Duration) ([]byte, int, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 		if err != nil {
 			return nil, 0, err
 		}
 		req.Header.Set("Accept", "application/vnd.github+json")
-		req.Header.Set("User-Agent", "ClashFX-Windows/"+currentVersion)
+		req.Header.Set("User-Agent", uaPrefix+currentVersion)
 
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		if proxyPort > 0 && proxyPort <= 65535 {
@@ -152,7 +152,24 @@ func fetchReleasesFeed(ctx context.Context, apiURL, currentVersion string, local
 	return doOnce(0, 10*time.Second)
 }
 
-func isWindowsCompatibleRelease(rel *githubRelease) bool {
+func isCompatibleRelease(rel *githubRelease, targetOS string) bool {
+	if targetOS == "darwin" {
+		if strings.Contains(strings.ToLower(rel.TagName), "mac") || strings.Contains(strings.ToLower(rel.TagName), "darwin") {
+			return true
+		}
+		for _, asset := range rel.Assets {
+			lower := strings.ToLower(strings.TrimSpace(asset.Name))
+			if strings.HasSuffix(lower, ".dsym.zip") {
+				continue
+			}
+			if strings.HasSuffix(lower, ".dmg") || strings.HasSuffix(lower, ".pkg") ||
+				(strings.HasSuffix(lower, ".zip") && (strings.Contains(lower, "mac") || strings.Contains(lower, "darwin") || strings.Contains(lower, "universal"))) {
+				return true
+			}
+		}
+		return false
+	}
+
 	if strings.Contains(strings.ToLower(rel.TagName), "win") {
 		return true
 	}
@@ -167,6 +184,57 @@ func isWindowsCompatibleRelease(rel *githubRelease) bool {
 		}
 	}
 	return false
+}
+
+func selectReleaseDownloadURL(assets []struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}, targetOS, targetArch string) string {
+	archMatches := func(lower string) bool {
+		return strings.Contains(lower, targetArch) ||
+			(targetArch == "amd64" && (strings.Contains(lower, "x64") || strings.Contains(lower, "x86_64")))
+	}
+	if targetOS == "darwin" {
+		var universalFallback, genericFallback string
+		for _, asset := range assets {
+			lower := strings.ToLower(strings.TrimSpace(asset.Name))
+			if strings.HasSuffix(lower, ".dsym.zip") {
+				continue
+			}
+			isDarwinPkg := strings.HasSuffix(lower, ".dmg") || strings.HasSuffix(lower, ".pkg")
+			isDarwinZip := strings.HasSuffix(lower, ".zip") && (strings.Contains(lower, "mac") || strings.Contains(lower, "darwin") || strings.Contains(lower, "universal"))
+			if !isDarwinPkg && !isDarwinZip {
+				continue
+			}
+			if archMatches(lower) {
+				return asset.BrowserDownloadURL
+			}
+			if strings.Contains(lower, "universal") && universalFallback == "" {
+				universalFallback = asset.BrowserDownloadURL
+			}
+			if isDarwinPkg && !strings.Contains(lower, "arm64") && !strings.Contains(lower, "amd64") && !strings.Contains(lower, "x64") && !strings.Contains(lower, "x86_64") && genericFallback == "" {
+				genericFallback = asset.BrowserDownloadURL
+			}
+		}
+		if universalFallback != "" {
+			return universalFallback
+		}
+		return genericFallback
+	}
+
+	for _, asset := range assets {
+		lower := strings.ToLower(strings.TrimSpace(asset.Name))
+		if strings.HasSuffix(lower, ".dsym.zip") || strings.HasSuffix(lower, ".dmg") || strings.HasSuffix(lower, ".pkg") {
+			continue
+		}
+		if !strings.HasSuffix(lower, ".exe") && !strings.HasSuffix(lower, ".msi") && !strings.HasSuffix(lower, ".zip") {
+			continue
+		}
+		if archMatches(lower) {
+			return asset.BrowserDownloadURL
+		}
+	}
+	return ""
 }
 
 func compareSemver(a, b string) int {

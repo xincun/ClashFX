@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !darwin
 
 package main
 
@@ -8,6 +8,6 @@ import (
 )
 
 func main() {
-	fmt.Fprintln(os.Stderr, "clashfx-service only runs on Windows")
+	fmt.Fprintln(os.Stderr, "clashfx-service only runs on Windows and macOS")
 	os.Exit(1)
 }

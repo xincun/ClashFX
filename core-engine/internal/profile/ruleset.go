@@ -14,6 +14,7 @@ const (
 
 	AILockProcessNamePattern = `(?i)^(claude|codex|codex-app-server|chatgpt|antigravity|antigravity-cli|agy)( helper.*)?(\.exe)?$`
 	AILockWindowsPathPattern = `(?i)([\\/](Programs|Program Files( \(x86\))?)[\\/](Claude|AnthropicClaude|Codex|ChatGPT|Antigravity)[\\/].*|[\\/]AppData[\\/]Local[\\/]AnthropicClaude[\\/].*|[\\/]WindowsApps[\\/][^\\/]*(Claude|Anthropic|OpenAI|ChatGPT|Codex|Antigravity)[^\\/]*[\\/].*|(^|[\\/])\.local[\\/](bin|share)[\\/]claude([\\/].*|\.exe)?|(^|[\\/])(\.antigravity|\.gemini[\\/]antigravity-cli)[\\/].*)$`
+	AILockDarwinPathPattern  = `(?i)(^|/)(Claude|Codex|CodexCLI|ChatGPT|Antigravity)\.app/Contents/.*$`
 )
 
 var DefaultAILockProtectedDomains = []string{
@@ -33,6 +34,16 @@ var DefaultCommonCNAppProcesses = []string{
 	"cloudmusic.exe", "QQMusic.exe", "kugou.exe", "Douyin.exe", "BiliBili.exe",
 	"QQLive.exe", "QyClient.exe", "wps.exe", "wpp.exe", "et.exe",
 	"ToDesk.exe", "SunloginClient.exe",
+}
+
+var DefaultDarwinCNAppProcesses = []string{
+	// IM & Collaboration (macOS)
+	"WeChat", "Weixin", "WeChatAppEx", "QQ", "DingTalk", "Feishu", "Lark", "WXWork", "AliWangWang",
+	// Cloud Storage & Downloaders (macOS)
+	"baidunetdisk", "aDrive", "QuarkCloudDrive", "Thunder",
+	// Media, Office & Remote Desktop (macOS)
+	"NeteaseMusic", "QQMusic", "Douyin", "BiliBili", "QQLive", "TencentVideo", "iQIYI",
+	"wpsoffice", "WPS Office", "ToDesk", "SunloginClient",
 }
 
 // SetFileClassicalRuleProvider registers a local plain-text classical rule-provider
@@ -90,7 +101,8 @@ func DefaultAILockRulesetText() string {
 	b.WriteString("# 以 # 开头的注释行和空行会被自动忽略；修改后可零中断热更新生效。\n\n")
 	b.WriteString("# --- AI 客户端进程与安装目录 (需 TUN 增强模式) ---\n")
 	b.WriteString("PROCESS-NAME-REGEX," + AILockProcessNamePattern + "\n")
-	b.WriteString("PROCESS-PATH-REGEX," + AILockWindowsPathPattern + "\n\n")
+	b.WriteString("PROCESS-PATH-REGEX," + AILockWindowsPathPattern + "\n")
+	b.WriteString("PROCESS-PATH-REGEX," + AILockDarwinPathPattern + "\n\n")
 	b.WriteString("# --- AI 与 Google 生态域名后缀 ---\n")
 	for _, dom := range DefaultAILockProtectedDomains {
 		b.WriteString("DOMAIN-SUFFIX," + dom + "\n")
@@ -101,10 +113,13 @@ func DefaultAILockRulesetText() string {
 func DefaultCNAppsRulesetText() string {
 	var b strings.Builder
 	b.WriteString("# ClashFX 常用国内桌面应用直连规则集 (clashfx-cn-apps-direct.list)\n")
-	b.WriteString("# 格式说明：每行写一条无目标策略的 Classical 规则（如 PROCESS-NAME,Weixin.exe），顶层统一路由至 DIRECT。\n")
+	b.WriteString("# 格式说明：每行写一条无目标策略的 Classical 规则（如 PROCESS-NAME,Weixin.exe 或 PROCESS-NAME,WeChat），顶层统一路由至 DIRECT。\n")
 	b.WriteString("# 注意：PROCESS-NAME / PROCESS-PATH 规则仅在开启增强模式 (TUN) 时生效。\n\n")
 	for _, exe := range DefaultCommonCNAppProcesses {
 		b.WriteString("PROCESS-NAME," + exe + "\n")
+	}
+	for _, proc := range DefaultDarwinCNAppProcesses {
+		b.WriteString("PROCESS-NAME," + proc + "\n")
 	}
 	return b.String()
 }

@@ -3,6 +3,7 @@ package sysproxy
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -71,8 +72,20 @@ func TestSystemProxyLifecycleCrashRecoveryAILockAndWakeHeal(t *testing.T) {
 	if st.HasAutoConfigURL {
 		t.Fatal("AutoConfigURL must be temporarily cleared while ClashFX owns system proxy")
 	}
-	if !strings.Contains(st.ProxyOverride, "127.*") || !strings.Contains(st.ProxyOverride, "192.168.1.*") || !strings.HasSuffix(st.ProxyOverride, ";<local>") {
-		t.Fatalf("unexpected WinINet ProxyOverride: %q", st.ProxyOverride)
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(st.ProxyOverride, "127.0.0.0/8") || !strings.Contains(st.ProxyOverride, "192.168.1.0/24") || strings.Contains(st.ProxyOverride, "<local>") {
+			t.Fatalf("unexpected Darwin ProxyOverride: %q", st.ProxyOverride)
+		}
+	} else {
+		if !strings.Contains(st.ProxyOverride, "127.*") || !strings.Contains(st.ProxyOverride, "192.168.1.*") || !strings.HasSuffix(st.ProxyOverride, ";<local>") {
+			t.Fatalf("unexpected WinINet ProxyOverride: %q", st.ProxyOverride)
+		}
+	}
+	if winFmt := FormatWindowsBypass("127.0.0.0/8, 192.168.1.0/24; <local>"); !strings.Contains(winFmt, "127.*") || !strings.Contains(winFmt, "192.168.1.*") || !strings.HasSuffix(winFmt, ";<local>") {
+		t.Fatalf("unexpected FormatWindowsBypass: %q", winFmt)
+	}
+	if macFmt := FormatDarwinBypass("127.0.0.0/8, 192.168.1.0/24; <local>"); len(macFmt) != 2 || macFmt[0] != "127.0.0.0/8" || macFmt[1] != "192.168.1.0/24" {
+		t.Fatalf("unexpected FormatDarwinBypass: %v", macFmt)
 	}
 	if _, err := os.Stat(filepath.Join(appDir, SnapshotFileName)); err != nil {
 		t.Fatalf("expected crash-recovery snapshot on disk: %v", err)

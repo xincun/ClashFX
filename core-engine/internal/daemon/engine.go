@@ -29,7 +29,7 @@ import (
 	mihomoutils "github.com/metacubex/mihomo/common/utils"
 )
 
-const AppVersion = "1.19.24-win.1"
+var AppVersion = "1.19.24"
 
 var ErrServiceInstallRequired = errors.New("ClashFXService is not installed yet")
 
@@ -90,6 +90,7 @@ type EffectiveRulesView struct {
 
 type DaemonSnapshot struct {
 	Version                string                             `json:"version"`
+	Platform               string                             `json:"platform"`
 	Arch                   string                             `json:"arch"`
 	CoreRunning            bool                               `json:"core_running"`
 	CoreViaService         bool                               `json:"core_via_service"`
@@ -244,15 +245,16 @@ func (e *Engine) Start(ctx context.Context) error {
 	// Recover previous crashed session's system proxy if user doesn't want system proxy now
 	_, _ = e.sysProxy.RecoverAfterUncleanShutdown(settings.SystemProxyEnabled)
 
-	// Self-heal HKCU Run\ClashFX path if the user moved or reinstalled ClashFX
+	// Self-heal Login item / HKCU Run\ClashFX path if the user moved or reinstalled ClashFX
 	if settings.LaunchAtLogin {
-		uiExe := filepath.Join(e.cfg.BinDir, "clashfx-ui.exe")
-		_ = SetLaunchAtLogin(true, uiExe)
+		if uiExe := uiLaunchExecutablePath(e.cfg.BinDir); uiExe != "" {
+			_ = SetLaunchAtLogin(true, uiExe)
+		}
 	}
 
-	// If EnhancedMode was persisted from last session, verify service is still installed;
+	// If EnhancedMode was persisted from last session, verify privileged service is installed;
 	// if uninstalled externally while offline (and AI Lock isn't forcing it), fall back cleanly to normal mode.
-	if settings.EnhancedMode && runtime.GOOS == "windows" && !IsPrivilegedServiceInstalled(service.ServiceName) && !settings.AILockEnabled {
+	if settings.EnhancedMode && supportsPrivilegedService() && !IsPrivilegedServiceInstalled(service.ServiceName) && !settings.AILockEnabled {
 		_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
 			s.EnhancedMode = false
 			return nil
@@ -342,10 +344,41 @@ func (e *Engine) ValidateConfig(homeDir, configPath string) error {
 	return e.coreHelper.ValidateConfig(homeDir, configPath)
 }
 
+func supportsPrivilegedService() bool {
+	return runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+}
+
+func serviceExecutablePath(binDir string) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(binDir, "clashfx-service.exe")
+	}
+	return filepath.Join(binDir, "clashfx-service")
+}
+
+func uiLaunchExecutablePath(binDir string) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(binDir, "clashfx-ui.exe")
+	}
+	if runtime.GOOS == "darwin" && strings.TrimSpace(binDir) != "" {
+		appUI := filepath.Join(binDir, "ClashFX")
+		if _, err := os.Stat(appUI); err == nil {
+			return appUI
+		}
+	}
+	if exe, err := os.Executable(); err == nil {
+		return exe
+	}
+	return ""
+}
+
+func (e *Engine) HandlePowerResume() {
+	e.handleWakeOrNetworkCheck()
+}
+
 // ApplyRuntimeConfig implements transaction.CoreApplier, transparently routing
 // normal mode through localRunner and Enhanced TUN mode through ClashFXService.
 func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSettings, homeDir, runtimeConfigPath string, apiPort int, secret string) error {
-	wantService := settings.EnhancedMode && runtime.GOOS == "windows"
+	wantService := settings.EnhancedMode && supportsPrivilegedService()
 
 	if wantService {
 		_ = e.localRunner.Stop()
@@ -353,7 +386,7 @@ func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSet
 			if !e.allowPromptUAC {
 				return ErrServiceInstallRequired
 			}
-			svcExe := filepath.Join(e.cfg.BinDir, "clashfx-service.exe")
+			svcExe := serviceExecutablePath(e.cfg.BinDir)
 			if err := ElevateAndInstallService(svcExe); err != nil {
 				return err
 			}
@@ -421,7 +454,7 @@ func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUA
 	e.opMu.Lock()
 	e.allowPromptUAC = allowUAC
 	prevViaService := e.isCoreViaService()
-	wantService := e.store.Settings().EnhancedMode && runtime.GOOS == "windows"
+	wantService := e.store.Settings().EnhancedMode && supportsPrivilegedService()
 	if prevViaService != wantService {
 		e.ctrl.ResetActiveState()
 	}
@@ -781,6 +814,7 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 
 	return DaemonSnapshot{
 		Version:                AppVersion,
+		Platform:               runtime.GOOS,
 		Arch:                   runtime.GOARCH,
 		CoreRunning:            e.IsCoreRunning(),
 		CoreViaService:         viaSvc,
@@ -1645,7 +1679,7 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 	next.SavedSelections = cur.SavedSelections
 
 	if next.LaunchAtLogin != cur.LaunchAtLogin {
-		uiExe := filepath.Join(e.cfg.BinDir, "clashfx-ui.exe")
+		uiExe := uiLaunchExecutablePath(e.cfg.BinDir)
 		if err := SetLaunchAtLogin(next.LaunchAtLogin, uiExe); err != nil {
 			return fmt.Errorf("update Launch at Login: %w", err)
 		}

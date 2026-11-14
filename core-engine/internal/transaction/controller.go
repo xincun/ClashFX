@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -399,13 +400,16 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		iface := strings.TrimSpace(settings.TunInterfaceName)
 		tunMap := map[string]any{
 			"enable":                true,
-			"device":                "ClashFX",
 			"stack":                 stack,
 			"auto-route":            true,
 			"auto-detect-interface": iface == "",
 			"strict-route":          true,
 			"dns-hijack":            []string{"any:53", "tcp://any:53"},
 			"mtu":                   mtu,
+		}
+		// Darwin sing-tun rejects non-utun<N> device names; omit device so Mihomo auto-allocates utunN.
+		if runtime.GOOS != "darwin" {
+			tunMap["device"] = "ClashFX"
 		}
 		if iface != "" {
 			root["interface-name"] = iface
@@ -432,11 +436,15 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 			}
 		}
 		root["tun"] = tunMap
-		// Prevent proxy loops from core/daemon executables under Windows TUN via inline rule-set
+		// Prevent proxy loops from core/daemon executables under Windows & Darwin TUN via inline rule-set
 		profile.SetInlineClassicalRuleProvider(root, profile.InternalDirectRuleProviderName, []string{
 			"PROCESS-NAME,mihomo_core.exe",
 			"PROCESS-NAME,clashfx-daemon.exe",
 			"PROCESS-NAME,clashfx-service.exe",
+			"PROCESS-NAME,mihomo_core",
+			"PROCESS-NAME,clashfx-daemon",
+			"PROCESS-NAME,clashfx-service",
+			"PROCESS-NAME,ClashFX",
 		})
 		PrependUniqueRules(root, []string{
 			"RULE-SET," + profile.InternalDirectRuleProviderName + ",DIRECT",

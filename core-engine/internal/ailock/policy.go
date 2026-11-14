@@ -19,6 +19,8 @@ const ProcessNamePattern = profile.AILockProcessNamePattern
 
 const WindowsProcessPathPattern = profile.AILockWindowsPathPattern
 
+const DarwinProcessPathPattern = profile.AILockDarwinPathPattern
+
 var ProtectedDomains = profile.DefaultAILockProtectedDomains
 
 type ProviderSnapshot struct {
@@ -73,9 +75,10 @@ func IsValidTarget(target string) bool {
 // RuleProviderPayload returns the deduplicated classical matchers (without target)
 // registered inside the inline clashfx-ai-lock rule-provider.
 func RuleProviderPayload() []string {
-	out := make([]string, 0, 2+len(ProtectedDomains))
+	out := make([]string, 0, 3+len(ProtectedDomains))
 	out = append(out, "PROCESS-NAME-REGEX,"+ProcessNamePattern)
 	out = append(out, "PROCESS-PATH-REGEX,"+WindowsProcessPathPattern)
+	out = append(out, "PROCESS-PATH-REGEX,"+DarwinProcessPathPattern)
 	for _, dom := range ProtectedDomains {
 		out = append(out, "DOMAIN-SUFFIX,"+dom)
 	}
@@ -351,7 +354,11 @@ func isInternalCoreDirectRule(rule string) bool {
 	case "RULE-SET," + InternalDirectRuleProviderName + ",DIRECT",
 		"PROCESS-NAME,mihomo_core.exe,DIRECT",
 		"PROCESS-NAME,clashfx-daemon.exe,DIRECT",
-		"PROCESS-NAME,clashfx-service.exe,DIRECT":
+		"PROCESS-NAME,clashfx-service.exe,DIRECT",
+		"PROCESS-NAME,mihomo_core,DIRECT",
+		"PROCESS-NAME,clashfx-daemon,DIRECT",
+		"PROCESS-NAME,clashfx-service,DIRECT",
+		"PROCESS-NAME,ClashFX,DIRECT":
 		return true
 	default:
 		return false

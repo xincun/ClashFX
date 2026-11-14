@@ -6,11 +6,30 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
 	"github.com/clashfx/core-engine/internal/profile"
 )
+
+type memoryBackend struct {
+	mu    sync.Mutex
+	state OSProxyState
+}
+
+func (m *memoryBackend) ReadState() (OSProxyState, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state, nil
+}
+
+func (m *memoryBackend) WriteState(st OSProxyState) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.state = st
+	return nil
+}
 
 const SnapshotFileName = "sysproxy-snapshot.json"
 
@@ -107,7 +126,7 @@ func (m *Manager) Apply(port int, customBypass string) error {
 	defer m.mu.Unlock()
 
 	targetServer := fmt.Sprintf("127.0.0.1:%d", port)
-	override := FormatWindowsBypass(customBypass)
+	override := FormatBypassForOS(customBypass)
 
 	current, err := m.backend.ReadState()
 	if err != nil {
@@ -290,6 +309,39 @@ func FormatWindowsBypass(custom string) string {
 		out = append(out, "<local>")
 	}
 	return strings.Join(out, ";")
+}
+
+// FormatDarwinBypass parses custom or default bypass rules for macOS networksetup
+// (-setproxybypassdomains), preserving CIDRs while dropping Windows-only <local>.
+func FormatDarwinBypass(custom string) []string {
+	if strings.TrimSpace(custom) == "" {
+		custom = profile.DefaultDarwinProxyBypass
+	}
+	rawTokens := strings.FieldsFunc(custom, func(r rune) bool {
+		return r == ';' || r == ',' || r == '\n' || r == '\r'
+	})
+	seen := map[string]bool{}
+	out := make([]string, 0, len(rawTokens))
+	for _, tok := range rawTokens {
+		t := strings.TrimSpace(tok)
+		if t == "" || strings.EqualFold(t, "<local>") {
+			continue
+		}
+		key := strings.ToLower(t)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, t)
+	}
+	return out
+}
+
+func FormatBypassForOS(custom string) string {
+	if runtime.GOOS == "darwin" {
+		return strings.Join(FormatDarwinBypass(custom), ",")
+	}
+	return FormatWindowsBypass(custom)
 }
 
 func normalizeWinINetToken(token string) string {

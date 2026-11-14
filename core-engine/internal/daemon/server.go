@@ -533,6 +533,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		return okResp(view)
 	case "get_diagnostic_info":
 		return okResp(map[string]string{"report": s.engine.DiagnosticInfo()})
+	case "power_resume":
+		s.engine.HandlePowerResume()
+		return okResp(s.engine.Snapshot())
 	case "check_updates":
 		res, err := s.engine.CheckUpdates(ctx)
 		if err != nil {
