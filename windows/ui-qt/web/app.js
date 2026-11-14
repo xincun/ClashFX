@@ -4,6 +4,7 @@ import {
   esc,
   formatSpeed,
   initBridgeListener,
+  native,
   postNative,
   rpc,
   showToast,
@@ -12,7 +13,7 @@ import {
   t,
   toggleLanguage,
 } from './bridge.js';
-import { renderOverviewPage, renderRulesPage, renderSubscriptionsPage, setRulesSubTab, updateOverviewTelemetry } from './pages-core.js';
+import { renderRulesPage, renderSubscriptionsPage, setRulesSubTab } from './pages-core.js';
 import {
   isDiagConnectionsActive,
   renderAiLockPage,
@@ -24,7 +25,7 @@ import {
 } from './pages-ops.js';
 
 const PAGES = [
-  { id: 0, icon: 'dashboard', zh: '概览与节点', en: 'Overview & Nodes' },
+  { id: 0, icon: 'dashboard', zh: '控制台', en: 'Console', titleZh: '控制台 (MetaCubeXD)', titleEn: 'Console (MetaCubeXD)' },
   { id: 1, icon: 'subscriptions', zh: '订阅与配置', en: 'Subscriptions' },
   { id: 2, icon: 'rules', zh: '分流与规则', en: 'Routing & Rules' },
   { id: 3, icon: 'aiLock', zh: 'AI 锁定', en: 'AI Lock' },
@@ -34,8 +35,15 @@ const PAGES = [
 ];
 
 const pageRoot = document.getElementById('page-content');
+const consoleHost = document.getElementById('console-host');
+const consoleBanner = document.getElementById('console-banner');
+const consoleStandby = document.getElementById('console-standby');
+const consoleFrame = document.getElementById('metacubexd-frame');
+const consoleTools = document.getElementById('console-topbar-tools');
+
 let pendingPageRender = false;
 let renderSeq = 0;
+let loadedConsoleKey = '';
 
 function isUserTypingInPage() {
   const el = document.activeElement;
@@ -108,7 +116,8 @@ function renderChrome() {
     navEl.innerHTML = PAGES.map((p) => {
       const active = store.page === p.id;
       let trailing = '';
-      if (p.id === 3 && aiOn) trailing = `<span class="nav-dot" title="AI Lock Active"></span>`;
+      if (p.id === 0) trailing = `<span class="nav-count">XD</span>`;
+      else if (p.id === 3 && aiOn) trailing = `<span class="nav-dot" title="AI Lock Active"></span>`;
       else if (p.id === 1 && subsCount > 0) trailing = `<span class="nav-count">${subsCount}</span>`;
       else if (p.id === 4 && snap.node_services?.settings?.ports_enabled && nsCount > 0) trailing = `<span class="nav-count">${nsCount}</span>`;
       return `
@@ -194,7 +203,19 @@ function renderChrome() {
   const langBtn = document.getElementById('btn-lang-toggle');
 
   if (tbIcon) tbIcon.innerHTML = ICONS[pageDef.icon] || '';
-  if (tbTitle) tbTitle.textContent = t(pageDef.zh, pageDef.en);
+  if (tbTitle) tbTitle.textContent = t(pageDef.titleZh || pageDef.zh, pageDef.titleEn || pageDef.en);
+  if (consoleTools) {
+    consoleTools.hidden = store.page !== 0;
+    const termBtn = document.getElementById('btn-copy-term');
+    const reloadPanelBtn = document.getElementById('btn-reload-panel');
+    const openBrowserBtn = document.getElementById('btn-open-browser');
+    if (termBtn) termBtn.innerHTML = `${ICONS.terminal} <span>${t('终端代理', 'Terminal Env')}</span>`;
+    if (reloadPanelBtn) reloadPanelBtn.innerHTML = `${ICONS.refresh} <span>${t('刷新面板', 'Reload Panel')}</span>`;
+    if (openBrowserBtn) {
+      openBrowserBtn.innerHTML = ICONS.externalLink;
+      openBrowserBtn.title = t('在浏览器中打开控制台', 'Open Console in Browser');
+    }
+  }
   if (tbChip) {
     const tags = [];
     if (sysOn) tags.push(t('系统代理', 'System'));
@@ -217,16 +238,107 @@ function renderChrome() {
   if (langBtn) langBtn.textContent = store.language === 'en_US' ? 'EN / 中' : '中 / EN';
 }
 
+function postSyncToConsoleFrame({ forceTheme = false, forceLang = false } = {}) {
+  if (!consoleFrame || !consoleFrame.contentWindow) return;
+  const snap = store.snapshot || {};
+  const settings = snap.settings || {};
+  const baseUrl = snap.dashboard_url || '';
+  if (!baseUrl) return;
+  let targetOrigin = '*';
+  try {
+    targetOrigin = new URL(baseUrl).origin;
+  } catch (_) {}
+  consoleFrame.contentWindow.postMessage(
+    {
+      type: 'clashfx_sync',
+      aiLocked: Boolean(settings.claudeProxyLockEnabled),
+      theme: store.theme,
+      language: store.language,
+      forceTheme,
+      forceLang,
+    },
+    targetOrigin
+  );
+}
+
+function syncConsoleHost(forceReload = false) {
+  const onConsole = store.page === 0;
+  if (consoleHost) consoleHost.hidden = !onConsole;
+  if (pageRoot) pageRoot.hidden = onConsole;
+  if (!onConsole) return;
+
+  const snap = store.snapshot || {};
+  const settings = snap.settings || {};
+  const runtime = snap.runtime || {};
+  const aiOn = Boolean(settings.claudeProxyLockEnabled);
+
+  if (consoleBanner) {
+    if (snap.last_error) {
+      consoleBanner.hidden = false;
+      consoleBanner.className = 'console-banner err';
+      consoleBanner.innerHTML = `
+        <span>${esc(snap.last_error)}</span>
+        <button type="button" class="btn btn-xs btn-danger" id="console-banner-diag">${t('打开诊断', 'Diagnostics')}</button>`;
+      consoleBanner.querySelector('#console-banner-diag')?.addEventListener('click', () => go(5, 0));
+    } else if (snap.suspended_by_network) {
+      consoleBanner.hidden = false;
+      consoleBanner.className = 'console-banner';
+      consoleBanner.innerHTML = `
+        <span>${esc(t(`检测到受信任网络「${snap.suspended_by_network}」，代理已自动挂起。`, `Trusted network "${snap.suspended_by_network}" detected — proxy suspended.`))}</span>
+        <button type="button" class="btn btn-xs" id="console-banner-settings">${t('网络规则', 'Network Rules')}</button>`;
+      consoleBanner.querySelector('#console-banner-settings')?.addEventListener('click', () => go(6));
+    } else {
+      consoleBanner.hidden = true;
+      consoleBanner.innerHTML = '';
+    }
+  }
+
+  if (!store.connected || !snap.core_running || !snap.dashboard_url) {
+    if (!snap.core_running) loadedConsoleKey = '';
+    if (consoleFrame) consoleFrame.hidden = true;
+    if (consoleStandby) {
+      consoleStandby.hidden = false;
+      const title = !store.connected
+        ? t('核心守护进程未连接', 'Daemon Disconnected')
+        : t('Mihomo 内核正在待机或启动中', 'Mihomo Core Standing By');
+      const sub = !store.connected
+        ? t('正在尝试重新建立守护进程命名管道连接…', 'Waiting for ClashFX daemon pipe connection…')
+        : t('内核启动就绪后将自动加载完整 MetaCubeXD 控制台。', 'MetaCubeXD console will load automatically once the core API is ready.');
+      consoleStandby.innerHTML = `
+        <div style="font-size:15px;font-weight:700;color:var(--text-primary);">${esc(title)}</div>
+        <div style="max-width:440px;font-size:12.5px;">${esc(sub)}</div>
+        <button type="button" class="btn btn-primary" id="console-standby-reload">${ICONS.refresh} ${t('重载并启动内核', 'Reload Core')}</button>`;
+      consoleStandby.querySelector('#console-standby-reload')?.addEventListener('click', async () => {
+        const res = await rpc('reload_config', {});
+        if (res.ok) showToast(t('已请求重载核心配置', 'Requested core reload'), 'ok');
+      });
+    }
+    return;
+  }
+
+  if (consoleStandby) consoleStandby.hidden = true;
+  if (consoleFrame) consoleFrame.hidden = false;
+
+  const nextKey = `${runtime.api_port || 0}|${runtime.api_secret || ''}|${snap.dashboard_url}`;
+  if (forceReload || loadedConsoleKey !== nextKey) {
+    const langParam = store.language === 'en_US' ? 'en' : 'zh';
+    const sep = snap.dashboard_url.includes('?') ? '&' : '?';
+    const urlWithMeta = `${snap.dashboard_url}${sep}cfx_theme=${store.theme}&cfx_lang=${langParam}&cfx_ai=${aiOn ? '1' : '0'}${forceReload ? `&_t=${Date.now()}` : ''}`;
+    loadedConsoleKey = nextKey;
+    if (consoleFrame) consoleFrame.src = urlWithMeta;
+  } else {
+    postSyncToConsoleFrame();
+  }
+}
+
 async function renderPageContent() {
-  if (!pageRoot) return;
+  if (!pageRoot || store.page === 0) return;
   const seq = ++renderSeq;
   const scrollBefore = pageRoot.scrollTop;
   pageRoot.classList.toggle('no-pad-scroll', store.page === 2);
 
   const handlers = { go };
-  if (store.page === 0) {
-    renderOverviewPage(pageRoot, handlers);
-  } else if (store.page === 1) {
+  if (store.page === 1) {
     renderSubscriptionsPage(pageRoot, handlers);
   } else if (store.page === 2) {
     await renderRulesPage(pageRoot, -1);
@@ -246,6 +358,7 @@ async function renderPageContent() {
 
 function renderAll(forcePage = false) {
   renderChrome();
+  syncConsoleHost(false);
   if (!forcePage && isUserTypingInPage()) {
     pendingPageRender = true;
     return;
@@ -265,6 +378,30 @@ function wireWindowControls() {
   });
 
   document.getElementById('btn-lang-toggle')?.addEventListener('click', () => toggleLanguage());
+
+  document.getElementById('btn-copy-term')?.addEventListener('click', async () => {
+    const snap = store.snapshot || {};
+    const runtime = snap.runtime || {};
+    const settings = snap.settings || {};
+    const mixedPort = runtime.mixed_port || settings.port_override || 7890;
+    const cmd = `$env:HTTP_PROXY="http://127.0.0.1:${mixedPort}"; $env:HTTPS_PROXY="http://127.0.0.1:${mixedPort}"; $env:ALL_PROXY="socks5://127.0.0.1:${mixedPort}"`;
+    await native('copy_text', { text: cmd });
+    showToast(t(`已复制 PowerShell 代理命令 (:${mixedPort})`, `Copied PowerShell proxy command (:${mixedPort})`), 'ok');
+  });
+
+  document.getElementById('btn-reload-panel')?.addEventListener('click', () => {
+    syncConsoleHost(true);
+    showToast(t('已刷新控制台面板', 'Reloaded MetaCubeXD console'), 'ok');
+  });
+
+  document.getElementById('btn-open-browser')?.addEventListener('click', () => {
+    const url = store.snapshot?.dashboard_url || '';
+    if (url) native('open_url', { url });
+  });
+
+  consoleFrame?.addEventListener('load', () => {
+    postSyncToConsoleFrame();
+  });
 
   document.getElementById('btn-reload-core')?.addEventListener('click', async () => {
     const res = await rpc('reload_config', {});
@@ -328,8 +465,17 @@ function wireIconsAndBootstrap() {
       renderAll(true);
       return;
     }
-    if (eventType === 'state' || eventType === 'language') {
+    if (eventType === 'state') {
       renderAll(false);
+      return;
+    }
+    if (eventType === 'theme') {
+      postSyncToConsoleFrame({ forceTheme: true });
+      return;
+    }
+    if (eventType === 'language') {
+      renderAll(false);
+      postSyncToConsoleFrame({ forceLang: true });
       return;
     }
     if (eventType === 'window_state') {
@@ -340,7 +486,6 @@ function wireIconsAndBootstrap() {
     if (eventType === 'telemetry') {
       const dockSpd = document.getElementById('dock-speed');
       if (dockSpd) dockSpd.textContent = `↑ ${formatSpeed(store.telemetry.up)} · ↓ ${formatSpeed(store.telemetry.down)}`;
-      if (store.page === 0) updateOverviewTelemetry();
       if (store.page === 5 && !isUserTypingInPage()) updateConnectionsTelemetry();
     }
   });

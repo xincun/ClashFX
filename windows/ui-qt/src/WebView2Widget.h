@@ -40,12 +40,15 @@ private:
     void syncBounds();
     void applyBackgroundColor();
     void configureMappingAndNavigate();
+    void installMetaCubeXDSubframeScripts();
+    static QString readBundledCompatibilityJS();
     QString resolvedUiRootDir() const;
 
     bool initStarted_ = false;
     bool pageActive_ = true;
     bool themeDark_ = true;
     bool navigated_ = false;
+    bool subframeScriptsInstalled_ = false;
     QString uiRootDir_;
 
 #ifdef Q_OS_WIN

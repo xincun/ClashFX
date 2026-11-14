@@ -600,6 +600,65 @@ html.is-maximized .win-resize {
   padding-bottom: 14px;
 }
 
+[hidden] {
+  display: none !important;
+}
+
+/* Embedded MetaCubeXD Console Host */
+.console-topbar-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.console-host {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-canvas);
+}
+
+.console-banner {
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--amber-soft);
+  color: var(--amber);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.console-banner.err {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.console-standby {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 32px;
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+.console-iframe {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+  background: var(--bg-canvas);
+}
+
 /* Reusable Bento Surface & Grid */
 .bento-grid-4 {
   display: grid;

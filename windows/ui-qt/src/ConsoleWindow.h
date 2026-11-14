@@ -74,11 +74,8 @@ private:
     QTimer* telemetryTimer_ = nullptr;
     QNetworkReply* trafficReply_ = nullptr;
     QByteArray trafficBuffer_;
-    QNetworkReply* memoryReply_ = nullptr;
-    QByteArray memoryBuffer_;
     qint64 lastUpRate_ = 0;
     qint64 lastDownRate_ = 0;
-    qint64 lastMemInuse_ = 0;
     int lastTrafficPort_ = 0;
     QString lastTrafficSecret_;
 

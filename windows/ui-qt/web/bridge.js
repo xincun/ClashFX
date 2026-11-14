@@ -140,6 +140,7 @@ export function applyTheme(theme) {
   store.theme = next;
   document.documentElement.setAttribute('data-theme', next);
   postNative({ type: 'set_theme', theme: next });
+  notify('theme', next);
 }
 
 export async function toggleLanguage() {

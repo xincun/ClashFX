@@ -53,6 +53,11 @@
           <span id="topbar-chip" class="topbar-chip"></span>
         </div>
         <div class="topbar-actions" data-no-drag="true">
+          <div id="console-topbar-tools" class="console-topbar-tools">
+            <button type="button" class="icon-pill-btn" id="btn-copy-term"></button>
+            <button type="button" class="icon-pill-btn" id="btn-reload-panel"></button>
+            <button type="button" class="icon-pill-btn" id="btn-open-browser"></button>
+          </div>
           <button type="button" class="icon-pill-btn" id="btn-reload-core" title="Reload Core"></button>
           <button type="button" class="lang-pill-btn" id="btn-lang-toggle">中 / EN</button>
           <button type="button" class="icon-pill-btn" id="btn-theme-toggle" title="Toggle Theme"></button>
@@ -64,7 +69,12 @@
         </div>
       </header>
 
-      <main id="page-content" class="page-content"></main>
+      <div id="console-host" class="console-host">
+        <div id="console-banner" class="console-banner" hidden></div>
+        <div id="console-standby" class="console-standby" hidden></div>
+        <iframe id="metacubexd-frame" class="console-iframe" title="MetaCubeXD Console"></iframe>
+      </div>
+      <main id="page-content" class="page-content" hidden></main>
     </div>
   </div>
 

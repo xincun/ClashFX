@@ -345,7 +345,7 @@ void ConsoleWindow::onWebMessageReceived(const QJsonObject& msg) {
     if (type == QLatin1String("telemetry_subscribe")) {
         telemetryConnections_ = msg.value(QStringLiteral("include_connections")).toBool(false);
         syncTelemetryState();
-        if (msg.value(QStringLiteral("enabled")).toBool(true)) {
+        if (msg.value(QStringLiteral("enabled")).toBool(true) && telemetryConnections_) {
             pollTelemetrySnapshot();
         }
         return;
@@ -635,14 +635,17 @@ void ConsoleWindow::syncTelemetryState() {
         if (telemetryTimer_->isActive()) telemetryTimer_->stop();
         lastUpRate_ = 0;
         lastDownRate_ = 0;
-        lastMemInuse_ = 0;
         return;
     }
 
     startTrafficStream();
-    if (!telemetryTimer_->isActive()) {
-        telemetryTimer_->start();
-        pollTelemetrySnapshot();
+    if (telemetryConnections_) {
+        if (!telemetryTimer_->isActive()) {
+            telemetryTimer_->start();
+            pollTelemetrySnapshot();
+        }
+    } else if (telemetryTimer_->isActive()) {
+        telemetryTimer_->stop();
     }
 }
 
@@ -660,57 +663,39 @@ void ConsoleWindow::startTrafficStream() {
     lastTrafficPort_ = apiPort;
     lastTrafficSecret_ = secret;
 
-    auto makeReq = [&](const QString& path) {
-        QNetworkRequest req(QUrl(QStringLiteral("http://127.0.0.1:%1%2").arg(apiPort).arg(path)));
-        if (!secret.isEmpty()) {
-            req.setRawHeader("Authorization", QByteArray("Bearer ") + secret.toUtf8());
-        }
-        return req;
-    };
+    QNetworkRequest req(QUrl(QStringLiteral("http://127.0.0.1:%1/traffic").arg(apiPort)));
+    if (!secret.isEmpty()) {
+        req.setRawHeader("Authorization", QByteArray("Bearer ") + secret.toUtf8());
+    }
 
-    auto pushTelemetry = [this]() {
-        if (!uiReady_) return;
-        webView_->postJsonMessage(QJsonObject{
-            {QStringLiteral("type"), QStringLiteral("telemetry")},
-            {QStringLiteral("up"), lastUpRate_},
-            {QStringLiteral("down"), lastDownRate_},
-            {QStringLiteral("memInuse"), lastMemInuse_},
-        });
-    };
-
-    bindNdjsonStream(this, trafficReply_, trafficBuffer_, netMgr_->get(makeReq(QStringLiteral("/traffic"))),
-                     [this, pushTelemetry](const QJsonObject& obj) {
+    bindNdjsonStream(this, trafficReply_, trafficBuffer_, netMgr_->get(req),
+                     [this](const QJsonObject& obj) {
                          lastUpRate_ = static_cast<qint64>(obj.value(QStringLiteral("up")).toDouble(0));
                          lastDownRate_ = static_cast<qint64>(obj.value(QStringLiteral("down")).toDouble(0));
-                         pushTelemetry();
-                     });
-
-    // Mihomo reports runtime memory usage via a dedicated /memory NDJSON stream rather than /connections.
-    bindNdjsonStream(this, memoryReply_, memoryBuffer_, netMgr_->get(makeReq(QStringLiteral("/memory"))),
-                     [this, pushTelemetry](const QJsonObject& obj) {
-                         const qint64 inuse = static_cast<qint64>(obj.value(QStringLiteral("inuse")).toDouble(0));
-                         if (inuse > 0) {
-                             lastMemInuse_ = inuse;
-                             pushTelemetry();
+                         if (uiReady_) {
+                             webView_->postJsonMessage(QJsonObject{
+                                 {QStringLiteral("type"), QStringLiteral("telemetry")},
+                                 {QStringLiteral("up"), lastUpRate_},
+                                 {QStringLiteral("down"), lastDownRate_},
+                             });
                          }
                      });
 }
 
 void ConsoleWindow::stopTrafficStream() {
     abortNdjsonStream(this, trafficReply_, trafficBuffer_);
-    abortNdjsonStream(this, memoryReply_, memoryBuffer_);
     lastTrafficPort_ = 0;
     lastTrafficSecret_.clear();
 }
 
 void ConsoleWindow::pollTelemetrySnapshot() {
-    if (!isVisible() || !uiReady_) return;
+    if (!isVisible() || !uiReady_ || !telemetryConnections_) return;
     const QJsonObject runtime = snapshot_.value(QStringLiteral("runtime")).toObject();
     const int apiPort = runtime.value(QStringLiteral("api_port")).toInt();
     const QString secret = runtime.value(QStringLiteral("api_secret")).toString();
     if (apiPort <= 0) return;
 
-    // Fetch /connections (gives uploadTotal, downloadTotal, active count + optional list)
+    // Fetch /connections only while viewing Diagnostics -> Live Connections
     QNetworkRequest connReq(QUrl(QStringLiteral("http://127.0.0.1:%1/connections").arg(apiPort)));
     connReq.setTransferTimeout(2000);
     if (!secret.isEmpty()) {
@@ -721,28 +706,20 @@ void ConsoleWindow::pollTelemetrySnapshot() {
         const bool ok = (connReply->error() == QNetworkReply::NoError);
         const QByteArray data = connReply->readAll();
         connReply->deleteLater();
-        if (!ok || !uiReady_) return;
+        if (!ok || !uiReady_ || !telemetryConnections_) return;
         const QJsonDocument doc = QJsonDocument::fromJson(data);
         if (!doc.isObject()) return;
         const QJsonObject obj = doc.object();
         const QJsonArray conns = obj.value(QStringLiteral("connections")).toArray();
-        const qint64 connMem = static_cast<qint64>(obj.value(QStringLiteral("memory")).toDouble(0));
-        if (connMem > 0) {
-            lastMemInuse_ = connMem;
-        }
-        QJsonObject payload{
+        const QJsonObject payload{
             {QStringLiteral("type"), QStringLiteral("telemetry")},
             {QStringLiteral("up"), lastUpRate_},
             {QStringLiteral("down"), lastDownRate_},
             {QStringLiteral("upTotal"), obj.value(QStringLiteral("uploadTotal"))},
             {QStringLiteral("downTotal"), obj.value(QStringLiteral("downloadTotal"))},
-            {QStringLiteral("memory"), connMem > 0 ? connMem : lastMemInuse_},
-            {QStringLiteral("memInuse"), lastMemInuse_},
             {QStringLiteral("connectionCount"), conns.size()},
+            {QStringLiteral("connections"), conns},
         };
-        if (telemetryConnections_) {
-            payload.insert(QStringLiteral("connections"), conns);
-        }
         webView_->postJsonMessage(payload);
     });
 }
