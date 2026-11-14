@@ -138,7 +138,10 @@ void DaemonClient::maybeAutoSpawnDaemon() {
     proc.setWorkingDirectory(appDir);
 #ifdef Q_OS_WIN
     proc.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* cpArgs) {
-        cpArgs->flags |= CREATE_NO_WINDOW | DETACHED_PROCESS;
+        cpArgs->flags &= ~DWORD(DETACHED_PROCESS);
+        cpArgs->flags |= CREATE_NO_WINDOW;
+        cpArgs->startupInfo->dwFlags |= STARTF_USESHOWWINDOW;
+        cpArgs->startupInfo->wShowWindow = SW_HIDE;
     });
 #endif
     proc.startDetached();

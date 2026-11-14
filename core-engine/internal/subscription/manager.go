@@ -86,6 +86,7 @@ func (b BinaryCoreHelper) ConvertShareLinks(raw []byte) ([]byte, error) {
 
 func (b BinaryCoreHelper) ValidateConfig(homeDir, configPath string) error {
 	cmd := exec.Command(b.CoreBinaryPath, "-t", "-d", homeDir, "-f", configPath)
+	configureChildProcess(cmd)
 	if len(b.SafePaths) > 0 {
 		cmd.Env = appendSafePathsEnv(os.Environ(), b.SafePaths...)
 	}

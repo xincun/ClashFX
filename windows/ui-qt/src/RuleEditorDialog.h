@@ -10,6 +10,7 @@ class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
+class QSplitter;
 class QStackedWidget;
 class QTableWidget;
 
@@ -58,6 +59,8 @@ private:
     void loadSelectedProviderIntoEditor();
     void saveSelectedRuleProvider();
     void resetSelectedRuleProvider();
+    void ensureRulesetEditorVisible();
+    void selectProviderFromTable(const QString& providerName, bool focusEditor);
     void setDirty(bool dirty);
     void setRulesetDirty(bool dirty);
 
@@ -70,6 +73,9 @@ private:
     bool dirty_ = false;
     bool rulesetDirty_ = false;
     bool loading_ = false;
+    bool mixinLoaded_ = false;
+    bool loadingMixin_ = false;
+    bool loadingEffective_ = false;
     bool switchingTab_ = false;
     bool togglingRule_ = false;
     int currentTab_ = 0;
@@ -116,8 +122,10 @@ private:
     QComboBox* effSourceCombo_ = nullptr;
     BadgePill* effCountPill_ = nullptr;
     QPushButton* effRefreshBtn_ = nullptr;
+    QSplitter* effSplitter_ = nullptr;
     QTableWidget* effTable_ = nullptr;
 
+    QFrame* rsCard_ = nullptr;
     QLabel* rsTitleLbl_ = nullptr;
     QComboBox* rsProviderCombo_ = nullptr;
     BadgePill* rsBehaviorPill_ = nullptr;
