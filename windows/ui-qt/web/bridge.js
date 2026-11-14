@@ -81,6 +81,24 @@ function notify(eventType, payload) {
   }
 }
 
+const LONG_RPC_METHODS = new Set([
+  'benchmark_all',
+  'benchmark_group',
+  'update_geo_databases',
+  'upsert_subscription',
+  'refresh_subscription',
+  'import_url_scheme',
+  'diagnose_node',
+  'node_refresh_direct',
+  'node_check_connectivity',
+  'node_speed_test_start',
+  'check_updates',
+  'set_enhanced_mode',
+  'set_ai_lock',
+  'reload_config',
+  'update_settings',
+]);
+
 export function rpc(method, params = {}, options = {}) {
   const { allowUacPrompt = true, silent = false } = options;
   const sendOnce = (p) =>
@@ -88,12 +106,13 @@ export function rpc(method, params = {}, options = {}) {
       const id = nextId++;
       pendingRpc.set(id, resolve);
       postNative({ type: 'rpc', id, method, params: p || {} });
+      const timeoutMs = LONG_RPC_METHODS.has(method) || Boolean(p && p.allow_uac) ? 120000 : 40000;
       setTimeout(() => {
         if (pendingRpc.has(id)) {
           pendingRpc.delete(id);
           resolve({ ok: false, error: t('请求超时', 'Request timed out'), error_code: 'TIMEOUT' });
         }
-      }, 30000);
+      }, timeoutMs);
     });
 
   return sendOnce(params).then(async (res) => {

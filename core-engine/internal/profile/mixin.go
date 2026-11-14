@@ -1,6 +1,7 @@
 package profile
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
@@ -89,7 +90,60 @@ func NormalizeYAMLValue(v any) any {
 	}
 }
 
+func expandLeadingTabs(data []byte, tabStop int) []byte {
+	lines := bytes.Split(data, []byte{'\n'})
+	for idx, line := range lines {
+		i := 0
+		col := 0
+		hasTab := false
+		for i < len(line) {
+			switch line[i] {
+			case ' ':
+				col++
+				i++
+			case '\t':
+				col += tabStop - (col % tabStop)
+				hasTab = true
+				i++
+			default:
+				goto done
+			}
+		}
+	done:
+		if !hasTab {
+			continue
+		}
+		expanded := make([]byte, col+len(line)-i)
+		for j := 0; j < col; j++ {
+			expanded[j] = ' '
+		}
+		copy(expanded[col:], line[i:])
+		lines[idx] = expanded
+	}
+	return bytes.Join(lines, []byte{'\n'})
+}
+
+// SanitizeYAMLIndentation expands tab indentation to spaces when raw YAML fails
+// initial parsing due to leading tabs (preserving tabs inside values/comments).
+func SanitizeYAMLIndentation(data []byte) []byte {
+	if !bytes.Contains(data, []byte{'\t'}) {
+		return data
+	}
+	var probe any
+	if yaml.Unmarshal(data, &probe) == nil {
+		return data
+	}
+	for _, stop := range []int{2, 4} {
+		cand := expandLeadingTabs(data, stop)
+		if yaml.Unmarshal(cand, &probe) == nil {
+			return cand
+		}
+	}
+	return data
+}
+
 func UnmarshalYAMLMap(data []byte) (map[string]any, error) {
+	data = SanitizeYAMLIndentation(data)
 	var raw any
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, err

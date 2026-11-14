@@ -218,8 +218,14 @@ func rpcTimeoutForMethod(method string) time.Duration {
 		"upsert_subscription",
 		"refresh_subscription",
 		"import_url_scheme",
+		"diagnose_node",
 		"node_refresh_direct",
-		"check_updates":
+		"node_check_connectivity",
+		"node_speed_test_start",
+		"check_updates",
+		"set_enhanced_mode",
+		"set_ai_lock",
+		"reload_config":
 		return 120 * time.Second
 	default:
 		return 35 * time.Second
@@ -350,7 +356,11 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		}
 		return okResp(s.engine.Snapshot())
 	case "reload_config":
-		if _, err := s.engine.applyAndSync(ctx, false, false); err != nil {
+		var p struct {
+			AllowUAC bool `json:"allow_uac"`
+		}
+		_ = json.Unmarshal(req.Params, &p)
+		if _, err := s.engine.applyAndSync(ctx, true, p.AllowUAC); err != nil {
 			return errResp(err)
 		}
 		return okResp(s.engine.Snapshot())

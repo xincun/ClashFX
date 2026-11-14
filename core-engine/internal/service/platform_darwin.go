@@ -193,3 +193,35 @@ func consoleOwnerUID() (uint32, bool) {
 	}
 	return st.Uid, true
 }
+
+// repairUserHomeOwnership restores user ownership on runtime directories/files created
+// inside the desktop user's ~/.config/clashfx directory while mihomo_core runs as root.
+func repairUserHomeOwnership(cleanHome string) {
+	if os.Geteuid() != 0 || strings.TrimSpace(cleanHome) == "" {
+		return
+	}
+	info, err := os.Stat(cleanHome)
+	if err != nil {
+		return
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st.Uid == 0 {
+		return
+	}
+	uid, gid := int(st.Uid), int(st.Gid)
+	for _, name := range []string{"ruleset", "clashfx-rulesets", "proxies", "rules", "cache.db", ".mihomo_core.log", ".mihomo_core_logs"} {
+		target := filepath.Join(cleanHome, name)
+		linfo, lerr := os.Lstat(target)
+		if lerr != nil {
+			continue
+		}
+		_ = os.Lchown(target, uid, gid)
+		if linfo.IsDir() {
+			if entries, rerr := os.ReadDir(target); rerr == nil {
+				for _, entry := range entries {
+					_ = os.Lchown(filepath.Join(target, entry.Name()), uid, gid)
+				}
+			}
+		}
+	}
+}

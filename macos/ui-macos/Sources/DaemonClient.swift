@@ -211,9 +211,31 @@ final class DaemonClient {
         }
         proc.arguments = args
         proc.standardInput = FileHandle.nullDevice
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
+
+        let runtimeDir = "/tmp/clashfx-\(getuid())"
+        try? FileManager.default.createDirectory(
+            atPath: runtimeDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let logPath = (runtimeDir as NSString).appendingPathComponent("daemon.log")
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath),
+           let size = attrs[.size] as? NSNumber,
+           size.int64Value > 2 * 1024 * 1024 {
+            try? Data().write(to: URL(fileURLWithPath: logPath), options: .atomic)
+        } else if !FileManager.default.fileExists(atPath: logPath) {
+            FileManager.default.createFile(
+                atPath: logPath,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            )
+        }
+        let logHandle = FileHandle(forWritingAtPath: logPath)
+        _ = try? logHandle?.seekToEnd()
+        proc.standardOutput = logHandle ?? FileHandle.nullDevice
+        proc.standardError = logHandle ?? FileHandle.nullDevice
         try? proc.run()
+        try? logHandle?.close()
     }
 
     private func writeAll(fd: Int32, data: Data) -> Bool {

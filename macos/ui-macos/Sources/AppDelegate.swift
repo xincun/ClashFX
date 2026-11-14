@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 import Foundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -13,6 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var consoleWindow: ConsoleWindowController?
     private var trayController: TrayController?
     private var wakeObserver: NSObjectProtocol?
+    private var instanceLockFd: Int32 = -1
+    private var controlListenFd: Int32 = -1
+    private var controlSocketPath = ""
 
     override init() {
         super.init()
@@ -29,10 +33,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if !acquireSingleInstanceOrForward() {
+            exit(0)
+        }
         installStandardMenus()
 
         let client = DaemonClient(config: config)
-        let showInitially = !backgroundStart || smokeTestMs > 0
+        let showInitially = (!backgroundStart || smokeTestMs > 0) && startupCmd != "--quit" && startupCmd != "--quit-uninstall"
         let console = ConsoleWindowController(client: client)
         let tray = TrayController(client: client, consoleWindow: console, showConsoleInitially: showInitially)
 
@@ -76,6 +83,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
             self.wakeObserver = nil
+        }
+        stopControlSocket()
+        if instanceLockFd >= 0 {
+            Darwin.close(instanceLockFd)
+            instanceLockFd = -1
         }
         daemonClient?.stopReconnect()
     }
@@ -216,5 +228,154 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitFromMenu() {
         trayController?.quitAll(forceRestoreProxy: false)
+    }
+
+    // MARK: - Per-Pipe Single-Instance Control Socket
+
+    private func pipeInstanceHash() -> String {
+        var h: UInt64 = 14695981039346656037
+        for b in config.pipePath.utf8 {
+            h ^= UInt64(b)
+            h &*= 1099511628211
+        }
+        return String(format: "%016llx", h)
+    }
+
+    private func acquireSingleInstanceOrForward() -> Bool {
+        let runtimeDir = "/tmp/clashfx-\(getuid())"
+        try? FileManager.default.createDirectory(
+            atPath: runtimeDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let hash = pipeInstanceHash()
+        let lockPath = (runtimeDir as NSString).appendingPathComponent("ui-\(hash).lock")
+        let sockPath = (runtimeDir as NSString).appendingPathComponent("ui-\(hash).sock")
+
+        let fd = Darwin.open(lockPath, O_CREAT | O_RDWR, 0o600)
+        if fd < 0 {
+            return true
+        }
+        _ = Darwin.fcntl(fd, F_SETFD, FD_CLOEXEC)
+
+        var fl = Darwin.flock()
+        fl.l_type = Int16(F_WRLCK)
+        fl.l_whence = Int16(SEEK_SET)
+        fl.l_start = 0
+        fl.l_len = 0
+        if Darwin.fcntl(fd, F_SETLK, &fl) != 0 {
+            let payload: String
+            if !startupUri.isEmpty {
+                payload = "URI:\(startupUri)"
+            } else if !startupCmd.isEmpty {
+                payload = startupCmd
+            } else {
+                payload = "ACTIVATE"
+            }
+            forwardCommandToRunningInstance(sockPath: sockPath, command: payload)
+            Darwin.close(fd)
+            return false
+        }
+
+        instanceLockFd = fd
+        controlSocketPath = sockPath
+        startControlSocketListener(sockPath: sockPath)
+        return true
+    }
+
+    private func forwardCommandToRunningInstance(sockPath: String, command: String) {
+        let utf8 = Array(sockPath.utf8)
+        guard utf8.count < 104 else { return }
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return }
+        defer { Darwin.close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { rawBuf in
+            rawBuf.initializeMemory(as: UInt8.self, repeating: 0)
+            for (idx, b) in utf8.enumerated() where idx + 1 < rawBuf.count {
+                rawBuf[idx] = b
+            }
+        }
+        let connRes = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connRes == 0 else { return }
+        let lineBytes = Array((command + "\n").utf8)
+        _ = lineBytes.withUnsafeBytes { buf in
+            guard let base = buf.baseAddress else { return 0 }
+            return Darwin.write(fd, base, buf.count)
+        }
+    }
+
+    private func startControlSocketListener(sockPath: String) {
+        let utf8 = Array(sockPath.utf8)
+        guard utf8.count < 104 else { return }
+        Darwin.unlink(sockPath)
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return }
+        _ = Darwin.fcntl(fd, F_SETFD, FD_CLOEXEC)
+
+        var addr = sockaddr_un()
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { rawBuf in
+            rawBuf.initializeMemory(as: UInt8.self, repeating: 0)
+            for (idx, b) in utf8.enumerated() where idx + 1 < rawBuf.count {
+                rawBuf[idx] = b
+            }
+        }
+        let bindRes = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.bind(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard bindRes == 0, Darwin.listen(fd, 16) == 0 else {
+            Darwin.close(fd)
+            return
+        }
+        _ = Darwin.chmod(sockPath, 0o600)
+        controlListenFd = fd
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while true {
+                let connFd = Darwin.accept(fd, nil, nil)
+                if connFd < 0 {
+                    if errno == EINTR { continue }
+                    break
+                }
+                var collected = Data()
+                while collected.count < 16384 {
+                    let n = Darwin.read(connFd, &buf, buf.count)
+                    if n <= 0 { break }
+                    collected.append(contentsOf: buf[0..<n])
+                    if collected.contains(0x0A) { break }
+                }
+                Darwin.close(connFd)
+                if let msg = String(data: collected, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !msg.isEmpty {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.trayController?.handleExternalCommand(msg)
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopControlSocket() {
+        if controlListenFd >= 0 {
+            Darwin.close(controlListenFd)
+            controlListenFd = -1
+        }
+        if !controlSocketPath.isEmpty {
+            Darwin.unlink(controlSocketPath)
+            controlSocketPath = ""
+        }
     }
 }

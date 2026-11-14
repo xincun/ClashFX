@@ -132,16 +132,10 @@ func applyLegacyDictToSettings(dict map[string]any, s *AppSettings) {
 		s.IPv6 = v
 	}
 	if v, ok := dictString(dict, "appLanguage"); ok {
-		lower := strings.ToLower(v)
-		switch {
-		case strings.HasPrefix(lower, "zh"):
-			s.Language = "zh_CN"
-		case strings.HasPrefix(lower, "en"):
-			s.Language = "en"
-		}
+		s.Language = NormalizeLanguageCode(v)
 	}
 	if v, ok := dictString(dict, "selectedMenuIconID"); ok {
-		s.TrayIconPreset = v
+		s.TrayIconPreset = NormalizeTrayIconPreset(v)
 	}
 	if list, ok := dictStringSlice(dict, "disableSSIDList"); ok {
 		s.SuspendNetworks = list

@@ -126,6 +126,7 @@ export function renderSubscriptionsPage(root) {
     })
     .join('');
 
+  const pathSep = store.platform === 'darwin' ? '/' : '\\';
   const localCardsHtml = localOnlyProfiles
     .map((name) => {
       const isActive = settings.selected_profile === name;
@@ -143,7 +144,7 @@ export function renderSubscriptionsPage(root) {
                 : `<button type="button" class="btn btn-sm btn-primary" data-sub-select="${esc(name)}">${t('切换使用', 'Activate')}</button>`
             }
           </div>
-          <div class="metric-sub mono">${esc(snap.config_dir || '')}\\${esc(name)}.yaml</div>
+          <div class="metric-sub mono">${esc(snap.config_dir || '')}${pathSep}${esc(name)}.yaml</div>
         </div>`;
     })
     .join('');

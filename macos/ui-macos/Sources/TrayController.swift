@@ -620,23 +620,22 @@ final class TrayController: NSObject, NSMenuDelegate {
             }
             gSub.addItem(.separator())
 
-            let nodes = (g["nodes"] as? [[String: Any]]) ?? []
+            let nodes = (g["items"] as? [[String: Any]]) ?? []
             for n in nodes {
                 let nName = (n["name"] as? String) ?? ""
                 let delay = (n["delay_ms"] as? Int) ?? 0
                 let tested = (n["tested"] as? Bool) ?? false
-                let alive = (n["alive"] as? Bool) ?? true
-                let isSelected = (n["selected"] as? Bool) ?? false
+                let isSelected = (!now.isEmpty && nName == now)
 
                 var label = nName
                 if delay > 0 {
                     label += "  (\(delay) ms)"
-                } else if tested && !alive {
+                } else if tested {
                     label += L("  (超时)", "  (Timeout)")
                 }
 
                 addItem(to: gSub, title: label, enabled: connected && !isLB && !aiLocked, checked: isSelected) { [weak self] in
-                    self?.client.call(method: "select_proxy", params: ["group": gName, "node": nName]) { ok, _, err, _ in
+                    self?.client.call(method: "select_proxy", params: ["group": gName, "target": nName]) { ok, _, err, _ in
                         if !ok {
                             self?.showAlert(title: "ClashFX", message: I18n.translateBackendText(err), warning: true)
                         }
@@ -703,10 +702,10 @@ final class TrayController: NSObject, NSMenuDelegate {
         }
         cfgSub.addItem(.separator())
         addItem(to: cfgSub, title: L("重载当前配置", "Reload Config")) { [weak self] in
-            self?.client.call(method: "reload_config") { ok, _, err, _ in
+            self?.client.call(method: "reload_config", params: ["allow_uac": true], timeoutSeconds: 120) { ok, _, err, _ in
                 self?.handleConfigMutationResult(
                     actionTitle: L("重载当前配置", "Reload Config"),
-                    retryAction: { self?.client.call(method: "reload_config") },
+                    retryAction: { self?.client.call(method: "reload_config", params: ["allow_uac": true], timeoutSeconds: 120) },
                     ok: ok,
                     err: err
                 )

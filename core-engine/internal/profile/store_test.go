@@ -244,3 +244,32 @@ func TestEagerProfileMixinUpgradeAndInternalWriteWatcherSuppression(t *testing.T
 		t.Fatal("expected external write to trigger fsnotify callback")
 	}
 }
+
+func TestUnmarshalYAMLMapAndApplyMixinSanitizesTabIndentation(t *testing.T) {
+	tabMixin := []byte("# comment\nprofile:\n  prepend-rules:\n  \t- DOMAIN-SUFFIX,google.com,JMS\n    - GEOSITE,google,JMS\n")
+	parsed, err := UnmarshalYAMLMap(tabMixin)
+	if err != nil {
+		t.Fatalf("expected tab-indented YAML to parse after sanitization: %v", err)
+	}
+	if _, ok := parsed["profile"].(map[string]any); !ok {
+		t.Fatalf("expected profile map in parsed YAML: %+v", parsed)
+	}
+
+	base := map[string]any{
+		"proxy-groups": []any{map[string]any{"name": "JMS", "type": "select", "proxies": []any{"DIRECT"}}},
+		"rules":        []any{"MATCH,JMS"},
+	}
+	merged, err := ApplyProfileMixin(base, tabMixin)
+	if err != nil {
+		t.Fatalf("ApplyProfileMixin failed on tab-indented mixin: %v", err)
+	}
+	rules := extractStringRules(merged["rules"])
+	if len(rules) != 3 || rules[0] != "DOMAIN-SUFFIX,google.com,JMS" || rules[1] != "GEOSITE,google,JMS" {
+		t.Fatalf("unexpected merged rules: %v", rules)
+	}
+
+	fourSpaceTab := []byte("profile:\n    prepend-rules:\n\t- DOMAIN-SUFFIX,example.com,JMS\n    - MATCH,JMS\n")
+	if _, err := UnmarshalYAMLMap(fourSpaceTab); err != nil {
+		t.Fatalf("expected 4-space tab-indented YAML to parse: %v", err)
+	}
+}

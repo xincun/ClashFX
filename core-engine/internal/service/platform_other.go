@@ -71,3 +71,5 @@ func ListenSecurePipe() (net.Listener, error) {
 func VerifyPipePeer(_ net.Conn, _ string) error {
 	return nil
 }
+
+func repairUserHomeOwnership(_ string) {}

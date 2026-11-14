@@ -470,6 +470,7 @@ func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUA
 	e.opMu.Unlock()
 
 	if err != nil {
+		e.refreshLiveCoreMetadata(ctx)
 		e.notifyStateChanged()
 		return state, err
 	}
@@ -1505,6 +1506,9 @@ func (e *Engine) SetAILock(ctx context.Context, enabled bool, target string, all
 				s.SystemProxyEnabled = s.AILockSavedState.SystemProxyEnabled
 				s.AILockSavedState = nil
 			}
+			if s.EnhancedMode && supportsPrivilegedService() && !IsPrivilegedServiceInstalled(service.ServiceName) && !allowUAC {
+				s.EnhancedMode = false
+			}
 		}
 		return nil
 	}); err != nil {
@@ -1774,10 +1778,11 @@ func (e *Engine) SaveProfileMixin(ctx context.Context, mode, rawYAML, baseYAML s
 	var err error
 	m := strings.TrimSpace(mode)
 	if strings.EqualFold(m, "yaml") || strings.EqualFold(m, "raw") {
-		if _, parseErr := profile.UnmarshalYAMLMap([]byte(rawYAML)); parseErr != nil {
+		sanitized := profile.SanitizeYAMLIndentation([]byte(rawYAML))
+		if _, parseErr := profile.UnmarshalYAMLMap(sanitized); parseErr != nil {
 			return features.ProfileMixinDocument{}, fmt.Errorf("YAML 格式错误: %w", parseErr)
 		}
-		finalYAML = []byte(rawYAML)
+		finalYAML = sanitized
 	} else {
 		base := []byte(baseYAML)
 		if len(strings.TrimSpace(baseYAML)) == 0 {

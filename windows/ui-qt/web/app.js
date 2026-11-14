@@ -296,6 +296,62 @@ function syncConsoleHost(forceReload = false) {
     if (consoleFrame) consoleFrame.hidden = true;
     if (consoleStandby) {
       consoleStandby.hidden = false;
+      const needPrivService =
+        store.connected &&
+        !snap.core_running &&
+        /ClashFXService is not installed yet|SERVICE_INSTALL_REQUIRED/i.test(snap.last_error || '');
+      if (needPrivService) {
+        const subPriv =
+          store.platform === 'darwin'
+            ? t(
+                '当前配置开启了 TUN 增强模式或 AI 专用锁定，首次运行需一次性 macOS 管理员授权安装后台服务；也可一键切换为普通系统代理模式直接启动（无需管理员权限）。',
+                'Enhanced TUN Mode or AI Proxy Lock is enabled. Authorize once as macOS administrator to install the background service, or switch to standard System Proxy mode without admin privileges.'
+              )
+            : t(
+                '当前配置开启了 TUN 增强模式或 AI 专用锁定，首次运行需一次性管理员授权安装后台服务；也可切换为普通系统代理模式直接启动。',
+                'Enhanced TUN Mode or AI Proxy Lock is enabled. Authorize once to install the system service, or start in standard System Proxy mode.'
+              );
+        consoleStandby.innerHTML = `
+          <div style="font-size:15px;font-weight:700;color:var(--text-primary);">${esc(t('需要安装系统特权服务以启用 TUN 增强 / AI 锁定', 'Privileged System Service Required for TUN / AI Lock'))}</div>
+          <div style="max-width:480px;font-size:12.5px;line-height:1.55;">${esc(subPriv)}</div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:4px;">
+            <button type="button" class="btn btn-primary" id="console-standby-elevate">${ICONS.aiLock} ${t('授权安装服务并启动内核', 'Authorize Service & Start Core')}</button>
+            <button type="button" class="btn" id="console-standby-standard">${t('切换为普通模式启动 (免管理员)', 'Start in Standard Mode')}</button>
+          </div>`;
+        const elevBtn = consoleStandby.querySelector('#console-standby-elevate');
+        const stdBtn = consoleStandby.querySelector('#console-standby-standard');
+        elevBtn?.addEventListener('click', async () => {
+          elevBtn.disabled = true;
+          const res = await rpc('reload_config', { allow_uac: true }, { allowUacPrompt: false });
+          elevBtn.disabled = false;
+          if (res.ok) showToast(t('系统服务已就绪并启动内核', 'Privileged service ready and core started'), 'ok');
+        });
+        stdBtn?.addEventListener('click', async () => {
+          stdBtn.disabled = true;
+          try {
+            const cur = store.snapshot?.settings || {};
+            if (cur.claudeProxyLockEnabled) {
+              const r = await rpc('set_ai_lock', { enabled: false, target: '' }, { allowUacPrompt: false });
+              if (!r.ok) return;
+            } else if (cur.enhanced_mode) {
+              const r = await rpc('set_enhanced_mode', { enabled: false }, { allowUacPrompt: false });
+              if (!r.ok) return;
+            }
+            if (!store.snapshot?.settings?.system_proxy_enabled) {
+              await rpc('set_system_proxy', { enabled: true });
+            }
+            if (!store.snapshot?.core_running) {
+              await rpc('reload_config', {}, { allowUacPrompt: false });
+            }
+            if (store.snapshot?.core_running) {
+              showToast(t('已切换为普通系统代理模式并启动内核', 'Started core in standard System Proxy mode'), 'ok');
+            }
+          } finally {
+            if (stdBtn) stdBtn.disabled = false;
+          }
+        });
+        return;
+      }
       const title = !store.connected
         ? t('核心守护进程未连接', 'Daemon Disconnected')
         : t('Mihomo 内核正在待机或启动中', 'Mihomo Core Standing By');

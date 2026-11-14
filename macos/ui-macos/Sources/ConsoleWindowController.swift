@@ -649,10 +649,13 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
 
         let longMethods: Set<String> = [
             "benchmark_all", "benchmark_group", "refresh_subscription",
-            "refresh_all_subscriptions", "add_subscription", "update_geo_databases",
-            "run_node_diagnostics", "test_node_download_speeds", "install_service",
+            "upsert_subscription", "import_url_scheme", "update_geo_databases",
+            "diagnose_node", "node_refresh_direct", "node_check_connectivity",
+            "node_speed_test_start", "check_updates",
+            "set_enhanced_mode", "set_ai_lock", "reload_config", "update_settings",
         ]
-        let timeoutSec = longMethods.contains(method) ? 60 : 25
+        let allowUac = (params["allow_uac"] as? Bool) ?? false
+        let timeoutSec = (longMethods.contains(method) || allowUac) ? 120 : 35
         client.call(method: method, params: params, timeoutSeconds: timeoutSec) { [weak self] ok, data, err, errCode in
             self?.postJsonMessage([
                 "type": "rpc_result",

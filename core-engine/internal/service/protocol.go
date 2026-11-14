@@ -335,6 +335,7 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 	r.logMu.Unlock()
 
 	endpoints := extractConfigEndpoints(cleanConfig)
+	repairUserHomeOwnership(cleanHome)
 
 	if err := cmd.Start(); err != nil {
 		return r.statusLocked(), fmt.Errorf("start core process: %w", err)
@@ -376,6 +377,7 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 
 	select {
 	case <-readyCh:
+		repairUserHomeOwnership(cleanHome)
 		return r.statusLocked(), nil
 	case waitErr := <-doneCh:
 		guard.closeHandles()
@@ -412,6 +414,9 @@ func (r *Runner) stopLocked() error {
 		r.cmd = nil
 		r.guard = nil
 		r.doneCh = nil
+		if r.homeDir != "" {
+			repairUserHomeOwnership(r.homeDir)
+		}
 		return nil
 	}
 
@@ -419,6 +424,9 @@ func (r *Runner) stopLocked() error {
 	r.cmd = nil
 	r.guard = nil
 	r.doneCh = nil
+	if r.homeDir != "" {
+		repairUserHomeOwnership(r.homeDir)
+	}
 	return stopErr
 }
 

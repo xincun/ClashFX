@@ -256,6 +256,7 @@ func ParseProfileMixinDocument(rawYAML []byte, defaultTarget string) (ProfileMix
 	if strings.TrimSpace(text) == "" {
 		text = profile.DefaultProfileMixinTemplate
 	}
+	text = string(profile.SanitizeYAMLIndentation([]byte(text)))
 	doc, err := profile.UnmarshalYAMLMap([]byte(text))
 	if err != nil {
 		return ProfileMixinDocument{}, err

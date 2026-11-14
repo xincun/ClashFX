@@ -149,6 +149,25 @@ func buildLaunchDaemonPlist() string {
 `, service.DarwinLaunchDaemonLabel, binPath)
 }
 
+func retireLegacyDarwinHelper() {
+	const (
+		legacyPlist  = "/Library/LaunchDaemons/com.clashfx.app.Helper.plist"
+		legacyLabel  = "com.clashfx.app.Helper"
+		legacyHelper = "/Library/PrivilegedHelperTools/com.clashfx.app.Helper"
+	)
+	_ = exec.Command("/bin/launchctl", "bootout", "system", legacyPlist).Run()
+	_ = exec.Command("/bin/launchctl", "bootout", "system/"+legacyLabel).Run()
+	_ = os.Remove(legacyPlist)
+	_ = os.Remove(legacyHelper)
+	if matches, err := filepath.Glob(legacyHelper + "*"); err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
+	_ = exec.Command("/usr/bin/pkill", "-TERM", "-f", `mihomo_core.*\.enhanced_config`).Run()
+	time.Sleep(250 * time.Millisecond)
+}
+
 func installAndStartService(sourceDir string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("install must be run as root")
@@ -161,6 +180,8 @@ func installAndStartService(sourceDir string) error {
 		}
 		srcDir = dir
 	}
+
+	retireLegacyDarwinHelper()
 
 	if err := os.MkdirAll(service.DarwinPrivilegedBinDir, 0755); err != nil {
 		return err

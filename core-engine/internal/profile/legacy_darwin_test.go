@@ -105,7 +105,7 @@ func TestMigrateLegacyDarwinPlistFile(t *testing.T) {
 	if settings.PortOverride != 7891 || settings.APIPort != 19091 || !settings.AllowLan || !settings.IPv6 {
 		t.Fatalf("unexpected network settings: %+v", settings)
 	}
-	if settings.Language != "en" || settings.TrayIconPreset != "cat" || settings.UpdateChannel != "lab" {
+	if settings.Language != "en_US" || settings.TrayIconPreset != "default" || settings.UpdateChannel != "lab" {
 		t.Fatalf("unexpected UI settings: %+v", settings)
 	}
 	if !reflect.DeepEqual(settings.SuspendNetworks, []string{"Corp-WiFi", "Home-5G"}) {
@@ -132,5 +132,66 @@ func TestMigrateLegacyDarwinPlistFile(t *testing.T) {
 	}
 	if subs[0].UserInfo == nil || subs[0].UserInfo.Total == nil || *subs[0].UserInfo.Total != 1073741824 {
 		t.Fatalf("unexpected migrated userinfo: %+v", subs[0].UserInfo)
+	}
+}
+
+func TestNormalizeAndUnwritableLegacyRulesetFallback(t *testing.T) {
+	if NormalizeLanguageCode("en") != "en_US" {
+		t.Fatalf("expected en -> en_US")
+	}
+	if NormalizeTrayIconPreset("cat-lightning-outline") != "monochrome" {
+		t.Fatalf("expected cat-lightning-outline -> monochrome")
+	}
+
+	dir := t.TempDir()
+	legacyDir := filepath.Join(dir, RulesetDirName)
+	if err := os.MkdirAll(legacyDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	legacyCN := filepath.Join(legacyDir, CNAppsRuleProviderName+".list")
+	if err := os.WriteFile(legacyCN, []byte("PROCESS-NAME,CustomMacApp\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(legacyDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(legacyDir, 0755) }()
+
+	// Seed a settings.json containing legacy macOS values to verify auto-healing on load
+	legacySettings := `{
+  "selected_profile": "config",
+  "tray_icon_preset": "cat-lightning-outline",
+  "language": "en"
+}`
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(legacySettings), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(dir, "")
+	if err != nil {
+		t.Fatalf("NewStore failed with unwritable legacy ruleset dir: %v", err)
+	}
+	defer store.Close()
+
+	st := store.Settings()
+	if st.Language != "en_US" || st.TrayIconPreset != "monochrome" {
+		t.Fatalf("expected settings normalized on load, got lang=%q icon=%q", st.Language, st.TrayIconPreset)
+	}
+	if ResolveRulesetDirName(dir) != FallbackRulesetDirName {
+		t.Fatalf("expected fallback ruleset dir %q, got %q", FallbackRulesetDirName, ResolveRulesetDirName(dir))
+	}
+	relPath := BuiltinRulesetRelPathInDir(dir, CNAppsRuleProviderName)
+	if relPath != "./clashfx-rulesets/clashfx-cn-apps-direct.list" {
+		t.Fatalf("unexpected fallback rel path: %q", relPath)
+	}
+	fallbackCN, err := os.ReadFile(filepath.Join(dir, FallbackRulesetDirName, CNAppsRuleProviderName+".list"))
+	if err != nil {
+		t.Fatalf("expected fallback CN ruleset created: %v", err)
+	}
+	if string(fallbackCN) != "PROCESS-NAME,CustomMacApp\n" {
+		t.Fatalf("expected legacy CN ruleset preserved, got %q", string(fallbackCN))
+	}
+	if _, err := os.Stat(filepath.Join(dir, FallbackRulesetDirName, AILockRuleProviderName+".list")); err != nil {
+		t.Fatalf("expected fallback AI lock ruleset created: %v", err)
 	}
 }

@@ -530,3 +530,64 @@ rules:
 		t.Fatal("DEADLOCK: SelectProfile + SetAILock + Snapshot timed out on proxy-providers profile")
 	}
 }
+
+type uacSpyApplier struct {
+	engine       *Engine
+	called       bool
+	seenAllowUAC bool
+}
+
+func (a *uacSpyApplier) ValidateConfig(_, _ string) error { return nil }
+func (a *uacSpyApplier) ApplyRuntimeConfig(_ context.Context, _ profile.AppSettings, _, _ string, _ int, _ string) error {
+	a.called = true
+	a.seenAllowUAC = a.engine.allowPromptUAC
+	return nil
+}
+
+func TestReloadConfigParsesAllowUACAndDisableAILockDowngradesEnhanced(t *testing.T) {
+	appData := t.TempDir()
+	t.Setenv("CLASHFX_SERVICE_SOCK", filepath.Join(appData, "nonexistent-service.sock"))
+
+	eng, err := NewEngine(Config{AppDataDir: appData}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Shutdown()
+
+	spy := &uacSpyApplier{engine: eng}
+	eng.ctrl = transaction.NewController(eng.store, spy, "")
+
+	srv := &Server{engine: eng, clients: map[*clientConn]struct{}{}}
+	resp := srv.dispatch(&clientConn{}, RPCRequest{
+		ID:     1,
+		Method: "reload_config",
+		Params: json.RawMessage(`{"allow_uac":true}`),
+	})
+	if !resp.OK {
+		t.Fatalf("reload_config dispatch failed: %s", resp.Error)
+	}
+	if !spy.called || !spy.seenAllowUAC {
+		t.Fatalf("expected reload_config to propagate allow_uac=true (called=%v seen=%v)", spy.called, spy.seenAllowUAC)
+	}
+
+	if _, err := eng.store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.AILockEnabled = true
+		s.AILockTarget = "DIRECT"
+		s.EnhancedMode = true
+		s.AILockSavedState = nil
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := eng.SetAILock(context.Background(), false, "", false); err != nil {
+		t.Fatalf("SetAILock(false) failed without privileged service: %v", err)
+	}
+	st := eng.store.Settings()
+	if st.AILockEnabled {
+		t.Fatalf("expected AILockEnabled=false after disable")
+	}
+	if supportsPrivilegedService() && st.EnhancedMode {
+		t.Fatalf("expected EnhancedMode downgraded to false when disabling AI lock without privileged service")
+	}
+}

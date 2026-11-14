@@ -155,8 +155,21 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 		return prevState, err
 	}
 	for _, hook := range c.hooks {
+		if hook == nil {
+			continue
+		}
 		if err := hook(root, settings); err != nil {
 			return prevState, err
+		}
+	}
+	// Sync editable built-in file rule-provider paths to the active writable
+	// ruleset directory (falls back to ./clashfx-rulesets when legacy ./ruleset
+	// is root-owned / non-writable on macOS).
+	if rpMap, ok := root["rule-providers"].(map[string]any); ok {
+		for _, name := range []string{profile.AILockRuleProviderName, profile.CNAppsRuleProviderName} {
+			if entry, exists := rpMap[name].(map[string]any); exists {
+				entry["path"] = profile.BuiltinRulesetRelPathInDir(cfgDir, name)
+			}
 		}
 	}
 

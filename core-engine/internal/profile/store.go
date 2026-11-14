@@ -220,6 +220,62 @@ func (s *Store) Settings() AppSettings {
 	return clone
 }
 
+func NormalizeLanguageCode(raw string) string {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	if strings.HasPrefix(lower, "en") {
+		return "en_US"
+	}
+	return "zh_CN"
+}
+
+func NormalizeTrayIconPreset(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	switch trimmed {
+	case "default", "monochrome", "ocean":
+		return trimmed
+	}
+	lower := strings.ToLower(trimmed)
+	switch {
+	case strings.Contains(lower, "lightning") || strings.Contains(lower, "mono"):
+		return "monochrome"
+	case strings.Contains(lower, "shield") || strings.Contains(lower, "ocean") || strings.Contains(lower, "network"):
+		return "ocean"
+	default:
+		return "default"
+	}
+}
+
+// NormalizeAppSettings coerces migrated or persisted fields into canonical
+// values recognized by the unified daemon, Web UI, and native tray hosts.
+func NormalizeAppSettings(s *AppSettings) {
+	if s == nil {
+		return
+	}
+	if strings.TrimSpace(s.SelectedProfile) == "" {
+		s.SelectedProfile = "config"
+	}
+	switch strings.ToLower(strings.TrimSpace(s.OutboundMode)) {
+	case "rule", "global", "direct":
+		s.OutboundMode = strings.ToLower(strings.TrimSpace(s.OutboundMode))
+	default:
+		s.OutboundMode = "rule"
+	}
+	if s.APIPort < 1 || s.APIPort > 65535 {
+		s.APIPort = 19090
+	}
+	if s.TunMTU == 0 {
+		s.TunMTU = 1500
+	}
+	if s.SavedSelections == nil {
+		s.SavedSelections = map[string]map[string]string{}
+	}
+	s.Language = NormalizeLanguageCode(s.Language)
+	s.TrayIconPreset = NormalizeTrayIconPreset(s.TrayIconPreset)
+	if s.AILockEnabled && strings.TrimSpace(s.AILockTarget) == "" {
+		s.AILockEnabled = false
+	}
+}
+
 func (s *Store) UpdateSettings(mutator func(*AppSettings) error) (AppSettings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -230,15 +286,7 @@ func (s *Store) UpdateSettings(mutator func(*AppSettings) error) (AppSettings, e
 	if err := mutator(&next); err != nil {
 		return s.settings, err
 	}
-	if strings.TrimSpace(next.SelectedProfile) == "" {
-		next.SelectedProfile = "config"
-	}
-	if next.APIPort < 1 || next.APIPort > 65535 {
-		next.APIPort = 19090
-	}
-	if next.TunMTU == 0 {
-		next.TunMTU = 1500
-	}
+	NormalizeAppSettings(&next)
 	if strings.TrimSpace(next.CustomConfigDir) != "" {
 		cleanCustom := filepath.Clean(strings.TrimSpace(next.CustomConfigDir))
 		if !filepath.IsAbs(cleanCustom) {
@@ -488,10 +536,10 @@ func (s *Store) ensureDirResourcesLocked(dir string) error {
 		}
 	}
 	if err := EnsureBuiltinRulesetFiles(dir); err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "[clashfx-daemon] warning: workspace ruleset init in %s: %v\n", dir, err)
 	}
 	if _, err := s.ensureProfileMixinInDir(dir); err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "[clashfx-daemon] warning: workspace mixin init in %s: %v\n", dir, err)
 	}
 	if s.resourceDir != "" {
 		unpackIfMissing(filepath.Join(s.resourceDir, "Country.mmdb.gz"), filepath.Join(dir, "Country.mmdb"))
@@ -605,6 +653,7 @@ func (s *Store) loadSettingsLocked() error {
 	data, err := os.ReadFile(s.settingsPathLocked())
 	if os.IsNotExist(err) {
 		migrateLegacyDarwinPreferences(s.appDataDir, &s.settings)
+		NormalizeAppSettings(&s.settings)
 		return writeJSONAtomic(s.settingsPathLocked(), s.settings)
 	}
 	if err != nil {
@@ -614,10 +663,12 @@ func (s *Store) loadSettingsLocked() error {
 	if err := json.Unmarshal(data, &loaded); err != nil {
 		return fmt.Errorf("corrupt settings.json: %w", err)
 	}
-	if loaded.SavedSelections == nil {
-		loaded.SavedSelections = map[string]map[string]string{}
-	}
+	beforeLang, beforeIcon, beforeAI := loaded.Language, loaded.TrayIconPreset, loaded.AILockEnabled
+	NormalizeAppSettings(&loaded)
 	s.settings = loaded
+	if loaded.Language != beforeLang || loaded.TrayIconPreset != beforeIcon || loaded.AILockEnabled != beforeAI {
+		_ = writeJSONAtomic(s.settingsPathLocked(), s.settings)
+	}
 	return nil
 }
 

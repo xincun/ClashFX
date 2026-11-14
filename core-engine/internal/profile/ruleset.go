@@ -10,7 +10,8 @@ import (
 )
 
 const (
-	RulesetDirName = "ruleset"
+	RulesetDirName         = "ruleset"
+	FallbackRulesetDirName = "clashfx-rulesets"
 
 	AILockProcessNamePattern = `(?i)^(claude|codex|codex-app-server|chatgpt|antigravity|antigravity-cli|agy)( helper.*)?(\.exe)?$`
 	AILockWindowsPathPattern = `(?i)([\\/](Programs|Program Files( \(x86\))?)[\\/](Claude|AnthropicClaude|Codex|ChatGPT|Antigravity)[\\/].*|[\\/]AppData[\\/]Local[\\/]AnthropicClaude[\\/].*|[\\/]WindowsApps[\\/][^\\/]*(Claude|Anthropic|OpenAI|ChatGPT|Codex|Antigravity)[^\\/]*[\\/].*|(^|[\\/])\.local[\\/](bin|share)[\\/]claude([\\/].*|\.exe)?|(^|[\\/])(\.antigravity|\.gemini[\\/]antigravity-cli)[\\/].*)$`
@@ -75,12 +76,38 @@ func IsEditableBuiltinRuleset(providerName string) bool {
 	}
 }
 
+// ResolveRulesetDirName returns "ruleset" when cfgDir/ruleset can be created and
+// written to by the current user, and falls back to "clashfx-rulesets" when the
+// legacy "ruleset" directory is root-owned or otherwise unwritable.
+func ResolveRulesetDirName(cfgDir string) string {
+	trimmed := strings.TrimSpace(cfgDir)
+	if trimmed == "" {
+		return RulesetDirName
+	}
+	primaryDir := filepath.Join(trimmed, RulesetDirName)
+	if err := os.MkdirAll(primaryDir, 0700); err != nil {
+		return FallbackRulesetDirName
+	}
+	probe, err := os.CreateTemp(primaryDir, ".clashfx-probe-*")
+	if err != nil {
+		return FallbackRulesetDirName
+	}
+	probePath := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(probePath)
+	return RulesetDirName
+}
+
 func BuiltinRulesetRelPath(providerName string) string {
 	return "./" + RulesetDirName + "/" + strings.TrimSpace(providerName) + ".list"
 }
 
+func BuiltinRulesetRelPathInDir(cfgDir, providerName string) string {
+	return "./" + ResolveRulesetDirName(cfgDir) + "/" + strings.TrimSpace(providerName) + ".list"
+}
+
 func BuiltinRulesetAbsPath(cfgDir, providerName string) string {
-	return filepath.Join(cfgDir, RulesetDirName, strings.TrimSpace(providerName)+".list")
+	return filepath.Join(cfgDir, ResolveRulesetDirName(cfgDir), strings.TrimSpace(providerName)+".list")
 }
 
 func DefaultBuiltinRulesetText(providerName string) (string, bool) {
@@ -125,21 +152,31 @@ func DefaultCNAppsRulesetText() string {
 }
 
 // EnsureBuiltinRulesetFiles creates ruleset/clashfx-ai-lock.list and
-// ruleset/clashfx-cn-apps-direct.list inside cfgDir if they do not exist yet,
-// preserving any user edits on disk.
+// ruleset/clashfx-cn-apps-direct.list inside cfgDir (or clashfx-rulesets/ if
+// the legacy ruleset/ directory is not writable by the current user),
+// seeding from any readable legacy file and preserving user edits on disk.
 func EnsureBuiltinRulesetFiles(cfgDir string) error {
 	if strings.TrimSpace(cfgDir) == "" {
 		return nil
 	}
+	dirName := ResolveRulesetDirName(cfgDir)
 	for _, name := range []string{AILockRuleProviderName, CNAppsRuleProviderName} {
-		absPath := BuiltinRulesetAbsPath(cfgDir, name)
+		absPath := filepath.Join(cfgDir, dirName, strings.TrimSpace(name)+".list")
 		if _, err := os.Stat(absPath); err == nil {
 			continue
 		} else if !os.IsNotExist(err) {
 			return err
 		}
-		defText, _ := DefaultBuiltinRulesetText(name)
-		if err := WriteFileAtomic(absPath, []byte(defText), 0600); err != nil {
+		initText, _ := DefaultBuiltinRulesetText(name)
+		if dirName != RulesetDirName {
+			legacyPath := filepath.Join(cfgDir, RulesetDirName, strings.TrimSpace(name)+".list")
+			if legacyBytes, rErr := os.ReadFile(legacyPath); rErr == nil {
+				if rules, pErr := ParseAndValidateClassicalRulesetText(string(legacyBytes)); pErr == nil && len(rules) > 0 {
+					initText = NormalizeRulesetContent(string(legacyBytes))
+				}
+			}
+		}
+		if err := WriteFileAtomic(absPath, []byte(initText), 0600); err != nil {
 			return fmt.Errorf("init ruleset %s: %w", name, err)
 		}
 	}

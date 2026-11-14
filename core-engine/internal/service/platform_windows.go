@@ -228,3 +228,5 @@ func VerifyPipePeer(conn net.Conn, trustedDir string) error {
 	}
 	return nil
 }
+
+func repairUserHomeOwnership(_ string) {}
