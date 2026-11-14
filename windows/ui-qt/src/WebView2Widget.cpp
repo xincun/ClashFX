@@ -1,21 +1,21 @@
 #include "WebView2Widget.h"
-#include "I18n.h"
 
 #include <QCoreApplication>
 #include <QDir>
-#include <QFile>
+#include <QFileInfo>
+#include <QHideEvent>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QMetaObject>
+#include <QResizeEvent>
 #include <QShowEvent>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QWindow>
 
 #include <atomic>
-#include <functional>
-#include <memory>
 
 #ifdef Q_OS_WIN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #include <objbase.h>
 #include <WebView2.h>
@@ -29,19 +29,16 @@ namespace {
 template <typename Interface, typename Arg2, typename Fn>
 class ComHandler final : public Interface {
 public:
-    explicit ComHandler(Fn&& fn)
-        : fn_(std::forward<Fn>(fn)) {}
+    explicit ComHandler(Fn fn) : fn_(std::move(fn)) {}
 
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
-        if (!ppvObject) {
-            return E_POINTER;
-        }
-        if (riid == IID_IUnknown || riid == __uuidof(Interface)) {
-            *ppvObject = static_cast<Interface*>(this);
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(Interface)) {
+            *ppv = static_cast<Interface*>(this);
             AddRef();
             return S_OK;
         }
-        *ppvObject = nullptr;
+        *ppv = nullptr;
         return E_NOINTERFACE;
     }
 
@@ -50,33 +47,69 @@ public:
     }
 
     ULONG STDMETHODCALLTYPE Release() override {
-        const ULONG next = --refCount_;
-        if (next == 0) {
+        const ULONG n = --refCount_;
+        if (n == 0) {
             delete this;
         }
-        return next;
+        return n;
     }
 
-    HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, Arg2 result) override {
-        return fn_(errorCode, result);
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT result, Arg2 arg) override {
+        return fn_(result, arg);
     }
 
 private:
+    ~ComHandler() = default;
+    std::atomic<ULONG> refCount_{1};
+    Fn fn_;
+};
+
+template <typename Interface, typename SenderT, typename ArgsT, typename Fn>
+class ComEventHandler final : public Interface {
+public:
+    explicit ComEventHandler(Fn fn) : fn_(std::move(fn)) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(Interface)) {
+            *ppv = static_cast<Interface*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ++refCount_;
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG n = --refCount_;
+        if (n == 0) {
+            delete this;
+        }
+        return n;
+    }
+
+    HRESULT STDMETHODCALLTYPE Invoke(SenderT sender, ArgsT args) override {
+        return fn_(sender, args);
+    }
+
+private:
+    ~ComEventHandler() = default;
     std::atomic<ULONG> refCount_{1};
     Fn fn_;
 };
 
 template <typename Interface, typename Arg2, typename Fn>
-Interface* makeComHandler(Fn&& fn) {
-    return new ComHandler<Interface, Arg2, std::decay_t<Fn>>(std::forward<Fn>(fn));
+Interface* makeComHandler(Fn fn) {
+    return new ComHandler<Interface, Arg2, Fn>(std::move(fn));
 }
 
-QString escapeJsSingleQuoted(QString s) {
-    s.replace(QStringLiteral("\\"), QStringLiteral("\\\\"));
-    s.replace(QStringLiteral("'"), QStringLiteral("\\'"));
-    s.replace(QStringLiteral("\r"), QString());
-    s.replace(QStringLiteral("\n"), QStringLiteral("\\n"));
-    return s;
+template <typename Interface, typename SenderT, typename ArgsT, typename Fn>
+Interface* makeComEventHandler(Fn fn) {
+    return new ComEventHandler<Interface, SenderT, ArgsT, Fn>(std::move(fn));
 }
 
 } // namespace
@@ -85,20 +118,25 @@ QString escapeJsSingleQuoted(QString s) {
 WebView2Widget::WebView2Widget(QWidget* parent)
     : QWidget(parent) {
     setAttribute(Qt::WA_NativeWindow, true);
-    setAttribute(Qt::WA_DontCreateNativeAncestors, false);
-    setMinimumSize(640, 420);
+    setFocusPolicy(Qt::StrongFocus);
 }
 
 WebView2Widget::~WebView2Widget() {
 #ifdef Q_OS_WIN
-    if (webview_) {
-        webview_->Release();
-        webview_ = nullptr;
+    if (webview_ && webMessageTokenValue_ != 0) {
+        EventRegistrationToken token{};
+        token.value = static_cast<__int64>(webMessageTokenValue_);
+        webview_->remove_WebMessageReceived(token);
+        webMessageTokenValue_ = 0;
     }
     if (controller_) {
         controller_->Close();
         controller_->Release();
         controller_ = nullptr;
+    }
+    if (webview_) {
+        webview_->Release();
+        webview_ = nullptr;
     }
     if (env_) {
         env_->Release();
@@ -107,78 +145,68 @@ WebView2Widget::~WebView2Widget() {
 #endif
 }
 
-void WebView2Widget::configureDashboard(int apiPort,
-                                        const QString& apiSecret,
-                                        const QString& dashboardUrl,
-                                        bool aiLocked) {
-    apiPort_ = apiPort;
-    apiSecret_ = apiSecret;
-    dashboardUrl_ = dashboardUrl.trimmed();
-    aiLocked_ = aiLocked;
-
-    if (isVisible()) {
-        ensureInitialized();
-    }
-    if (webview_) {
-        applyScriptsAndNavigate(false);
+void WebView2Widget::setUiRootDir(const QString& dirPath) {
+    uiRootDir_ = dirPath.trimmed();
+    if (webview_ && !navigated_) {
+        configureMappingAndNavigate();
     }
 }
 
-void WebView2Widget::retryInitialize() {
-    if (!webview_ && !controller_) {
-        initStarted_ = false;
-    }
-    ensureInitialized();
-}
-
-void WebView2Widget::reloadDashboard() {
-#ifdef Q_OS_WIN
-    if (!webview_) {
-        ensureInitialized();
-        return;
-    }
-    if (!dashboardUrl_.isEmpty()) {
-        applyScriptsAndNavigate(true);
-    } else {
-        webview_->Reload();
-    }
-#endif
+void WebView2Widget::setThemeDark(bool dark) {
+    if (themeDark_ == dark) return;
+    themeDark_ = dark;
+    applyBackgroundColor();
 }
 
 void WebView2Widget::setPageActive(bool active) {
     pageActive_ = active;
 #ifdef Q_OS_WIN
     if (controller_) {
-        const bool vis = pageActive_ && isVisible();
-        controller_->put_IsVisible(vis ? TRUE : FALSE);
-        if (vis) {
+        controller_->put_IsVisible(active ? TRUE : FALSE);
+        if (active) {
             syncBounds();
         }
     }
 #endif
+}
+
+void WebView2Widget::postJsonMessage(const QJsonObject& message) {
+#ifdef Q_OS_WIN
+    if (!webview_) return;
+    const QString json = QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact));
+    const std::wstring wJson = json.toStdWString();
+    webview_->PostWebMessageAsJson(wJson.c_str());
+#else
+    Q_UNUSED(message);
+#endif
+}
+
+void WebView2Widget::reloadApp() {
+#ifdef Q_OS_WIN
+    if (webview_) {
+        webview_->Navigate(L"https://app.clashfx.local/index.html");
+    } else {
+        retryInitialize();
+    }
+#endif
+}
+
+void WebView2Widget::retryInitialize() {
+    initStarted_ = false;
+    navigated_ = false;
+    ensureInitialized();
 }
 
 void WebView2Widget::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
     ensureInitialized();
-#ifdef Q_OS_WIN
-    if (controller_) {
-        const bool vis = pageActive_ && isVisible();
-        controller_->put_IsVisible(vis ? TRUE : FALSE);
-        if (vis) {
-            syncBounds();
-        }
-    }
-#endif
+    setPageActive(true);
+    QTimer::singleShot(0, this, [this]() { syncBounds(); });
 }
 
 void WebView2Widget::hideEvent(QHideEvent* event) {
     QWidget::hideEvent(event);
-#ifdef Q_OS_WIN
-    if (controller_) {
-        controller_->put_IsVisible(FALSE);
-    }
-#endif
+    setPageActive(false);
 }
 
 void WebView2Widget::resizeEvent(QResizeEvent* event) {
@@ -186,448 +214,228 @@ void WebView2Widget::resizeEvent(QResizeEvent* event) {
     syncBounds();
 }
 
-void WebView2Widget::syncBounds() {
+QString WebView2Widget::resolvedUiRootDir() const {
+    if (!uiRootDir_.isEmpty()) {
+        return QDir::cleanPath(uiRootDir_);
+    }
+    const QString appDir = QCoreApplication::applicationDirPath();
+    const QString packagedDir = QDir(appDir).filePath(QStringLiteral("resources/ui"));
+    if (QFileInfo::exists(QDir(packagedDir).filePath(QStringLiteral("index.html")))) {
+        return packagedDir;
+    }
+    const QString devFallback = QDir(appDir).filePath(QStringLiteral("../../windows/ui-qt/web"));
+    if (QFileInfo::exists(QDir(devFallback).filePath(QStringLiteral("index.html")))) {
+        return QDir::cleanPath(devFallback);
+    }
+    return packagedDir;
+}
+
+void WebView2Widget::applyBackgroundColor() {
 #ifdef Q_OS_WIN
-    if (!controller_) {
-        return;
-    }
-    HWND hwnd = reinterpret_cast<HWND>(winId());
-    if (!hwnd) {
-        return;
-    }
-    RECT rc{};
-    if (GetClientRect(hwnd, &rc)) {
-        controller_->put_Bounds(rc);
+    if (!controller_) return;
+    ICoreWebView2Controller2* controller2 = nullptr;
+    if (SUCCEEDED(controller_->QueryInterface(IID_PPV_ARGS(&controller2))) && controller2) {
+        const COREWEBVIEW2_COLOR color = themeDark_
+            ? COREWEBVIEW2_COLOR{255, 11, 13, 18}
+            : COREWEBVIEW2_COLOR{255, 244, 246, 250};
+        controller2->put_DefaultBackgroundColor(color);
+        controller2->Release();
     }
 #endif
 }
 
 void WebView2Widget::ensureInitialized() {
 #ifdef Q_OS_WIN
-    if (initStarted_) {
-        return;
-    }
+    if (initStarted_) return;
+    const HWND hwnd = reinterpret_cast<HWND>(winId());
+    if (!hwnd) return;
     initStarted_ = true;
 
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-    QString baseDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-    if (baseDir.isEmpty()) {
-        baseDir = QDir::tempPath() + QStringLiteral("/ClashFX");
+    QString userDataDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    if (userDataDir.isEmpty()) {
+        userDataDir = QDir::tempPath() + QStringLiteral("/ClashFX");
     }
-    const QString userDataDir = QDir::toNativeSeparators(QDir(baseDir).filePath(QStringLiteral("WebView2Data")));
+    userDataDir = QDir::toNativeSeparators(userDataDir + QStringLiteral("/WebView2Data"));
     QDir().mkpath(userDataDir);
-    const std::wstring userDataW = userDataDir.toStdWString();
 
     QPointer<WebView2Widget> self(this);
+    const std::wstring wDataDir = userDataDir.toStdWString();
+
     auto* envHandler = makeComHandler<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
                                       ICoreWebView2Environment*>(
-        [self](HRESULT hr, ICoreWebView2Environment* createdEnv) -> HRESULT {
-            if (!self) {
+        [self, hwnd](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
+            if (!self) return S_OK;
+            if (FAILED(hr) || !env) {
+                const QString msg = QStringLiteral("WebView2 environment creation failed (0x%1)")
+                                        .arg(static_cast<quint32>(hr), 8, 16, QLatin1Char('0'));
+                QMetaObject::invokeMethod(self, [self, msg]() {
+                    if (self) emit self->webViewFailed(msg);
+                }, Qt::QueuedConnection);
                 return S_OK;
             }
-            if (FAILED(hr) || !createdEnv) {
-                self->initStarted_ = false;
-                emit self->webViewFailed(QStringLiteral("CreateCoreWebView2Environment failed: 0x%1")
-                                             .arg(static_cast<quint32>(hr), 8, 16, QLatin1Char('0')));
-                return S_OK;
-            }
-            self->env_ = createdEnv;
-            self->env_->AddRef();
 
-            HWND hwnd = reinterpret_cast<HWND>(self->winId());
-            auto* ctrlHandler = makeComHandler<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
-                                               ICoreWebView2Controller*>(
-                [self](HRESULT ctrlHr, ICoreWebView2Controller* ctrl) -> HRESULT {
-                    if (!self) {
-                        return S_OK;
-                    }
-                    if (FAILED(ctrlHr) || !ctrl) {
-                        self->initStarted_ = false;
-                        emit self->webViewFailed(QStringLiteral("CreateCoreWebView2Controller failed: 0x%1")
-                                                     .arg(static_cast<quint32>(ctrlHr), 8, 16, QLatin1Char('0')));
-                        return S_OK;
-                    }
-                    self->controller_ = ctrl;
-                    self->controller_->AddRef();
+            env->AddRef();
+            self->env_ = env;
 
-                    ICoreWebView2* wv = nullptr;
-                    if (SUCCEEDED(self->controller_->get_CoreWebView2(&wv)) && wv) {
-                        self->webview_ = wv; // already AddRef'd by get_CoreWebView2
-
-                        ICoreWebView2Settings* settings = nullptr;
-                        if (SUCCEEDED(self->webview_->get_Settings(&settings)) && settings) {
-                            settings->put_IsStatusBarEnabled(FALSE);
-                            settings->put_AreDefaultContextMenusEnabled(TRUE);
-                            settings->put_AreDevToolsEnabled(TRUE);
-
-                            ICoreWebView2Settings2* settings2 = nullptr;
-                            if (SUCCEEDED(settings->QueryInterface(__uuidof(ICoreWebView2Settings2),
-                                                                   reinterpret_cast<void**>(&settings2))) &&
-                                settings2) {
-                                LPWSTR rawUa = nullptr;
-                                if (SUCCEEDED(settings2->get_UserAgent(&rawUa)) && rawUa) {
-                                    QString ua = QString::fromWCharArray(rawUa);
-                                    CoTaskMemFree(rawUa);
-                                    if (!ua.contains(QStringLiteral("ClashFX Runtime"))) {
-                                        ua += QStringLiteral(" ClashFX Runtime");
-                                        const std::wstring newUa = ua.toStdWString();
-                                        settings2->put_UserAgent(newUa.c_str());
-                                    }
-                                }
-                                settings2->Release();
-                            }
-                            settings->Release();
+            auto* ctrlHandler =
+                makeComHandler<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
+                               ICoreWebView2Controller*>(
+                    [self](HRESULT ctrlHr, ICoreWebView2Controller* controller) -> HRESULT {
+                        if (!self) return S_OK;
+                        if (FAILED(ctrlHr) || !controller) {
+                            const QString msg = QStringLiteral("WebView2 controller creation failed (0x%1)")
+                                                    .arg(static_cast<quint32>(ctrlHr), 8, 16, QLatin1Char('0'));
+                            QMetaObject::invokeMethod(self, [self, msg]() {
+                                if (self) emit self->webViewFailed(msg);
+                            }, Qt::QueuedConnection);
+                            return S_OK;
                         }
-                    }
 
-                    self->controller_->put_IsVisible((self->pageActive_ && self->isVisible()) ? TRUE : FALSE);
-                    self->syncBounds();
-                    self->applyScriptsAndNavigate(true);
-                    emit self->webViewReady();
-                    return S_OK;
-                });
+                        controller->AddRef();
+                        self->controller_ = controller;
+                        controller->get_CoreWebView2(&self->webview_);
 
-            const HRESULT createHr = self->env_->CreateCoreWebView2Controller(hwnd, ctrlHandler);
+                        self->applyBackgroundColor();
+
+                        if (self->webview_) {
+                            ICoreWebView2Settings* settings = nullptr;
+                            if (SUCCEEDED(self->webview_->get_Settings(&settings)) && settings) {
+                                settings->put_AreDefaultContextMenusEnabled(FALSE);
+                                settings->put_IsStatusBarEnabled(FALSE);
+                                settings->put_IsZoomControlEnabled(FALSE);
+                                settings->put_AreDevToolsEnabled(FALSE);
+                                ICoreWebView2Settings3* settings3 = nullptr;
+                                if (SUCCEEDED(settings->QueryInterface(IID_PPV_ARGS(&settings3))) && settings3) {
+                                    settings3->put_AreBrowserAcceleratorKeysEnabled(FALSE);
+                                    settings3->Release();
+                                }
+                                settings->Release();
+                            }
+
+                            EventRegistrationToken token{};
+                            auto* msgHandler = makeComEventHandler<
+                                ICoreWebView2WebMessageReceivedEventHandler,
+                                ICoreWebView2*,
+                                ICoreWebView2WebMessageReceivedEventArgs*>(
+                                [self](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                                    if (!self || !args) return S_OK;
+                                    LPWSTR rawJson = nullptr;
+                                    if (SUCCEEDED(args->get_WebMessageAsJson(&rawJson)) && rawJson) {
+                                        const QString jsonStr = QString::fromWCharArray(rawJson);
+                                        CoTaskMemFree(rawJson);
+                                        const QByteArray utf8 = jsonStr.toUtf8();
+                                        const QJsonDocument doc = QJsonDocument::fromJson(utf8);
+                                        QJsonObject obj;
+                                        if (doc.isObject()) {
+                                            obj = doc.object();
+                                        } else {
+                                            const QJsonDocument wrapped = QJsonDocument::fromJson(
+                                                QByteArrayLiteral("[") + utf8 + QByteArrayLiteral("]"));
+                                            if (wrapped.isArray() && !wrapped.array().isEmpty() &&
+                                                wrapped.array().at(0).isString()) {
+                                                const QJsonDocument inner = QJsonDocument::fromJson(
+                                                    wrapped.array().at(0).toString().toUtf8());
+                                                if (inner.isObject()) {
+                                                    obj = inner.object();
+                                                }
+                                            }
+                                        }
+                                        if (!obj.isEmpty()) {
+                                            QMetaObject::invokeMethod(self, [self, obj]() {
+                                                if (self) emit self->webMessageReceived(obj);
+                                            }, Qt::QueuedConnection);
+                                        }
+                                    }
+                                    return S_OK;
+                                });
+                            if (SUCCEEDED(self->webview_->add_WebMessageReceived(msgHandler, &token))) {
+                                self->webMessageTokenValue_ = static_cast<unsigned long long>(token.value);
+                            }
+                            msgHandler->Release();
+                        }
+
+                        self->syncBounds();
+                        controller->put_IsVisible(self->pageActive_ ? TRUE : FALSE);
+                        self->configureMappingAndNavigate();
+                        QMetaObject::invokeMethod(self, [self]() {
+                            if (self) emit self->webViewReady();
+                        }, Qt::QueuedConnection);
+                        return S_OK;
+                    });
+
+            const HRESULT ctrlCall = env->CreateCoreWebView2Controller(hwnd, ctrlHandler);
             ctrlHandler->Release();
-            if (FAILED(createHr)) {
-                emit self->webViewFailed(QStringLiteral("Invoke CreateCoreWebView2Controller failed"));
+            if (FAILED(ctrlCall)) {
+                const QString msg = QStringLiteral("CreateCoreWebView2Controller failed (0x%1)")
+                                        .arg(static_cast<quint32>(ctrlCall), 8, 16, QLatin1Char('0'));
+                QMetaObject::invokeMethod(self, [self, msg]() {
+                    if (self) emit self->webViewFailed(msg);
+                }, Qt::QueuedConnection);
             }
             return S_OK;
         });
 
-    const HRESULT startHr = CreateCoreWebView2EnvironmentWithOptions(
-        nullptr, userDataW.c_str(), nullptr, envHandler);
+    const HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
+        nullptr, wDataDir.c_str(), nullptr, envHandler);
     envHandler->Release();
-    if (FAILED(startHr)) {
-        initStarted_ = false;
-        emit webViewFailed(L("未检测到 Microsoft Edge WebView2 运行时。",
-                             "Microsoft Edge WebView2 Runtime is not available."));
+    if (FAILED(hr)) {
+        const QString msg = QStringLiteral("WebView2 runtime unavailable (0x%1). Please install Microsoft Edge WebView2 Runtime.")
+                                .arg(static_cast<quint32>(hr), 8, 16, QLatin1Char('0'));
+        QMetaObject::invokeMethod(this, [this, msg]() {
+            emit webViewFailed(msg);
+        }, Qt::QueuedConnection);
     }
 #endif
 }
 
-void WebView2Widget::removeDynamicScripts() {
+void WebView2Widget::configureMappingAndNavigate() {
 #ifdef Q_OS_WIN
-    if (!webview_) {
-        dynamicScriptIds_.clear();
+    if (!webview_) return;
+    const QString uiDir = resolvedUiRootDir();
+    const QString indexPath = QDir(uiDir).filePath(QStringLiteral("index.html"));
+    if (!QFileInfo::exists(indexPath)) {
+        emit webViewFailed(QStringLiteral("UI assets missing: %1").arg(indexPath));
         return;
     }
-    for (const QString& id : dynamicScriptIds_) {
-        const std::wstring idW = id.toStdWString();
-        webview_->RemoveScriptToExecuteOnDocumentCreated(idW.c_str());
+
+    ICoreWebView2_3* webview3 = nullptr;
+    if (SUCCEEDED(webview_->QueryInterface(IID_PPV_ARGS(&webview3))) && webview3) {
+        const std::wstring wUiDir = QDir::toNativeSeparators(uiDir).toStdWString();
+        const HRESULT mapHr = webview3->SetVirtualHostNameToFolderMapping(
+            L"app.clashfx.local",
+            wUiDir.c_str(),
+            COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+        webview3->Release();
+        if (FAILED(mapHr)) {
+            emit webViewFailed(QStringLiteral("SetVirtualHostNameToFolderMapping failed (0x%1)")
+                                   .arg(static_cast<quint32>(mapHr), 8, 16, QLatin1Char('0')));
+            return;
+        }
+    } else {
+        emit webViewFailed(QStringLiteral("ICoreWebView2_3 interface unsupported on current WebView2 Runtime"));
+        return;
     }
-    dynamicScriptIds_.clear();
+
+    navigated_ = true;
+    webview_->Navigate(L"https://app.clashfx.local/index.html");
 #endif
 }
 
-void WebView2Widget::applyScriptsAndNavigate(bool forceNavigate) {
+void WebView2Widget::syncBounds() {
 #ifdef Q_OS_WIN
-    if (!webview_ || apiPort_ <= 0 || dashboardUrl_.isEmpty()) {
-        return;
+    if (!controller_) return;
+    RECT rc{};
+    const HWND hwnd = reinterpret_cast<HWND>(winId());
+    if (!hwnd || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) {
+        const qreal dpr = (window() && window()->windowHandle())
+            ? window()->windowHandle()->devicePixelRatio()
+            : devicePixelRatioF();
+        rc.left = 0;
+        rc.top = 0;
+        rc.right = qMax(1, qRound(width() * dpr));
+        rc.bottom = qMax(1, qRound(height() * dpr));
     }
-
-    if (!staticScriptsInstalled_) {
-        staticScriptsInstalled_ = true;
-        const QString compatJs = readBundledCompatibilityJS();
-        if (!compatJs.isEmpty()) {
-            const std::wstring w = compatJs.toStdWString();
-            webview_->AddScriptToExecuteOnDocumentCreated(w.c_str(), nullptr);
-        }
-    }
-
-    const bool endpointChanged = (appliedPort_ != apiPort_) ||
-                                 (appliedSecret_ != apiSecret_) ||
-                                 (appliedUrl_ != dashboardUrl_);
-    const bool lockChangedOnly = !endpointChanged && (appliedAiLocked_ != aiLocked_);
-    if (!endpointChanged && !lockChangedOnly && !forceNavigate) {
-        return;
-    }
-
-    appliedPort_ = apiPort_;
-    appliedSecret_ = apiSecret_;
-    appliedUrl_ = dashboardUrl_;
-    appliedAiLocked_ = aiLocked_;
-
-    removeDynamicScripts();
-
-    const QString staleMsg = L("内核重载中，当前显示最近一次规则快照",
-                               "Core unavailable; showing the last valid rules snapshot");
-
-    const QStringList dynamicScripts = {
-        buildMetaCubeXDConfigJS(apiPort_, apiSecret_),
-        buildRulesSnapshotJS(apiPort_, staleMsg, aiLocked_),
-    };
-
-    if (lockChangedOnly && !forceNavigate) {
-        for (const QString& script : dynamicScripts) {
-            const std::wstring scriptW = script.toStdWString();
-            QPointer<WebView2Widget> self(this);
-            auto* handler = makeComHandler<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler,
-                                           LPCWSTR>(
-                [self](HRESULT hr, LPCWSTR id) -> HRESULT {
-                    if (self && SUCCEEDED(hr) && id) {
-                        self->dynamicScriptIds_.append(QString::fromWCharArray(id));
-                    }
-                    return S_OK;
-                });
-            webview_->AddScriptToExecuteOnDocumentCreated(scriptW.c_str(), handler);
-            handler->Release();
-        }
-        const QString liveFlagJs = QStringLiteral("window.__CLASHFX_AI_LOCKED__ = %1;")
-                                       .arg(aiLocked_ ? QStringLiteral("true") : QStringLiteral("false"));
-        const std::wstring liveW = liveFlagJs.toStdWString();
-        webview_->ExecuteScript(liveW.c_str(), nullptr);
-        return;
-    }
-
-    auto remaining = std::make_shared<int>(dynamicScripts.size());
-    QPointer<WebView2Widget> self(this);
-    const QString targetUrl = dashboardUrl_;
-
-    for (const QString& script : dynamicScripts) {
-        const std::wstring scriptW = script.toStdWString();
-        auto* handler = makeComHandler<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler,
-                                       LPCWSTR>(
-            [self, remaining, targetUrl](HRESULT hr, LPCWSTR id) -> HRESULT {
-                if (!self) {
-                    return S_OK;
-                }
-                if (SUCCEEDED(hr) && id) {
-                    self->dynamicScriptIds_.append(QString::fromWCharArray(id));
-                }
-                if (--(*remaining) == 0 && self->webview_) {
-                    const std::wstring navW = targetUrl.toStdWString();
-                    self->webview_->Navigate(navW.c_str());
-                }
-                return S_OK;
-            });
-        webview_->AddScriptToExecuteOnDocumentCreated(scriptW.c_str(), handler);
-        handler->Release();
-    }
-#else
-    Q_UNUSED(forceNavigate);
-#endif
-}
-
-QString WebView2Widget::readBundledCompatibilityJS() {
-    const QString appDir = QCoreApplication::applicationDirPath();
-    const QStringList candidates = {
-        QDir(appDir).filePath(QStringLiteral("resources/clashfx-compat.js")),
-        QDir(appDir).filePath(QStringLiteral("resources/DashboardCompatibility/clashfx-compat.js")),
-    };
-    for (const QString& path : candidates) {
-        QFile f(path);
-        if (f.exists() && f.open(QIODevice::ReadOnly)) {
-            return QString::fromUtf8(f.readAll());
-        }
-    }
-    return QString();
-}
-
-QString WebView2Widget::buildMetaCubeXDConfigJS(int port, const QString& secret) {
-#ifdef Q_OS_WIN
-    const QString backend = escapeJsSingleQuoted(QStringLiteral("http://127.0.0.1:%1").arg(port));
-    const QString sec = escapeJsSingleQuoted(secret);
-    return QStringLiteral("window.__METACUBEXD_CONFIG__ = { defaultBackendURL: '%1', defaultBackendSecret: '%2' };")
-        .arg(backend, sec);
-#else
-    Q_UNUSED(port);
-    Q_UNUSED(secret);
-    return QString();
-#endif
-}
-
-QString WebView2Widget::buildRulesSnapshotJS(int port, const QString& staleMessage, bool aiLocked) {
-#ifdef Q_OS_WIN
-    const QString backend = escapeJsSingleQuoted(QStringLiteral("http://127.0.0.1:%1").arg(port));
-    const QString msg = escapeJsSingleQuoted(staleMessage);
-    const QString guardInternalMsg = escapeJsSingleQuoted(
-        L("系统防环回守护规则固定开启，不可停用", "ClashFX internal loop-prevention guard cannot be disabled"));
-    const QString guardAiModeMsg = escapeJsSingleQuoted(
-        L("AI 专用锁定开启期间出站模式固定为规则模式", "Outbound mode is locked to Rule while AI Proxy Lock is active"));
-    QString tpl = QStringLiteral(R"JS(
-(function() {
-  window.__CLASHFX_AI_LOCKED__ = __AILOCKED__;
-  var BACKEND_ORIGIN = '__BACKEND__';
-  var STALE_MESSAGE = '__STALE__';
-  var GUARD_INTERNAL_MSG = '__GUARD_INTERNAL__';
-  var GUARD_AIMODE_MSG = '__GUARD_AIMODE__';
-  var BANNER_ID = 'clashfx-stale-rules-banner';
-  var NOTICE_ID = 'clashfx-guard-notice-banner';
-  var rulesSnapshot = null;
-  var rulePayloadByIndex = {};
-  var aiLockIndices = [];
-  var originalFetch = window.fetch;
-
-  function parseBackendRequest(input, init) {
-    var method = ((init && init.method) || (typeof input !== 'string' && input.method) || 'GET').toUpperCase();
-    var rawURL = (typeof input === 'string') ? input : (input.url || '');
-    try {
-      var url = new URL(rawURL, window.location.href);
-      if (url.origin !== BACKEND_ORIGIN) return null;
-      return { method: method, pathname: url.pathname };
-    } catch (_) {
-      return null;
-    }
-  }
-  function showGuardNotice(text) {
-    var existing = document.getElementById(NOTICE_ID);
-    if (existing) existing.remove();
-    var toast = document.createElement('div');
-    toast.id = NOTICE_ID;
-    toast.textContent = text;
-    toast.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;padding:8px 14px;border-radius:8px;background:rgba(185,28,28,0.95);color:#fff;font:600 12px Segoe UI,sans-serif;box-shadow:0 4px 12px rgba(0,0,0,0.35);pointer-events:none;';
-    (document.body || document.documentElement).appendChild(toast);
-    setTimeout(function() { if (toast.parentNode) toast.remove(); }, 2800);
-  }
-  function showStaleBanner() {
-    if (document.getElementById(BANNER_ID)) return;
-    var banner = document.createElement('div');
-    banner.id = BANNER_ID;
-    banner.textContent = STALE_MESSAGE;
-    banner.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:2147483647;padding:7px 12px;border-radius:8px;background:rgba(154,87,0,0.94);color:#fff;font:12px Segoe UI,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.22);pointer-events:none;';
-    (document.body || document.documentElement).appendChild(banner);
-  }
-  function hideStaleBanner() {
-    var banner = document.getElementById(BANNER_ID);
-    if (banner) banner.remove();
-  }
-  function isMeaningfulRuleTime(count, value) {
-    if (Number(count) <= 0 || typeof value !== 'string') return false;
-    var ms = Date.parse(value);
-    return isFinite(ms) && ms > 0;
-  }
-  function indexRuleMetadata(payload) {
-    if (!payload || !Array.isArray(payload.rules)) return;
-    var nextMap = {};
-    var nextAi = [];
-    for (var i = 0; i < payload.rules.length; i++) {
-      var r = payload.rules[i];
-      if (!r || typeof r !== 'object') continue;
-      var idx = (typeof r.index === 'number') ? r.index : i;
-      var pl = String(r.payload || '');
-      nextMap[String(idx)] = pl;
-      if (pl === 'clashfx-ai-lock') nextAi.push(String(idx));
-    }
-    rulePayloadByIndex = nextMap;
-    aiLockIndices = nextAi;
-  }
-  function sanitizeRuleTimes(payload) {
-    if (!payload || !Array.isArray(payload.rules)) return false;
-    var changed = false;
-    for (var i = 0; i < payload.rules.length; i++) {
-      var extra = payload.rules[i] && payload.rules[i].extra;
-      if (!extra || typeof extra !== 'object') continue;
-      if (!isMeaningfulRuleTime(extra.hitCount, extra.hitAt) && Object.prototype.hasOwnProperty.call(extra, 'hitAt')) {
-        delete extra.hitAt;
-        changed = true;
-      }
-      if (!isMeaningfulRuleTime(extra.missCount, extra.missAt) && Object.prototype.hasOwnProperty.call(extra, 'missAt')) {
-        delete extra.missAt;
-        changed = true;
-      }
-    }
-    return changed;
-  }
-  window.fetch = function(input, init) {
-    var reqInfo = parseBackendRequest(input, init);
-    if (!reqInfo) return originalFetch.apply(this, arguments);
-
-    if (reqInfo.method === 'PATCH' && reqInfo.pathname === '/configs' && window.__CLASHFX_AI_LOCKED__) {
-      if (init && typeof init.body === 'string') {
-        try {
-          var cfgPatch = JSON.parse(init.body);
-          if (cfgPatch && typeof cfgPatch.mode === 'string' && cfgPatch.mode.toLowerCase() !== 'rule') {
-            showGuardNotice(GUARD_AIMODE_MSG);
-            return Promise.resolve(new Response(JSON.stringify({message: GUARD_AIMODE_MSG}), {
-              status: 403, headers: {'Content-Type': 'application/json'}
-            }));
-          }
-        } catch (_) {}
-      }
-    }
-
-    if (reqInfo.method === 'PATCH' && reqInfo.pathname === '/rules/disable' && init && typeof init.body === 'string') {
-      try {
-        var patchMap = JSON.parse(init.body);
-        if (patchMap && typeof patchMap === 'object') {
-          var keys = Object.keys(patchMap);
-          var touchedAiVal = null;
-          for (var k = 0; k < keys.length; k++) {
-            var plName = rulePayloadByIndex[keys[k]] || '';
-            if (plName === 'clashfx-internal-direct') {
-              showGuardNotice(GUARD_INTERNAL_MSG);
-              return Promise.resolve(new Response(JSON.stringify({message: GUARD_INTERNAL_MSG}), {
-                status: 403, headers: {'Content-Type': 'application/json'}
-              }));
-            }
-            if (plName === 'clashfx-ai-lock') {
-              touchedAiVal = Boolean(patchMap[keys[k]]);
-            }
-          }
-          if (touchedAiVal !== null && aiLockIndices.length > 1) {
-            for (var a = 0; a < aiLockIndices.length; a++) {
-              patchMap[aiLockIndices[a]] = touchedAiVal;
-            }
-            var clonedInit = Object.assign({}, init, { body: JSON.stringify(patchMap) });
-            return originalFetch.call(this, input, clonedInit);
-          }
-        }
-      } catch (_) {}
-    }
-
-    if (reqInfo.method !== 'GET' || reqInfo.pathname !== '/rules') {
-      return originalFetch.apply(this, arguments);
-    }
-
-    var receiver = this, args = arguments;
-    return originalFetch.apply(receiver, args).then(function(response) {
-      if (response && response.ok) {
-        return response.clone().text().then(function(text) {
-          try {
-            var payload = JSON.parse(text);
-            if (!Array.isArray(payload.rules)) return response;
-            indexRuleMetadata(payload);
-            var changed = sanitizeRuleTimes(payload);
-            var normalized = changed ? JSON.stringify(payload) : text;
-            rulesSnapshot = normalized;
-            hideStaleBanner();
-            if (!changed) return response;
-            var headers = new Headers(response.headers);
-            headers.delete('content-length');
-            return new Response(normalized, {status: response.status, statusText: response.statusText, headers: headers});
-          } catch (_) {
-            return response;
-          }
-        });
-      }
-      if (rulesSnapshot && response && response.status >= 500) {
-        showStaleBanner();
-        return new Response(rulesSnapshot, {status: 200, headers: {'Content-Type': 'application/json', 'X-ClashFX-Stale-Snapshot': 'rules'}});
-      }
-      return response;
-    }).catch(function(err) {
-      if (rulesSnapshot) {
-        showStaleBanner();
-        return new Response(rulesSnapshot, {status: 200, headers: {'Content-Type': 'application/json', 'X-ClashFX-Stale-Snapshot': 'rules'}});
-      }
-      throw err;
-    });
-  };
-})();
-)JS");
-    tpl.replace(QStringLiteral("__AILOCKED__"), aiLocked ? QStringLiteral("true") : QStringLiteral("false"));
-    tpl.replace(QStringLiteral("__BACKEND__"), backend);
-    tpl.replace(QStringLiteral("__STALE__"), msg);
-    tpl.replace(QStringLiteral("__GUARD_INTERNAL__"), guardInternalMsg);
-    tpl.replace(QStringLiteral("__GUARD_AIMODE__"), guardAiModeMsg);
-    return tpl;
-#else
-    Q_UNUSED(port);
-    Q_UNUSED(staleMessage);
-    Q_UNUSED(aiLocked);
-    return QString();
+    controller_->put_Bounds(rc);
 #endif
 }
 

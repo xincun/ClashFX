@@ -51,12 +51,6 @@ set(CLASHFX_UI_SOURCES
     src/WebView2Widget.cpp
     src/ConsoleWindow.h
     src/ConsoleWindow.cpp
-    src/AiLockAndNodeDialogs.h
-    src/AiLockAndNodeDialogs.cpp
-    src/RuleEditorDialog.h
-    src/RuleEditorDialog.cpp
-    src/SubscriptionsAndSettingsDialogs.h
-    src/SubscriptionsAndSettingsDialogs.cpp
     src/TrayController.h
     src/TrayController.cpp
     resources/clashfx.qrc

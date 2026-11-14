@@ -1,45 +1,41 @@
 #include "ConsoleWindow.h"
 
-#include "AiLockAndNodeDialogs.h"
 #include "DaemonClient.h"
 #include "I18n.h"
 #include "ModernWidgets.h"
-#include "RuleEditorDialog.h"
-#include "SubscriptionsAndSettingsDialogs.h"
-#include "TrayIconGenerator.h"
 #include "WebView2Widget.h"
 
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
-#include <QComboBox>
-#include <QDateTime>
 #include <QDesktopServices>
-#include <QFrame>
+#include <QDir>
+#include <QEvent>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QHideEvent>
-#include <QJsonArray>
+#include <QIcon>
 #include <QJsonDocument>
-#include <QJsonObject>
+#include <QJsonValue>
 #include <QLabel>
-#include <QMessageBox>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
-#include <QPainter>
-#include <QPixmap>
-#include <QProgressBar>
+#include <QProcess>
 #include <QPushButton>
+#include <QRect>
+#include <QScreen>
+#include <QSettings>
 #include <QShowEvent>
-#include <QSignalBlocker>
 #include <QStackedWidget>
+#include <QStandardPaths>
+#include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
 
 #ifdef Q_OS_WIN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #endif
 
@@ -47,1036 +43,754 @@ namespace clashfx {
 
 namespace {
 
-inline QString uiText(const char* zh, const char* en) {
-    return I18n::instance().isChinese() ? QString::fromUtf8(zh) : QString::fromUtf8(en);
+QSettings uiSettings() {
+    return QSettings(QStringLiteral("ClashFX"), QStringLiteral("ClashFXDesktop"));
 }
 
-QString formatQuotaBytes(double bytes) {
-    if (bytes <= 0.0) {
-        return QStringLiteral("0 B");
-    }
-    static const char* kUnits[] = {"B", "KB", "MB", "GB", "TB"};
-    int idx = 0;
-    double val = bytes;
-    while (val >= 1024.0 && idx < 4) {
-        val /= 1024.0;
-        ++idx;
-    }
-    return QString::number(val, 'f', idx <= 1 ? 0 : (val >= 100.0 ? 1 : 2)) + QLatin1Char(' ') +
-           QLatin1String(kUnits[idx]);
+int htCodeForEdge(const QString& edge) {
+#ifdef Q_OS_WIN
+    if (edge == QLatin1String("top")) return HTTOP;
+    if (edge == QLatin1String("bottom")) return HTBOTTOM;
+    if (edge == QLatin1String("left")) return HTLEFT;
+    if (edge == QLatin1String("right")) return HTRIGHT;
+    if (edge == QLatin1String("top-left")) return HTTOPLEFT;
+    if (edge == QLatin1String("top-right")) return HTTOPRIGHT;
+    if (edge == QLatin1String("bottom-left")) return HTBOTTOMLEFT;
+    if (edge == QLatin1String("bottom-right")) return HTBOTTOMRIGHT;
+#else
+    Q_UNUSED(edge);
+#endif
+    return 0;
 }
 
-}  // namespace
+} // namespace
 
 ConsoleWindow::ConsoleWindow(DaemonClient* client, QWidget* parent)
-    : QMainWindow(parent)
-    , client_(client)
-    , netMgr_(new QNetworkAccessManager(this)) {
+    : QMainWindow(parent),
+      client_(client),
+      netMgr_(new QNetworkAccessManager(this)) {
     setObjectName(QStringLiteral("ClashConsoleWindow"));
-    setWindowIcon(TrayIconGenerator::appIcon());
-    resize(1340, 820);
-    setMinimumSize(1120, 680);
+    setWindowTitle(QStringLiteral("ClashFX"));
+    setWindowIcon(QIcon(QStringLiteral(":/clashfx.ico")));
+    setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowMinimizeButtonHint |
+                   Qt::WindowMaximizeButtonHint | Qt::WindowSystemMenuHint);
+    setMinimumSize(960, 620);
 
-    auto* central = new QWidget(this);
-    central->setObjectName(QStringLiteral("ClashCentral"));
-    central->setStyleSheet(QStringLiteral("QWidget#ClashCentral { background: #14151a; }"));
-    auto* rootLay = new QHBoxLayout(central);
-    rootLay->setContentsMargins(0, 0, 0, 0);
-    rootLay->setSpacing(0);
-
-    rootLay->addWidget(buildSidebar(central));
-
-    rightStack_ = new QStackedWidget(central);
-    rightStack_->setStyleSheet(QStringLiteral("QStackedWidget { background: #14151a; }"));
-
-    rightStack_->addWidget(buildDashboardPage(rightStack_));            // 0: Dashboard
-    subsPage_ = new SubscriptionsPage(client_, rightStack_);
-    rightStack_->addWidget(subsPage_);                                  // 1: Subscriptions
-    rulesPage_ = new RuleEditorPage(client_, rightStack_);
-    rightStack_->addWidget(rulesPage_);                                 // 2: Rules
-    aiLockPage_ = new AiLockPage(client_, rightStack_);
-    rightStack_->addWidget(aiLockPage_);                                // 3: AiLock
-    multiNodePage_ = new MultiNodePage(client_, rightStack_);
-    rightStack_->addWidget(multiNodePage_);                             // 4: MultiNode
-    diagPage_ = new NodeDiagnosticPage(client_, rightStack_);
-    rightStack_->addWidget(diagPage_);                                  // 5: Diagnostics
-    settingsPage_ = new SettingsPage(client_, rightStack_);
-    rightStack_->addWidget(settingsPage_);                              // 6: Settings
-
-    rootLay->addWidget(rightStack_, 1);
-    setCentralWidget(central);
-
-    connect(&I18n::instance(), &I18n::languageChanged, this, [this](const QString&) { retranslateUi(); });
-
-    retranslateUi();
-    navigateTo(ConsolePage::Dashboard);
-    applySnapshot(client_ && client_->isConnected(), client_ ? client_->snapshot() : QJsonObject());
-}
-
-QWidget* ConsoleWindow::buildSidebar(QWidget* parent) {
-    sidebar_ = new QFrame(parent);
-    sidebar_->setFixedWidth(256);
-    sidebar_->setObjectName(QStringLiteral("ClashSidebar"));
-    sidebar_->setStyleSheet(QStringLiteral(
-        "QFrame#ClashSidebar {"
-        "  background: #101014;"
-        "  border-right: 1px solid #222530;"
-        "}"));
-
-    auto* lay = new QVBoxLayout(sidebar_);
-    lay->setContentsMargins(14, 16, 14, 14);
-    lay->setSpacing(12);
-
-    // 1. Brand Header Row
-    auto* brandRow = new QHBoxLayout();
-    brandRow->setSpacing(10);
-
-    brandIconLabel_ = new QLabel(sidebar_);
-    brandIconLabel_->setFixedSize(36, 36);
-    brandIconLabel_->setAlignment(Qt::AlignCenter);
-    brandIconLabel_->setStyleSheet(QStringLiteral(
-        "background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2563eb, stop:1 #0ea5e9);"
-        "border-radius: 10px;"));
-    brandIconLabel_->setPixmap(renderVectorIcon(VectorIcon::BrandBolt, 20, Qt::white, devicePixelRatioF()));
-
-    auto* brandTextCol = new QVBoxLayout();
-    brandTextCol->setSpacing(1);
-    auto* brandNameLbl = new QLabel(QStringLiteral("ClashFX"), sidebar_);
-    brandNameLbl->setStyleSheet(QStringLiteral("color: #f9fafb; font-size: 16px; font-weight: 700;"));
-    brandSubLabel_ = new QLabel(QStringLiteral("● Mihomo"), sidebar_);
-    brandSubLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-size: 11px; font-weight: 600;"));
-    brandTextCol->addWidget(brandNameLbl);
-    brandTextCol->addWidget(brandSubLabel_);
-
-    sidebarAiPill_ = new BadgePill(sidebar_, true);
-    brandRow->addWidget(brandIconLabel_);
-    brandRow->addLayout(brandTextCol, 1);
-    brandRow->addWidget(sidebarAiPill_, 0, Qt::AlignTop);
-    lay->addLayout(brandRow);
-
-    // 2. Outbound Mode 3-Way Segmented Switcher
-    modeSwitch_ = new SegmentedControl(true, sidebar_);
-    modeSwitch_->setCompact(true);
-    modeSwitch_->setItems({QStringLiteral("Rule"), QStringLiteral("Global"), QStringLiteral("Direct")});
-    connect(modeSwitch_, &SegmentedControl::itemClicked, this, &ConsoleWindow::switchOutboundMode);
-    lay->addWidget(modeSwitch_);
-
-    // 3. System Proxy & Enhanced TUN Quick Cards
-    auto* quickRow = new QHBoxLayout();
-    quickRow->setSpacing(8);
-    sysProxyCard_ = new SidebarQuickCard(VectorIcon::Globe, ToggleSwitch::Accent::Blue, sidebar_);
-    tunCard_ = new SidebarQuickCard(VectorIcon::Zap, ToggleSwitch::Accent::Emerald, sidebar_);
-    quickRow->addWidget(sysProxyCard_, 1);
-    quickRow->addWidget(tunCard_, 1);
-    lay->addLayout(quickRow);
-
-    connect(sysProxyCard_, &SidebarQuickCard::toggleRequested, this, &ConsoleWindow::toggleSystemProxy);
-    connect(tunCard_, &SidebarQuickCard::toggleRequested, this, [this](bool next) { toggleEnhancedMode(next, false); });
-
-    // 4. Active Profile & Subscription Quota Card
-    auto* profCard = new QFrame(sidebar_);
-    profCard->setObjectName(QStringLiteral("SidebarProfileCard"));
-    profCard->setStyleSheet(QStringLiteral(
-        "QFrame#SidebarProfileCard {"
-        "  background: #151721;"
-        "  border: 1px solid #242836;"
-        "  border-radius: 10px;"
-        "}"));
-    auto* profLay = new QVBoxLayout(profCard);
-    profLay->setContentsMargins(10, 9, 10, 9);
-    profLay->setSpacing(7);
-
-    auto* profTop = new QHBoxLayout();
-    profTop->setSpacing(6);
-    profileCombo_ = new QComboBox(profCard);
-    profileCombo_->setStyleSheet(QStringLiteral(
-        "QComboBox { background: transparent; border: none; color: #f3f4f6; font-size: 12px; font-weight: 700;"
-        "  padding: 2px 4px; }"
-        "QComboBox::drop-down { border: none; width: 16px; }"));
-    profileActivePill_ = new BadgePill(profCard, true);
-    profileRefreshBtn_ = new QPushButton(profCard);
-    profileRefreshBtn_->setFixedSize(24, 24);
-    profileRefreshBtn_->setCursor(Qt::PointingHandCursor);
-    profileRefreshBtn_->setIcon(QIcon(renderVectorIcon(VectorIcon::Refresh, 14, QColor(QStringLiteral("#9ca3af")),
-                                                       devicePixelRatioF())));
-    profileRefreshBtn_->setStyleSheet(QStringLiteral(
-        "QPushButton { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 0; }"
-        "QPushButton:hover { background: #212534; border-color: #313649; }"));
-
-    profTop->addWidget(profileCombo_, 1);
-    profTop->addWidget(profileActivePill_);
-    profTop->addWidget(profileRefreshBtn_);
-    profLay->addLayout(profTop);
-
-    quotaBar_ = new QProgressBar(profCard);
-    quotaBar_->setRange(0, 100);
-    quotaBar_->setValue(0);
-    quotaBar_->setTextVisible(false);
-    quotaBar_->setFixedHeight(4);
-    quotaBar_->setStyleSheet(QStringLiteral(
-        "QProgressBar { background: #232635; border: none; border-radius: 2px; }"
-        "QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3b82f6, stop:1 #10b981);"
-        "  border-radius: 2px; }"));
-    profLay->addWidget(quotaBar_);
-
-    quotaTextLabel_ = new QLabel(profCard);
-    quotaTextLabel_->setStyleSheet(QStringLiteral("color: #8b93a6; font-size: 10px;"));
-    profLay->addWidget(quotaTextLabel_);
-    lay->addWidget(profCard);
-
-    connect(profileCombo_, &QComboBox::activated, this, [this](int idx) {
-        if (!updatingUi_ && idx >= 0) {
-            selectActiveProfile(profileCombo_->itemText(idx));
-        }
-    });
-    connect(profileRefreshBtn_, &QPushButton::clicked, this, &ConsoleWindow::refreshActiveProfile);
-
-    // 5. Navigation Items
-    navSectionLabel_ = new QLabel(sidebar_);
-    navSectionLabel_->setStyleSheet(
-        QStringLiteral("color: #6b7280; font-size: 11px; font-weight: 600; padding: 4px 4px 0 4px;"));
-    lay->addWidget(navSectionLabel_);
-
-    auto* navCol = new QVBoxLayout();
-    navCol->setSpacing(4);
-    navDashboard_ = new SidebarNavButton(VectorIcon::Dashboard, sidebar_);
-    navSubscriptions_ = new SidebarNavButton(VectorIcon::Subscriptions, sidebar_);
-    navRules_ = new SidebarNavButton(VectorIcon::Rules, sidebar_);
-    navAiLock_ = new SidebarNavButton(VectorIcon::AiLock, sidebar_);
-    navMultiNode_ = new SidebarNavButton(VectorIcon::MultiNode, sidebar_);
-    navDiagnostics_ = new SidebarNavButton(VectorIcon::Diagnostics, sidebar_);
-    navSettings_ = new SidebarNavButton(VectorIcon::Settings, sidebar_);
-
-    for (SidebarNavButton* btn : {navDashboard_, navSubscriptions_, navRules_, navAiLock_, navMultiNode_, navDiagnostics_,
-                                  navSettings_}) {
-        navCol->addWidget(btn);
+    theme_ = uiSettings().value(QStringLiteral("ui/theme"), QStringLiteral("dark")).toString();
+    if (theme_ != QLatin1String("light")) {
+        theme_ = QStringLiteral("dark");
     }
-    lay->addLayout(navCol);
 
-    connect(navDashboard_, &QPushButton::clicked, this, [this]() { navigateTo(ConsolePage::Dashboard); });
-    connect(navSubscriptions_, &QPushButton::clicked, this, [this]() { navigateTo(ConsolePage::Subscriptions); });
-    connect(navRules_, &QPushButton::clicked, this, [this]() { navigateTo(ConsolePage::Rules); });
-    connect(navAiLock_, &QPushButton::clicked, this, [this]() { navigateTo(ConsolePage::AiLock); });
-    connect(navMultiNode_, &QPushButton::clicked, this, [this]() { navigateTo(ConsolePage::MultiNode); });
-    connect(navDiagnostics_, &QPushButton::clicked, this, [this]() { navigateTo(ConsolePage::Diagnostics); });
-    connect(navSettings_, &QPushButton::clicked, this, [this]() { navigateTo(ConsolePage::Settings); });
+    stack_ = new QStackedWidget(this);
+    stack_->setContentsMargins(0, 0, 0, 0);
+    setCentralWidget(stack_);
 
-    lay->addStretch(1);
+    webView_ = new WebView2Widget(stack_);
+    webView_->setThemeDark(theme_ == QLatin1String("dark"));
+    stack_->addWidget(webView_);
 
-    // 6. Live Traffic & Port Telemetry Box
-    auto* trafficCard = new QFrame(sidebar_);
-    trafficCard->setObjectName(QStringLiteral("SidebarTrafficCard"));
-    trafficCard->setStyleSheet(QStringLiteral(
-        "QFrame#SidebarTrafficCard {"
-        "  background: #151721;"
-        "  border: 1px solid #242836;"
-        "  border-radius: 10px;"
-        "}"));
-    auto* tLay = new QVBoxLayout(trafficCard);
-    tLay->setContentsMargins(12, 10, 12, 10);
-    tLay->setSpacing(5);
+    // Minimal fallback screen shown only if WebView2 initialization fails
+    fallbackWidget_ = new QWidget(stack_);
+    fallbackWidget_->setStyleSheet(
+        QStringLiteral("QWidget { background: #0b0d12; color: #f1f5f9; }"));
+    auto* fbLayout = new QVBoxLayout(fallbackWidget_);
+    fbLayout->setAlignment(Qt::AlignCenter);
+    fbLayout->setSpacing(12);
+    fallbackLabel_ = new QLabel(
+        L("正在加载 ClashFX 界面...", "Loading ClashFX interface..."), fallbackWidget_);
+    fallbackLabel_->setWordWrap(true);
+    fallbackLabel_->setAlignment(Qt::AlignCenter);
+    fallbackLabel_->setMaximumWidth(540);
+    fallbackLabel_->setStyleSheet(QStringLiteral("font-size: 13px; color: #94a3b8;"));
+    auto* retryBtn = new QPushButton(L("重新加载界面", "Reload UI"), fallbackWidget_);
+    retryBtn->setStyleSheet(QStringLiteral(
+        "QPushButton { background: #3b82f6; color: #ffffff; border: none; border-radius: 8px; "
+        "padding: 8px 18px; font-weight: 600; }"
+        "QPushButton:hover { background: #2563eb; }"));
+    fbLayout->addWidget(fallbackLabel_);
+    fbLayout->addWidget(retryBtn, 0, Qt::AlignCenter);
+    stack_->addWidget(fallbackWidget_);
+    stack_->setCurrentWidget(webView_);
 
-    auto* upRow = new QHBoxLayout();
-    upTitleLabel_ = new QLabel(trafficCard);
-    upTitleLabel_->setStyleSheet(QStringLiteral("color: #8b93a6; font-size: 11px;"));
-    upSpeedLabel_ = new QLabel(QStringLiteral("0 B/s"), trafficCard);
-    upSpeedLabel_->setStyleSheet(
-        QStringLiteral("color: #60a5fa; font-size: 12px; font-weight: 700; font-family: Consolas, monospace;"));
-    upRow->addWidget(upTitleLabel_);
-    upRow->addStretch(1);
-    upRow->addWidget(upSpeedLabel_);
-
-    auto* dnRow = new QHBoxLayout();
-    downTitleLabel_ = new QLabel(trafficCard);
-    downTitleLabel_->setStyleSheet(QStringLiteral("color: #8b93a6; font-size: 11px;"));
-    downSpeedLabel_ = new QLabel(QStringLiteral("0 B/s"), trafficCard);
-    downSpeedLabel_->setStyleSheet(
-        QStringLiteral("color: #34d399; font-size: 12px; font-weight: 700; font-family: Consolas, monospace;"));
-    dnRow->addWidget(downTitleLabel_);
-    dnRow->addStretch(1);
-    dnRow->addWidget(downSpeedLabel_);
-
-    auto* tDiv = new QFrame(trafficCard);
-    tDiv->setFixedHeight(1);
-    tDiv->setStyleSheet(QStringLiteral("background: #222634; border: none;"));
-
-    auto* portRow = new QHBoxLayout();
-    mixedPortLabel_ = new QLabel(QStringLiteral("Mixed :7890"), trafficCard);
-    mixedPortLabel_->setStyleSheet(QStringLiteral("color: #6b7280; font-size: 10px; font-family: Consolas, monospace;"));
-    apiPortLabel_ = new QLabel(QStringLiteral("API :19090"), trafficCard);
-    apiPortLabel_->setStyleSheet(QStringLiteral("color: #6b7280; font-size: 10px; font-family: Consolas, monospace;"));
-    portRow->addWidget(mixedPortLabel_);
-    portRow->addStretch(1);
-    portRow->addWidget(apiPortLabel_);
-
-    tLay->addLayout(upRow);
-    tLay->addLayout(dnRow);
-    tLay->addWidget(tDiv);
-    tLay->addLayout(portRow);
-    lay->addWidget(trafficCard);
-
-    return sidebar_;
-}
-
-QWidget* ConsoleWindow::buildDashboardPage(QWidget* parent) {
-    auto* page = new QWidget(parent);
-    auto* outerLay = new QVBoxLayout(page);
-    outerLay->setContentsMargins(0, 0, 0, 0);
-    outerLay->setSpacing(0);
-
-    const WorkspaceHeaderRefs hdr = buildWorkspaceHeader(page);
-    dashTitleLabel_ = hdr.titleLabel;
-    dashStatusPill_ = hdr.primaryBadge;
-    dashAiPill_ = hdr.secondaryBadge;
-    dashSubLabel_ = hdr.subtitleLabel;
-
-    benchAllBtn_ = new QPushButton(page);
-    copyTermBtn_ = new QPushButton(page);
-    reloadDashBtn_ = new QPushButton(page);
-    reloadDashBtn_->setProperty("primary", true);
-
-    hdr.actionsLayout->addWidget(benchAllBtn_);
-    hdr.actionsLayout->addWidget(copyTermBtn_);
-    hdr.actionsLayout->addWidget(reloadDashBtn_);
-    outerLay->addWidget(hdr.container);
-
-    auto* body = new QWidget(page);
-    auto* lay = new QVBoxLayout(body);
-    lay->setContentsMargins(24, 16, 24, 18);
-    lay->setSpacing(14);
-    outerLay->addWidget(body, 1);
-
-    auto* dashCard = createCardFrame(body);
-    auto* cardLay = new QVBoxLayout(dashCard);
-    cardLay->setContentsMargins(1, 1, 1, 1);
-    cardLay->setSpacing(0);
-
-    dashboardStack_ = new QStackedWidget(dashCard);
-    webView_ = new WebView2Widget(dashboardStack_);
-    dashboardStack_->addWidget(webView_);
-
-    fallbackPage_ = new QWidget(dashboardStack_);
-    auto* fbLay = new QVBoxLayout(fallbackPage_);
-    fbLay->setAlignment(Qt::AlignCenter);
-    fbLay->setSpacing(12);
-    fallbackTitleLabel_ = new QLabel(fallbackPage_);
-    fallbackTitleLabel_->setStyleSheet(QStringLiteral("color: #f3f4f6; font-size: 16px; font-weight: 700;"));
-    fallbackTitleLabel_->setAlignment(Qt::AlignCenter);
-    fallbackReasonLabel_ = new QLabel(fallbackPage_);
-    fallbackReasonLabel_->setStyleSheet(QStringLiteral("color: #9ca3af; font-size: 12px;"));
-    fallbackReasonLabel_->setAlignment(Qt::AlignCenter);
-    fallbackReasonLabel_->setWordWrap(true);
-    fallbackReasonLabel_->setMaximumWidth(540);
-    auto* fbBtns = new QHBoxLayout();
-    fbBtns->setSpacing(10);
-    fbBtns->setAlignment(Qt::AlignCenter);
-    downloadWebViewBtn_ = new QPushButton(fallbackPage_);
-    retryWebViewBtn_ = new QPushButton(fallbackPage_);
-    retryWebViewBtn_->setProperty("primary", true);
-    fbBtns->addWidget(downloadWebViewBtn_);
-    fbBtns->addWidget(retryWebViewBtn_);
-    fbLay->addWidget(fallbackTitleLabel_);
-    fbLay->addWidget(fallbackReasonLabel_);
-    fbLay->addLayout(fbBtns);
-    dashboardStack_->addWidget(fallbackPage_);
-
-    cardLay->addWidget(dashboardStack_, 1);
-    lay->addWidget(dashCard, 1);
-
-    connect(webView_, &WebView2Widget::webViewReady, this, [this]() {
-        dashboardStack_->setCurrentWidget(webView_);
-        webView_->setPageActive(currentPage_ == ConsolePage::Dashboard && isVisible());
-    });
-    connect(webView_, &WebView2Widget::webViewFailed, this, [this](const QString& reason) {
-        fallbackReasonLabel_->setText(reason);
-        dashboardStack_->setCurrentWidget(fallbackPage_);
-    });
-    connect(downloadWebViewBtn_, &QPushButton::clicked, this, []() {
-        QDesktopServices::openUrl(
-            QUrl(QStringLiteral("https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section")));
-    });
-    connect(retryWebViewBtn_, &QPushButton::clicked, this, [this]() {
-        dashboardStack_->setCurrentWidget(webView_);
+    connect(retryBtn, &QPushButton::clicked, this, [this]() {
+        stack_->setCurrentWidget(webView_);
         webView_->retryInitialize();
     });
+    connect(webView_, &WebView2Widget::webViewReady, this, [this]() {
+        stack_->setCurrentWidget(webView_);
+    });
+    connect(webView_, &WebView2Widget::webViewFailed, this, &ConsoleWindow::onWebViewFailed);
+    connect(webView_, &WebView2Widget::webMessageReceived, this, &ConsoleWindow::onWebMessageReceived);
 
-    connect(benchAllBtn_, &QPushButton::clicked, this, &ConsoleWindow::runBenchmarkAll);
-    connect(copyTermBtn_, &QPushButton::clicked, this, &ConsoleWindow::copyTerminalProxyCommand);
-    connect(reloadDashBtn_, &QPushButton::clicked, this, [this]() {
-        if (webView_) {
-            webView_->reloadDashboard();
-            ToastOverlay::show(this, uiText("正在重新加载 MetaCubeXD 面板...", "Reloading MetaCubeXD dashboard..."),
-                               PillTone::Blue);
+    connect(&I18n::instance(), &I18n::languageChanged, this, [this](const QString& lang) {
+        if (uiReady_) {
+            webView_->postJsonMessage(QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("language")},
+                {QStringLiteral("language"), lang},
+            });
         }
     });
 
-    return page;
+    telemetryTimer_ = new QTimer(this);
+    telemetryTimer_->setInterval(1500);
+    connect(telemetryTimer_, &QTimer::timeout, this, &ConsoleWindow::pollTelemetrySnapshot);
+
+    restoreWindowGeometry();
+    Win11Dwm::applyFramelessRoundedChrome(this, theme_ == QLatin1String("dark"));
+}
+
+ConsoleWindow::~ConsoleWindow() {
+    saveWindowGeometry();
+    stopTrafficStream();
+}
+
+void ConsoleWindow::applySnapshot(bool connected, const QJsonObject& snapshot) {
+    connected_ = connected;
+    snapshot_ = snapshot;
+    if (uiReady_) {
+        webView_->postJsonMessage(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("state")},
+            {QStringLiteral("connected"), connected_},
+            {QStringLiteral("snapshot"), snapshot_},
+        });
+    }
+    syncTelemetryState();
 }
 
 void ConsoleWindow::navigateTo(ConsolePage page, int subTab, const QString& diagNode) {
     currentPage_ = page;
-
-    // CRITICAL: Hide native WebView2 child HWND BEFORE showing non-Dashboard pages!
-    if (webView_) {
-        webView_->setPageActive(page == ConsolePage::Dashboard && isVisible());
-    }
-
-    rightStack_->setCurrentIndex(static_cast<int>(page));
-
-    navDashboard_->setActive(page == ConsolePage::Dashboard);
-    navSubscriptions_->setActive(page == ConsolePage::Subscriptions);
-    navRules_->setActive(page == ConsolePage::Rules);
-    navAiLock_->setActive(page == ConsolePage::AiLock);
-    navMultiNode_->setActive(page == ConsolePage::MultiNode);
-    navDiagnostics_->setActive(page == ConsolePage::Diagnostics);
-    navSettings_->setActive(page == ConsolePage::Settings);
-
-    updateWindowTitle();
-
-    if (page == ConsolePage::Rules && rulesPage_) {
-        rulesPage_->onPageActivated(subTab);
-    } else if (page == ConsolePage::AiLock && aiLockPage_) {
-        aiLockPage_->focusSearch();
-    } else if (page == ConsolePage::Diagnostics && diagPage_ && !diagNode.isEmpty()) {
-        diagPage_->startDiagnosisForNode(diagNode);
-    }
-}
-
-void ConsoleWindow::updateWindowTitle() {
-    QString suffix;
-    switch (currentPage_) {
-    case ConsolePage::Dashboard:
-        suffix = uiText("控制台与节点拓扑", "Dashboard & Topology");
-        break;
-    case ConsolePage::Subscriptions:
-        suffix = uiText("托管订阅管理", "Subscriptions");
-        break;
-    case ConsolePage::Rules:
-        suffix = uiText("分流与配置补丁", "Rules & Mixin");
-        break;
-    case ConsolePage::AiLock:
-        suffix = uiText("AI 专用锁定", "AI Proxy Lock");
-        break;
-    case ConsolePage::MultiNode:
-        suffix = uiText("多节点固定端口", "Multi-Node Ports");
-        break;
-    case ConsolePage::Diagnostics:
-        suffix = uiText("测速与故障诊断", "Node Diagnostics");
-        break;
-    case ConsolePage::Settings:
-        suffix = uiText("偏好设置", "Preferences");
-        break;
-    }
-    setWindowTitle(uiText("ClashFX 控制台 — ", "ClashFX Console — ") + suffix);
-}
-
-void ConsoleWindow::retranslateUi() {
-    modeSwitch_->setItemText(0, uiText("规则 Rule", "Rule"));
-    modeSwitch_->setItemText(1, uiText("全局 Global", "Global"));
-    modeSwitch_->setItemText(2, uiText("直连 Direct", "Direct"));
-
-    navSectionLabel_->setText(uiText("工作台导航", "WORKSPACE"));
-    navDashboard_->setNavTitle(uiText("控制台与节点", "Dashboard"));
-    navDashboard_->setBadge(QStringLiteral("MetaCubeXD"), PillTone::Muted);
-    navSubscriptions_->setNavTitle(uiText("托管订阅管理", "Subscriptions"));
-    navRules_->setNavTitle(uiText("分流与配置补丁", "Rules & Mixin"));
-    navRules_->setBadge(QStringLiteral("Mixin"), PillTone::Muted);
-    navAiLock_->setNavTitle(uiText("AI 专用锁定", "AI Proxy Lock"));
-    navMultiNode_->setNavTitle(uiText("多节点固定端口", "Multi-Node Ports"));
-    navDiagnostics_->setNavTitle(uiText("测速与故障诊断", "Diagnostics"));
-    navSettings_->setNavTitle(uiText("偏好设置", "Preferences"));
-
-    upTitleLabel_->setText(uiText("↑ 实时上传", "↑ Upload"));
-    downTitleLabel_->setText(uiText("↓ 实时下载", "↓ Download"));
-
-    dashTitleLabel_->setText(uiText("控制台与节点拓扑", "Dashboard & Node Topology"));
-    dashSubLabel_->setText(uiText("内嵌 MetaCubeXD 实时面板 · 左侧可直接切换系统代理、TUN 网卡与出站模式",
-                                  "Embedded MetaCubeXD console · Toggle System Proxy, TUN & Outbound mode on the left"));
-    benchAllBtn_->setText(uiText("⚡ 全节点测速", "⚡ Benchmark"));
-    copyTermBtn_->setText(uiText("📋 终端代理", "📋 Proxy Env"));
-    reloadDashBtn_->setText(uiText("↻ 刷新面板", "↻ Reload"));
-
-    fallbackTitleLabel_->setText(uiText("未检测到 Microsoft Edge WebView2 运行时",
-                                        "Microsoft Edge WebView2 Runtime Not Found"));
-    downloadWebViewBtn_->setText(uiText("下载 WebView2 运行时", "Download WebView2"));
-    retryWebViewBtn_->setText(uiText("重试加载面板", "Retry"));
-
-    updateWindowTitle();
-    updateSidebarFromSnapshot(lastConnected_, lastSnapshot_);
-    updateDashboardHeader(lastConnected_, lastSnapshot_);
-}
-
-void ConsoleWindow::applySnapshot(bool connected, const QJsonObject& snapshot) {
-    lastConnected_ = connected;
-    lastSnapshot_ = snapshot;
-
-    updateSidebarFromSnapshot(connected, snapshot);
-    updateDashboardHeader(connected, snapshot);
-
-    const QJsonObject runtime = snapshot.value(QStringLiteral("runtime")).toObject();
-    const QJsonObject settings = snapshot.value(QStringLiteral("settings")).toObject();
-    const int apiPort = runtime.value(QStringLiteral("api_port")).toInt(settings.value(QStringLiteral("api_port")).toInt(19090));
-    const QString apiSecret = runtime.contains(QStringLiteral("api_secret"))
-                                  ? runtime.value(QStringLiteral("api_secret")).toString()
-                                  : settings.value(QStringLiteral("api_secret")).toString();
-    const QString dashUrl = snapshot.value(QStringLiteral("dashboard_url")).toString();
-    const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
-
-    if (webView_ && apiPort > 0 && !dashUrl.isEmpty()) {
-        webView_->configureDashboard(apiPort, apiSecret, dashUrl, aiLocked);
-        webView_->setPageActive(currentPage_ == ConsolePage::Dashboard && isVisible());
-    }
-
-    if (subsPage_) subsPage_->updateSnapshot(snapshot);
-    if (rulesPage_) rulesPage_->updateSnapshot(snapshot);
-    if (aiLockPage_) aiLockPage_->updateSnapshot(snapshot);
-    if (multiNodePage_) multiNodePage_->updateSnapshot(snapshot);
-    if (diagPage_) diagPage_->updateSnapshot(snapshot);
-    if (settingsPage_) settingsPage_->updateSnapshot(snapshot);
-
-    syncTrafficStream();
-}
-
-void ConsoleWindow::updateSidebarFromSnapshot(bool connected, const QJsonObject& snapshot) {
-    updatingUi_ = true;
-
-    const QJsonObject settings = snapshot.value(QStringLiteral("settings")).toObject();
-    const QJsonObject runtime = snapshot.value(QStringLiteral("runtime")).toObject();
-    const bool coreRunning = snapshot.value(QStringLiteral("core_running")).toBool(false);
-    const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
-    const QString aiTarget = settings.value(QStringLiteral("claudeProxyLockTarget")).toString();
-    const bool sysProxyOn = settings.value(QStringLiteral("system_proxy_enabled")).toBool(false);
-    const bool tunOn = settings.value(QStringLiteral("enhanced_mode")).toBool(false);
-    const QString mode = settings.value(QStringLiteral("outbound_mode")).toString(QStringLiteral("rule")).toLower();
-
-    const int mixedPort = runtime.value(QStringLiteral("mixed_port")).toInt(7890);
-    const int apiPort = runtime.value(QStringLiteral("api_port")).toInt(settings.value(QStringLiteral("api_port")).toInt(19090));
-
-    // Brand status line
-    if (!connected) {
-        brandSubLabel_->setText(uiText("● 守护进程断开", "● Daemon Offline"));
-        brandSubLabel_->setStyleSheet(QStringLiteral("color: #f87171; font-size: 11px; font-weight: 600;"));
-    } else if (coreRunning) {
-        brandSubLabel_->setText(QStringLiteral("● Mihomo v1.19.24"));
-        brandSubLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-size: 11px; font-weight: 600;"));
-    } else {
-        brandSubLabel_->setText(uiText("● 内核已停止", "● Core Stopped"));
-        brandSubLabel_->setStyleSheet(QStringLiteral("color: #fbbf24; font-size: 11px; font-weight: 600;"));
-    }
-
-    sidebarAiPill_->setPill(aiLocked ? uiText("AI 锁定", "AI Lock") : QString(), PillTone::Violet);
-
-    int modeIdx = 0;
-    if (mode == QLatin1String("global")) {
-        modeIdx = 1;
-    } else if (mode == QLatin1String("direct")) {
-        modeIdx = 2;
-    }
-    modeSwitch_->setCurrentIndex(modeIdx, false);
-    modeSwitch_->setItemEnabled(1, connected && !aiLocked);
-    modeSwitch_->setItemEnabled(2, connected && !aiLocked);
-    modeSwitch_->setItemEnabled(0, connected);
-
-    sysProxyCard_->setCardEnabled(connected);
-    sysProxyCard_->setState(
-        sysProxyOn, uiText("系统代理", "System Proxy"),
-        sysProxyOn ? QStringLiteral("127.0.0.1:%1").arg(mixedPort > 0 ? mixedPort : 7890)
-                   : uiText("未开启", "Disabled"));
-
-    tunCard_->setCardEnabled(connected);
-    tunCard_->setState(
-        tunOn, uiText("增强模式 TUN", "Enhanced TUN"),
-        tunOn ? uiText("Wintun · 零弹窗", "Wintun · Active") : uiText("已关闭", "Disabled"));
-
-    // Active profile combo + quota
-    const QString selectedProf = settings.value(QStringLiteral("selected_profile")).toString();
-    const QJsonArray profiles = snapshot.value(QStringLiteral("profiles")).toArray();
-    {
-        QSignalBlocker sb(profileCombo_);
-        profileCombo_->clear();
-        for (const QJsonValue& p : profiles) {
-            profileCombo_->addItem(p.toString());
+    pendingSubTab_ = subTab;
+    pendingDiagNode_ = diagNode;
+    if (uiReady_) {
+        QJsonObject msg{
+            {QStringLiteral("type"), QStringLiteral("navigate")},
+            {QStringLiteral("page"), static_cast<int>(page)},
+            {QStringLiteral("subTab"), subTab},
+        };
+        if (!diagNode.isEmpty()) {
+            msg.insert(QStringLiteral("diagNode"), diagNode);
         }
-        if (!selectedProf.isEmpty()) {
-            const int idx = profileCombo_->findText(selectedProf);
-            if (idx >= 0) {
-                profileCombo_->setCurrentIndex(idx);
-            } else {
-                profileCombo_->addItem(selectedProf);
-                profileCombo_->setCurrentIndex(profileCombo_->count() - 1);
-            }
-        }
+        webView_->postJsonMessage(msg);
     }
-    profileCombo_->setEnabled(connected && profileCombo_->count() > 0);
-    profileRefreshBtn_->setEnabled(connected);
-    profileActivePill_->setPill(selectedProf.isEmpty() ? QString() : uiText("当前激活", "Active"), PillTone::Green);
-
-    const QJsonObject subInfo = snapshot.value(QStringLiteral("active_subscription_info")).toObject();
-    if (!subInfo.isEmpty() && (subInfo.value(QStringLiteral("total")).toDouble(0) > 0 ||
-                               subInfo.contains(QStringLiteral("upload")) ||
-                               subInfo.contains(QStringLiteral("download")))) {
-        const double up = subInfo.value(QStringLiteral("upload")).toDouble(0.0);
-        const double down = subInfo.value(QStringLiteral("download")).toDouble(0.0);
-        const double total = subInfo.value(QStringLiteral("total")).toDouble(0.0);
-        const double used = qMax(0.0, up + down);
-        if (total > 0.0) {
-            quotaBar_->setValue(qBound(0, static_cast<int>((used / total) * 100.0 + 0.5), 100));
-            QString txt = uiText("已用 ", "Used ") + formatQuotaBytes(used) + QStringLiteral(" / ") +
-                          formatQuotaBytes(total);
-            const qint64 expTs = static_cast<qint64>(subInfo.value(QStringLiteral("expire")).toDouble(0));
-            if (expTs > 0) {
-                txt += QStringLiteral(" · ") +
-                       QDateTime::fromSecsSinceEpoch(expTs).toString(QStringLiteral("yyyy-MM-dd")) +
-                       uiText(" 到期", " exp");
-            }
-            quotaTextLabel_->setText(txt);
-        } else {
-            quotaBar_->setValue(0);
-            quotaTextLabel_->setText(uiText("已用 ", "Used ") + formatQuotaBytes(used));
-        }
-    } else {
-        quotaBar_->setValue(0);
-        quotaTextLabel_->setText(uiText("本地配置 / 无流量配额头", "Local Profile / No Quota Info"));
-    }
-
-    // Nav dynamic badges
-    const QJsonArray subs = snapshot.value(QStringLiteral("subscriptions")).toArray();
-    navSubscriptions_->setBadge(subs.isEmpty() ? QString()
-                                               : (QString::number(subs.size()) + uiText(" 个订阅", " subs")),
-                                PillTone::Muted);
-
-    navAiLock_->setBadge(aiLocked ? uiText("已保护", "Locked") : QString(), PillTone::Violet);
-    Q_UNUSED(aiTarget);
-
-    const QJsonObject ns = snapshot.value(QStringLiteral("node_services")).toObject();
-    const bool portsEnabled = ns.value(QStringLiteral("settings")).toObject().value(QStringLiteral("ports_enabled")).toBool(true);
-    const QJsonArray nsRows = ns.value(QStringLiteral("rows")).toArray();
-    int activePorts = 0;
-    for (const QJsonValue& r : nsRows) {
-        if (r.toObject().value(QStringLiteral("enabled")).toBool(false)) {
-            ++activePorts;
-        }
-    }
-    if (!nsRows.isEmpty()) {
-        navMultiNode_->setBadge(
-            QStringLiteral("%1 / %2").arg(activePorts).arg(nsRows.size()),
-            (portsEnabled && activePorts > 0) ? PillTone::Green : PillTone::Muted);
-    } else {
-        navMultiNode_->setBadge(QString(), PillTone::Muted);
-    }
-
-    mixedPortLabel_->setText(QStringLiteral("Mixed :%1").arg(mixedPort > 0 ? mixedPort : 7890));
-    apiPortLabel_->setText(QStringLiteral("API :%1").arg(apiPort > 0 ? apiPort : 19090));
-
-    updatingUi_ = false;
-}
-
-void ConsoleWindow::updateDashboardHeader(bool connected, const QJsonObject& snapshot) {
-    const QJsonObject settings = snapshot.value(QStringLiteral("settings")).toObject();
-    const bool coreRunning = snapshot.value(QStringLiteral("core_running")).toBool(false);
-    const bool tunOn = settings.value(QStringLiteral("enhanced_mode")).toBool(false);
-    const bool sysProxyOn = settings.value(QStringLiteral("system_proxy_enabled")).toBool(false);
-    const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
-    const QString aiTarget = settings.value(QStringLiteral("claudeProxyLockTarget")).toString();
-    const QString mode = settings.value(QStringLiteral("outbound_mode")).toString(QStringLiteral("rule")).toUpper();
-
-    if (!connected) {
-        dashStatusPill_->setPill(uiText("● 守护进程未连接", "● Daemon Disconnected"), PillTone::Red);
-    } else if (!coreRunning) {
-        const QString err = snapshot.value(QStringLiteral("last_error")).toString().trimmed();
-        dashStatusPill_->setPill(
-            err.isEmpty() ? uiText("● 内核已停止", "● Core Stopped") : uiText("● 启动异常", "● Core Error"),
-            PillTone::Red);
-    } else {
-        QStringList tags;
-        if (tunOn) tags << QStringLiteral("TUN");
-        if (sysProxyOn) tags << QStringLiteral("SYSPROXY");
-        tags << mode;
-        dashStatusPill_->setPill(QStringLiteral("● ") + tags.join(QStringLiteral(" + ")) +
-                                     uiText(" 运行中", " Running"),
-                                 PillTone::Green);
-    }
-
-    if (aiLocked && !aiTarget.isEmpty()) {
-        dashAiPill_->setPill(QStringLiteral("AI → ") + aiTarget, PillTone::Violet);
-    } else {
-        dashAiPill_->setPill(QString(), PillTone::Muted);
-    }
-
-    benchAllBtn_->setEnabled(connected && coreRunning);
-}
-
-void ConsoleWindow::switchOutboundMode(int index) {
-    if (updatingUi_ || !client_) {
-        return;
-    }
-    const QJsonObject settings = lastSnapshot_.value(QStringLiteral("settings")).toObject();
-    if (settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false) && index != 0) {
-        updateSidebarFromSnapshot(lastConnected_, lastSnapshot_);
-        ToastOverlay::show(
-            this,
-            uiText("AI 专用锁定开启期间强制使用规则模式，如需切换请先在 AI 锁定页停用锁定",
-                   "Outbound mode stays locked to Rule while AI Lock is active"),
-            PillTone::Violet);
-        return;
-    }
-
-    QString nextMode = QStringLiteral("rule");
-    if (index == 1) nextMode = QStringLiteral("global");
-    else if (index == 2) nextMode = QStringLiteral("direct");
-
-    QJsonObject params;
-    params.insert(QStringLiteral("mode"), nextMode);
-    client_->call(QStringLiteral("set_outbound_mode"), params,
-                  [this, nextMode](bool ok, const QJsonValue&, const QString& err, const QString&) {
-                      if (!ok) {
-                          updateSidebarFromSnapshot(lastConnected_, lastSnapshot_);
-                          ToastOverlay::show(this, I18n::instance().translateBackendText(err), PillTone::Red);
-                          return;
-                      }
-                      ToastOverlay::show(
-                          this, uiText("已切换出站模式为 ", "Switched outbound mode to ") + nextMode.toUpper(),
-                          PillTone::Blue);
-                  });
-}
-
-void ConsoleWindow::toggleSystemProxy(bool nextChecked) {
-    if (updatingUi_ || !client_) {
-        return;
-    }
-    const QJsonObject settings = lastSnapshot_.value(QStringLiteral("settings")).toObject();
-    if (settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false) && !nextChecked) {
-        updateSidebarFromSnapshot(lastConnected_, lastSnapshot_);
-        ToastOverlay::show(
-            this, uiText("AI 专用锁定开启期间系统代理受保护不可关闭", "System Proxy is protected while AI Lock is active"),
-            PillTone::Violet);
-        return;
-    }
-
-    QJsonObject params;
-    params.insert(QStringLiteral("enabled"), nextChecked);
-    client_->call(QStringLiteral("set_system_proxy"), params,
-                  [this, nextChecked](bool ok, const QJsonValue&, const QString& err, const QString&) {
-                      if (!ok) {
-                          updateSidebarFromSnapshot(lastConnected_, lastSnapshot_);
-                          ToastOverlay::show(this, I18n::instance().translateBackendText(err), PillTone::Red);
-                          return;
-                      }
-                      ToastOverlay::show(
-                          this,
-                          nextChecked ? uiText("已开启 Windows 系统代理", "System Proxy enabled")
-                                      : uiText("已关闭 Windows 系统代理", "System Proxy disabled"),
-                          nextChecked ? PillTone::Blue : PillTone::Muted);
-                  });
-}
-
-void ConsoleWindow::toggleEnhancedMode(bool nextChecked, bool allowUac) {
-    if (updatingUi_ || !client_) {
-        return;
-    }
-    const QJsonObject settings = lastSnapshot_.value(QStringLiteral("settings")).toObject();
-    if (settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false) && !nextChecked) {
-        updateSidebarFromSnapshot(lastConnected_, lastSnapshot_);
-        ToastOverlay::show(
-            this, uiText("AI 专用锁定开启期间增强模式 (TUN) 受保护不可关闭", "Enhanced TUN is protected while AI Lock is active"),
-            PillTone::Violet);
-        return;
-    }
-
-    QJsonObject params;
-    params.insert(QStringLiteral("enabled"), nextChecked);
-    params.insert(QStringLiteral("allow_uac"), allowUac);
-
-    client_->call(QStringLiteral("set_enhanced_mode"), params,
-                  [this, nextChecked, allowUac](bool ok, const QJsonValue&, const QString& err,
-                                                const QString& errCode) {
-                      if (!ok) {
-                          updateSidebarFromSnapshot(lastConnected_, lastSnapshot_);
-                          if (errCode == QLatin1String("SERVICE_INSTALL_REQUIRED") && !allowUac) {
-                              const auto ans = QMessageBox::question(
-                                  this, uiText("需要安装 ClashFX TUN 服务", "Install ClashFX TUN Service"),
-                                  uiText("首次启用增强模式 (TUN) 需要通过 Windows UAC 安装系统服务。是否继续？",
-                                         "Enabling Enhanced TUN requires installing ClashFXService via Windows UAC. Continue?"));
-                              if (ans == QMessageBox::Yes) {
-                                  toggleEnhancedMode(nextChecked, true);
-                              }
-                              return;
-                          }
-                          QMessageBox::warning(this, uiText("增强模式切换失败", "Enhanced Mode Failed"),
-                                               I18n::instance().translateBackendText(err));
-                          return;
-                      }
-                      ToastOverlay::show(
-                          this,
-                          nextChecked ? uiText("增强模式 (TUN) 已启用", "Enhanced TUN mode enabled")
-                                      : uiText("增强模式 (TUN) 已关闭", "Enhanced TUN mode disabled"),
-                          nextChecked ? PillTone::Green : PillTone::Muted);
-                  });
-}
-
-void ConsoleWindow::selectActiveProfile(const QString& profileName) {
-    if (!client_ || profileName.isEmpty()) {
-        return;
-    }
-    QJsonObject params;
-    params.insert(QStringLiteral("name"), profileName);
-    client_->call(QStringLiteral("select_profile"), params,
-                  [this, profileName](bool ok, const QJsonValue&, const QString& err, const QString&) {
-                      if (!ok) {
-                          updateSidebarFromSnapshot(lastConnected_, lastSnapshot_);
-                          const bool aiLocked = lastSnapshot_.value(QStringLiteral("settings"))
-                                                    .toObject()
-                                                    .value(QStringLiteral("claudeProxyLockEnabled"))
-                                                    .toBool(false);
-                          if (aiLocked) {
-                              const auto ans = QMessageBox::question(
-                                  this, uiText("AI 专用锁定冲突", "AI Lock Conflict"),
-                                  I18n::instance().translateBackendText(err) +
-                                      uiText("\n\n是否先关闭 AI 专用节点锁定并切换到 ",
-                                             "\n\nDisable AI Lock and switch to ") +
-                                      profileName + QStringLiteral("?"));
-                              if (ans == QMessageBox::Yes) {
-                                  QJsonObject dis;
-                                  dis.insert(QStringLiteral("enabled"), false);
-                                  client_->call(QStringLiteral("set_ai_lock"), dis,
-                                                [this, profileName](bool dOk, const QJsonValue&, const QString& dErr,
-                                                                    const QString&) {
-                                                    if (!dOk) {
-                                                        ToastOverlay::show(this,
-                                                                           I18n::instance().translateBackendText(dErr),
-                                                                           PillTone::Red);
-                                                        return;
-                                                    }
-                                                    selectActiveProfile(profileName);
-                                                });
-                              }
-                              return;
-                          }
-                          QMessageBox::warning(this, uiText("切换配置失败", "Switch Profile Failed"),
-                                               I18n::instance().translateBackendText(err));
-                          return;
-                      }
-                      ToastOverlay::show(
-                          this, uiText("已切换并激活配置 ", "Switched active profile to ") + profileName,
-                          PillTone::Green);
-                  });
-}
-
-void ConsoleWindow::refreshActiveProfile() {
-    if (!client_) {
-        return;
-    }
-    const QString active = lastSnapshot_.value(QStringLiteral("settings")).toObject().value(QStringLiteral("selected_profile")).toString();
-    bool isManaged = false;
-    const QJsonArray subs = lastSnapshot_.value(QStringLiteral("subscriptions")).toArray();
-    for (const QJsonValue& s : subs) {
-        if (s.toObject().value(QStringLiteral("name")).toString() == active) {
-            isManaged = true;
-            break;
-        }
-    }
-
-    profileRefreshBtn_->setEnabled(false);
-    if (isManaged && !active.isEmpty()) {
-        QJsonObject params;
-        params.insert(QStringLiteral("name"), active);
-        client_->call(QStringLiteral("refresh_subscription"), params,
-                      [this, active](bool ok, const QJsonValue&, const QString& err, const QString&) {
-                          profileRefreshBtn_->setEnabled(lastConnected_);
-                          if (!ok) {
-                              ToastOverlay::show(this, I18n::instance().translateBackendText(err), PillTone::Red);
-                              return;
-                          }
-                          client_->call(QStringLiteral("get_state"));
-                          ToastOverlay::show(this, uiText("已刷新当前订阅 ", "Refreshed subscription ") + active,
-                                             PillTone::Green);
-                      });
-    } else {
-        client_->call(QStringLiteral("reload_config"), QJsonObject(),
-                      [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
-                          profileRefreshBtn_->setEnabled(lastConnected_);
-                          if (!ok) {
-                              ToastOverlay::show(this, I18n::instance().translateBackendText(err), PillTone::Red);
-                              return;
-                          }
-                          ToastOverlay::show(this, uiText("已重新加载当前配置文件", "Reloaded active configuration"),
-                                             PillTone::Green);
-                      });
-    }
-}
-
-void ConsoleWindow::copyTerminalProxyCommand() {
-    const int port = lastSnapshot_.value(QStringLiteral("runtime")).toObject().value(QStringLiteral("mixed_port")).toInt(7890);
-    const int p = port > 0 ? port : 7890;
-    const QString cmd = QStringLiteral("$env:HTTP_PROXY=\"http://127.0.0.1:%1\"; $env:HTTPS_PROXY=\"http://127.0.0.1:%1\"; $env:ALL_PROXY=\"socks5://127.0.0.1:%1\"").arg(p);
-    if (QClipboard* cb = QApplication::clipboard()) {
-        cb->setText(cmd);
-    }
-    ToastOverlay::show(
-        this, uiText("已复制 PowerShell 终端代理环境变量 (:", "Copied PowerShell proxy command (: ") + QString::number(p) +
-                  QStringLiteral(")"),
-        PillTone::Blue);
-}
-
-void ConsoleWindow::runBenchmarkAll() {
-    if (!client_) {
-        return;
-    }
-    benchAllBtn_->setEnabled(false);
-    client_->call(QStringLiteral("benchmark_all"), QJsonObject(),
-                  [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
-                      benchAllBtn_->setEnabled(lastConnected_);
-                      if (!ok) {
-                          ToastOverlay::show(this, I18n::instance().translateBackendText(err), PillTone::Red);
-                          return;
-                      }
-                      ToastOverlay::show(this, uiText("已完成全策略组节点测速", "All proxy groups benchmarked"),
-                                         PillTone::Green);
-                  });
 }
 
 void ConsoleWindow::presentWindow() {
     if (isMinimized()) {
         showNormal();
-    } else {
-        show();
     }
-    setWindowState((windowState() & ~Qt::WindowMinimized) | Qt::WindowActive);
+    show();
     raise();
     activateWindow();
-    Win11Dwm::applyDarkTitleBar(this);
-#ifdef Q_OS_WIN
-    if (HWND hwnd = reinterpret_cast<HWND>(winId())) {
-        SetForegroundWindow(hwnd);
-    }
-#endif
+    Win11Dwm::applyFramelessRoundedChrome(this, theme_ == QLatin1String("dark"));
+    webView_->setPageActive(true);
+    pushWindowState();
+    syncTelemetryState();
 }
 
 void ConsoleWindow::showEvent(QShowEvent* event) {
     QMainWindow::showEvent(event);
-    Win11Dwm::applyDarkTitleBar(this);
-    if (webView_) {
-        webView_->setPageActive(currentPage_ == ConsolePage::Dashboard);
-    }
-    syncTrafficStream();
+    Win11Dwm::applyFramelessRoundedChrome(this, theme_ == QLatin1String("dark"));
+    webView_->setPageActive(true);
+    pushWindowState();
+    syncTelemetryState();
 }
 
 void ConsoleWindow::hideEvent(QHideEvent* event) {
     QMainWindow::hideEvent(event);
-    if (webView_) {
-        webView_->setPageActive(false);
-    }
+    webView_->setPageActive(false);
     stopTrafficStream();
+    if (telemetryTimer_) {
+        telemetryTimer_->stop();
+    }
 }
 
 void ConsoleWindow::closeEvent(QCloseEvent* event) {
-    if (!allowClose_) {
-        event->ignore();
-        hide();
-        return;
-    }
-    stopTrafficStream();
-    QMainWindow::closeEvent(event);
-}
-
-QString ConsoleWindow::formatSpeedRate(qint64 bytesPerSec) {
-    if (bytesPerSec < 0) bytesPerSec = 0;
-    if (bytesPerSec < 1024) {
-        return QString::number(bytesPerSec) + QStringLiteral(" B/s");
-    }
-    if (bytesPerSec < 1024 * 1024) {
-        return QString::number(bytesPerSec / 1024.0, 'f', 1) + QStringLiteral(" KB/s");
-    }
-    if (bytesPerSec < 1024LL * 1024 * 1024) {
-        return QString::number(bytesPerSec / (1024.0 * 1024.0), 'f', 2) + QStringLiteral(" MB/s");
-    }
-    return QString::number(bytesPerSec / (1024.0 * 1024.0 * 1024.0), 'f', 2) + QStringLiteral(" GB/s");
-}
-
-void ConsoleWindow::stopTrafficStream() {
-    if (trafficReply_) {
-        QNetworkReply* rep = trafficReply_;
-        trafficReply_.clear();
-        rep->disconnect(this);
-        rep->abort();
-        rep->deleteLater();
-    }
-    trafficBuf_.clear();
-    trafficPort_ = 0;
-    trafficSecret_.clear();
-    if (upSpeedLabel_) upSpeedLabel_->setText(QStringLiteral("0 B/s"));
-    if (downSpeedLabel_) downSpeedLabel_->setText(QStringLiteral("0 B/s"));
-}
-
-void ConsoleWindow::syncTrafficStream() {
-    const bool coreRunning = lastSnapshot_.value(QStringLiteral("core_running")).toBool(false);
-    if (!isVisible() || !lastConnected_ || !coreRunning) {
+    saveWindowGeometry();
+    if (allowClose_) {
         stopTrafficStream();
+        event->accept();
+        return;
+    }
+    hide();
+    event->ignore();
+}
+
+void ConsoleWindow::changeEvent(QEvent* event) {
+    QMainWindow::changeEvent(event);
+    if (event->type() == QEvent::WindowStateChange) {
+        pushWindowState();
+    }
+}
+
+bool ConsoleWindow::nativeEvent(const QByteArray& eventType, void* message, qintptr* result) {
+#ifdef Q_OS_WIN
+    if (eventType == "windows_generic_MSG" || eventType == "windows_dispatcher_MSG") {
+        MSG* msg = static_cast<MSG*>(message);
+        if (msg->message == WM_NCCALCSIZE && msg->wParam == TRUE) {
+            auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(msg->lParam);
+            if (IsZoomed(msg->hwnd)) {
+                HMONITOR mon = MonitorFromWindow(msg->hwnd, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi{};
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(mon, &mi)) {
+                    params->rgrc[0] = mi.rcWork;
+                }
+            }
+            *result = 0;
+            return true;
+        }
+        if (msg->message == WM_GETMINMAXINFO) {
+            HMONITOR mon = MonitorFromWindow(msg->hwnd, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(mon, &mi)) {
+                auto* mmi = reinterpret_cast<MINMAXINFO*>(msg->lParam);
+                mmi->ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left;
+                mmi->ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
+                mmi->ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
+                mmi->ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
+            }
+            *result = 0;
+            return false;
+        }
+    }
+#else
+    Q_UNUSED(eventType);
+    Q_UNUSED(message);
+    Q_UNUSED(result);
+#endif
+    return QMainWindow::nativeEvent(eventType, message, result);
+}
+
+void ConsoleWindow::onWebViewFailed(const QString& reason) {
+    if (fallbackLabel_) {
+        fallbackLabel_->setText(reason);
+    }
+    stack_->setCurrentWidget(fallbackWidget_);
+}
+
+void ConsoleWindow::pushWindowState() {
+    if (!uiReady_) return;
+    webView_->postJsonMessage(QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("window_state")},
+        {QStringLiteral("maximized"), isMaximized()},
+    });
+}
+
+void ConsoleWindow::pushInitPayload() {
+    QJsonObject initMsg{
+        {QStringLiteral("type"), QStringLiteral("init")},
+        {QStringLiteral("connected"), connected_},
+        {QStringLiteral("snapshot"), snapshot_},
+        {QStringLiteral("language"), I18n::instance().language()},
+        {QStringLiteral("theme"), theme_},
+        {QStringLiteral("page"), static_cast<int>(currentPage_)},
+        {QStringLiteral("subTab"), pendingSubTab_},
+        {QStringLiteral("maximized"), isMaximized()},
+    };
+    if (!pendingDiagNode_.isEmpty()) {
+        initMsg.insert(QStringLiteral("diagNode"), pendingDiagNode_);
+    }
+    webView_->postJsonMessage(initMsg);
+}
+
+void ConsoleWindow::onWebMessageReceived(const QJsonObject& msg) {
+    const QString type = msg.value(QStringLiteral("type")).toString();
+
+    if (type == QLatin1String("ui_ready")) {
+        uiReady_ = true;
+        pushInitPayload();
+        syncTelemetryState();
         return;
     }
 
-    const QJsonObject rt = lastSnapshot_.value(QStringLiteral("runtime")).toObject();
-    const QJsonObject settings = lastSnapshot_.value(QStringLiteral("settings")).toObject();
-    const int port = rt.value(QStringLiteral("api_port")).toInt(settings.value(QStringLiteral("api_port")).toInt(19090));
-    const QString secret = rt.contains(QStringLiteral("api_secret"))
-                               ? rt.value(QStringLiteral("api_secret")).toString()
-                               : settings.value(QStringLiteral("api_secret")).toString();
-
-    if (port <= 0) {
-        stopTrafficStream();
-        return;
-    }
-    if (trafficReply_ && trafficPort_ == port && trafficSecret_ == secret) {
+    if (type == QLatin1String("nav_sync")) {
+        const int pageIdx = msg.value(QStringLiteral("page")).toInt(0);
+        if (pageIdx >= 0 && pageIdx <= 6) {
+            currentPage_ = static_cast<ConsolePage>(pageIdx);
+        }
+        pendingSubTab_ = msg.value(QStringLiteral("subTab")).toInt(-1);
+        pendingDiagNode_.clear();
         return;
     }
 
-    stopTrafficStream();
-    trafficPort_ = port;
-    trafficSecret_ = secret;
+    if (type == QLatin1String("rpc")) {
+        handleRpcMessage(msg);
+        return;
+    }
 
-    QNetworkRequest req(QUrl(QStringLiteral("http://127.0.0.1:%1/traffic").arg(port)));
+    if (type == QLatin1String("mihomo_api")) {
+        handleMihomoMessage(msg);
+        return;
+    }
+
+    if (type == QLatin1String("native_action")) {
+        handleNativeAction(msg);
+        return;
+    }
+
+    if (type == QLatin1String("set_theme")) {
+        applyThemePreference(msg.value(QStringLiteral("theme")).toString());
+        return;
+    }
+
+    if (type == QLatin1String("set_language")) {
+        const QString lang = msg.value(QStringLiteral("language")).toString();
+        if (lang == QLatin1String("zh_CN") || lang == QLatin1String("en_US")) {
+            I18n::instance().setLanguage(lang);
+        }
+        return;
+    }
+
+    if (type == QLatin1String("telemetry_subscribe")) {
+        telemetryConnections_ = msg.value(QStringLiteral("include_connections")).toBool(false);
+        syncTelemetryState();
+        if (msg.value(QStringLiteral("enabled")).toBool(true)) {
+            pollTelemetrySnapshot();
+        }
+        return;
+    }
+
+    if (type == QLatin1String("window_drag")) {
+#ifdef Q_OS_WIN
+        ReleaseCapture();
+        POINT pt{};
+        GetCursorPos(&pt);
+        SendMessageW(reinterpret_cast<HWND>(winId()), WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(pt.x, pt.y));
+#endif
+        return;
+    }
+
+    if (type == QLatin1String("window_resize")) {
+#ifdef Q_OS_WIN
+        if (!isMaximized()) {
+            const int ht = htCodeForEdge(msg.value(QStringLiteral("edge")).toString());
+            if (ht != 0) {
+                ReleaseCapture();
+                POINT pt{};
+                GetCursorPos(&pt);
+                SendMessageW(reinterpret_cast<HWND>(winId()), WM_NCLBUTTONDOWN, ht, MAKELPARAM(pt.x, pt.y));
+            }
+        }
+#endif
+        return;
+    }
+
+    if (type == QLatin1String("window_control")) {
+        const QString action = msg.value(QStringLiteral("action")).toString();
+        if (action == QLatin1String("minimize")) {
+            showMinimized();
+        } else if (action == QLatin1String("maximize") || action == QLatin1String("toggle_maximize")) {
+            if (isMaximized()) {
+                showNormal();
+            } else {
+                showMaximized();
+            }
+        } else if (action == QLatin1String("close")) {
+            close();
+        }
+        return;
+    }
+}
+
+void ConsoleWindow::handleRpcMessage(const QJsonObject& msg) {
+    const QJsonValue id = msg.value(QStringLiteral("id"));
+    const QString method = msg.value(QStringLiteral("method")).toString();
+    const QJsonObject params = msg.value(QStringLiteral("params")).toObject();
+
+    if (!client_) {
+        webView_->postJsonMessage(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("rpc_result")},
+            {QStringLiteral("id"), id},
+            {QStringLiteral("ok"), false},
+            {QStringLiteral("error"), QStringLiteral("DaemonClient unavailable")},
+        });
+        return;
+    }
+
+    client_->call(method, params, [this, id](bool ok, const QJsonValue& data, const QString& err, const QString& code) {
+        if (!uiReady_) return;
+        webView_->postJsonMessage(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("rpc_result")},
+            {QStringLiteral("id"), id},
+            {QStringLiteral("ok"), ok},
+            {QStringLiteral("data"), data},
+            {QStringLiteral("error"), err},
+            {QStringLiteral("error_code"), code},
+        });
+    });
+}
+
+void ConsoleWindow::handleMihomoMessage(const QJsonObject& msg) {
+    const QJsonValue id = msg.value(QStringLiteral("id"));
+    const QString verb = msg.value(QStringLiteral("method")).toString(QStringLiteral("GET")).toUpper();
+    QString path = msg.value(QStringLiteral("path")).toString();
+    if (!path.startsWith(QLatin1Char('/'))) {
+        path.prepend(QLatin1Char('/'));
+    }
+
+    const QJsonObject runtime = snapshot_.value(QStringLiteral("runtime")).toObject();
+    const int apiPort = runtime.value(QStringLiteral("api_port")).toInt();
+    const QString secret = runtime.value(QStringLiteral("api_secret")).toString();
+    if (apiPort <= 0) {
+        webView_->postJsonMessage(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("mihomo_result")},
+            {QStringLiteral("id"), id},
+            {QStringLiteral("ok"), false},
+            {QStringLiteral("status"), 0},
+            {QStringLiteral("error"), QStringLiteral("Mihomo API port unavailable")},
+        });
+        return;
+    }
+
+    const QUrl url(QStringLiteral("http://127.0.0.1:%1%2").arg(apiPort).arg(path));
+    QNetworkRequest req(url);
+    req.setTransferTimeout(6000);
     if (!secret.isEmpty()) {
-        req.setRawHeader("Authorization", "Bearer " + secret.toUtf8());
+        req.setRawHeader("Authorization", QByteArray("Bearer ") + secret.toUtf8());
     }
-    req.setRawHeader("Accept", "application/json");
 
-    QNetworkReply* reply = netMgr_->get(req);
-    trafficReply_ = reply;
+    QByteArray bodyBytes;
+    const QJsonValue bodyVal = msg.value(QStringLiteral("body"));
+    if (!bodyVal.isUndefined() && !bodyVal.isNull()) {
+        req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+        if (bodyVal.isObject()) {
+            bodyBytes = QJsonDocument(bodyVal.toObject()).toJson(QJsonDocument::Compact);
+        } else if (bodyVal.isArray()) {
+            bodyBytes = QJsonDocument(bodyVal.toArray()).toJson(QJsonDocument::Compact);
+        } else {
+            bodyBytes = bodyVal.toString().toUtf8();
+        }
+    }
 
-    connect(reply, &QNetworkReply::readyRead, this, [this, reply]() {
-        if (trafficReply_ != reply) {
+    QNetworkReply* reply = netMgr_->sendCustomRequest(req, verb.toUtf8(), bodyBytes);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, id]() {
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray payload = reply->readAll();
+        const bool netOk = (reply->error() == QNetworkReply::NoError);
+        const QString errStr = netOk ? QString() : reply->errorString();
+        reply->deleteLater();
+
+        QJsonValue parsed = QString::fromUtf8(payload);
+        if (!payload.trimmed().isEmpty()) {
+            const QJsonDocument doc = QJsonDocument::fromJson(payload);
+            if (doc.isObject()) parsed = doc.object();
+            else if (doc.isArray()) parsed = doc.array();
+        }
+
+        if (!uiReady_) return;
+        webView_->postJsonMessage(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("mihomo_result")},
+            {QStringLiteral("id"), id},
+            {QStringLiteral("ok"), netOk && status >= 200 && status < 400},
+            {QStringLiteral("status"), status},
+            {QStringLiteral("data"), parsed},
+            {QStringLiteral("error"), errStr},
+        });
+    });
+}
+
+void ConsoleWindow::handleNativeAction(const QJsonObject& msg) {
+    const QJsonValue id = msg.value(QStringLiteral("id"));
+    const QString action = msg.value(QStringLiteral("action")).toString();
+
+    auto reply = [this, id](bool ok, const QJsonValue& data = QJsonValue(), const QString& err = QString()) {
+        if (!uiReady_ || id.isUndefined()) return;
+        webView_->postJsonMessage(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("native_result")},
+            {QStringLiteral("id"), id},
+            {QStringLiteral("ok"), ok},
+            {QStringLiteral("data"), data},
+            {QStringLiteral("error"), err},
+        });
+    };
+
+    if (action == QLatin1String("copy_text")) {
+        if (auto* cb = QApplication::clipboard()) {
+            cb->setText(msg.value(QStringLiteral("text")).toString());
+        }
+        reply(true, QJsonObject{{QStringLiteral("copied"), true}});
+        return;
+    }
+
+    if (action == QLatin1String("read_clipboard")) {
+        const QString text = QApplication::clipboard() ? QApplication::clipboard()->text() : QString();
+        reply(true, QJsonObject{{QStringLiteral("text"), text}});
+        return;
+    }
+
+    if (action == QLatin1String("open_path")) {
+        const QString path = msg.value(QStringLiteral("path")).toString();
+        const bool ok = !path.isEmpty() && QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+        reply(ok, QJsonValue(), ok ? QString() : QStringLiteral("Failed to open path"));
+        return;
+    }
+
+    if (action == QLatin1String("open_url")) {
+        const QUrl url(msg.value(QStringLiteral("url")).toString());
+        const bool allowed = url.isValid() &&
+                             (url.scheme() == QLatin1String("http") || url.scheme() == QLatin1String("https"));
+        const bool ok = allowed && QDesktopServices::openUrl(url);
+        reply(ok, QJsonValue(), ok ? QString() : QStringLiteral("Invalid or blocked URL"));
+        return;
+    }
+
+    if (action == QLatin1String("pick_directory")) {
+        const QString title = msg.value(QStringLiteral("title")).toString(
+            L("选择目录", "Select Directory"));
+        const QString initial = msg.value(QStringLiteral("initial")).toString();
+        const QString picked = QFileDialog::getExistingDirectory(this, title, initial);
+        reply(true, QJsonObject{{QStringLiteral("path"), picked}});
+        return;
+    }
+
+    if (action == QLatin1String("launch_chrome_proxy")) {
+        const int port = msg.value(QStringLiteral("port")).toInt();
+        const QString exe = findChromiumExecutable();
+        if (exe.isEmpty() || port <= 0) {
+            reply(false, QJsonValue(), L("未找到 Chrome 或 Edge 浏览器", "Chrome or Edge browser not found"));
             return;
         }
-        trafficBuf_.append(reply->readAll());
+        const QString dataBase = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+        const QString profileDir = QDir::toNativeSeparators(
+            QStringLiteral("%1/ChromeProfiles/port_%2").arg(dataBase).arg(port));
+        QDir().mkpath(profileDir);
+        const QStringList args{
+            QStringLiteral("--proxy-server=http://127.0.0.1:%1").arg(port),
+            QStringLiteral("--user-data-dir=%1").arg(profileDir),
+            QStringLiteral("--no-first-run"),
+            QStringLiteral("--no-default-browser-check"),
+        };
+        const bool launched = QProcess::startDetached(exe, args);
+        reply(launched, QJsonObject{{QStringLiteral("exe"), exe}},
+              launched ? QString() : L("启动浏览器失败", "Failed to launch browser"));
+        return;
+    }
+
+    if (action == QLatin1String("reload_ui")) {
+        webView_->reloadApp();
+        reply(true);
+        return;
+    }
+
+    reply(false, QJsonValue(), QStringLiteral("Unknown native action"));
+}
+
+void ConsoleWindow::applyThemePreference(const QString& theme) {
+    theme_ = (theme == QLatin1String("light")) ? QStringLiteral("light") : QStringLiteral("dark");
+    uiSettings().setValue(QStringLiteral("ui/theme"), theme_);
+    const bool dark = (theme_ == QLatin1String("dark"));
+    Win11Dwm::applyFramelessRoundedChrome(this, dark);
+    webView_->setThemeDark(dark);
+}
+
+namespace {
+
+template <typename OnObj>
+void bindNdjsonStream(QObject* owner, QNetworkReply*& replySlot, QByteArray& buffer,
+                      QNetworkReply* reply, OnObj&& onObj) {
+    replySlot = reply;
+    QObject::connect(reply, &QNetworkReply::readyRead, owner, [reply, &replySlot, &buffer, onObj]() {
+        if (!reply || reply != replySlot) return;
+        buffer.append(reply->readAll());
         while (true) {
-            const int nl = trafficBuf_.indexOf('\n');
-            if (nl < 0) {
-                break;
-            }
-            const QByteArray line = trafficBuf_.left(nl).trimmed();
-            trafficBuf_.remove(0, nl + 1);
-            if (line.isEmpty()) {
-                continue;
-            }
+            const int nl = buffer.indexOf('\n');
+            if (nl < 0) break;
+            const QByteArray line = buffer.left(nl).trimmed();
+            buffer.remove(0, nl + 1);
+            if (line.isEmpty()) continue;
             const QJsonDocument doc = QJsonDocument::fromJson(line);
-            if (!doc.isObject()) {
-                continue;
+            if (doc.isObject()) {
+                onObj(doc.object());
             }
-            const QJsonObject obj = doc.object();
-            const qint64 up = static_cast<qint64>(obj.value(QStringLiteral("up")).toDouble(0));
-            const qint64 down = static_cast<qint64>(obj.value(QStringLiteral("down")).toDouble(0));
-            upSpeedLabel_->setText(formatSpeedRate(up));
-            downSpeedLabel_->setText(formatSpeedRate(down));
         }
     });
-
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-        if (trafficReply_ == reply) {
-            trafficReply_.clear();
-            trafficPort_ = 0;
+    QObject::connect(reply, &QNetworkReply::finished, owner, [&replySlot, reply]() {
+        if (replySlot == reply) {
+            replySlot = nullptr;
         }
         reply->deleteLater();
     });
 }
 
-}  // namespace clashfx
+void abortNdjsonStream(QObject* owner, QNetworkReply*& replySlot, QByteArray& buffer) {
+    if (replySlot) {
+        replySlot->disconnect(owner);
+        replySlot->abort();
+        replySlot->deleteLater();
+        replySlot = nullptr;
+    }
+    buffer.clear();
+}
+
+} // namespace
+
+void ConsoleWindow::syncTelemetryState() {
+    const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
+    const int apiPort = snapshot_.value(QStringLiteral("runtime")).toObject().value(QStringLiteral("api_port")).toInt();
+    const bool active = isVisible() && uiReady_ && connected_ && coreRunning && apiPort > 0;
+
+    if (!active) {
+        stopTrafficStream();
+        if (telemetryTimer_->isActive()) telemetryTimer_->stop();
+        lastUpRate_ = 0;
+        lastDownRate_ = 0;
+        lastMemInuse_ = 0;
+        return;
+    }
+
+    startTrafficStream();
+    if (!telemetryTimer_->isActive()) {
+        telemetryTimer_->start();
+        pollTelemetrySnapshot();
+    }
+}
+
+void ConsoleWindow::startTrafficStream() {
+    const QJsonObject runtime = snapshot_.value(QStringLiteral("runtime")).toObject();
+    const int apiPort = runtime.value(QStringLiteral("api_port")).toInt();
+    const QString secret = runtime.value(QStringLiteral("api_secret")).toString();
+    if (apiPort <= 0) return;
+
+    if (trafficReply_ && lastTrafficPort_ == apiPort && lastTrafficSecret_ == secret) {
+        return;
+    }
+    stopTrafficStream();
+
+    lastTrafficPort_ = apiPort;
+    lastTrafficSecret_ = secret;
+
+    auto makeReq = [&](const QString& path) {
+        QNetworkRequest req(QUrl(QStringLiteral("http://127.0.0.1:%1%2").arg(apiPort).arg(path)));
+        if (!secret.isEmpty()) {
+            req.setRawHeader("Authorization", QByteArray("Bearer ") + secret.toUtf8());
+        }
+        return req;
+    };
+
+    auto pushTelemetry = [this]() {
+        if (!uiReady_) return;
+        webView_->postJsonMessage(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("telemetry")},
+            {QStringLiteral("up"), lastUpRate_},
+            {QStringLiteral("down"), lastDownRate_},
+            {QStringLiteral("memInuse"), lastMemInuse_},
+        });
+    };
+
+    bindNdjsonStream(this, trafficReply_, trafficBuffer_, netMgr_->get(makeReq(QStringLiteral("/traffic"))),
+                     [this, pushTelemetry](const QJsonObject& obj) {
+                         lastUpRate_ = static_cast<qint64>(obj.value(QStringLiteral("up")).toDouble(0));
+                         lastDownRate_ = static_cast<qint64>(obj.value(QStringLiteral("down")).toDouble(0));
+                         pushTelemetry();
+                     });
+
+    // Mihomo reports runtime memory usage via a dedicated /memory NDJSON stream rather than /connections.
+    bindNdjsonStream(this, memoryReply_, memoryBuffer_, netMgr_->get(makeReq(QStringLiteral("/memory"))),
+                     [this, pushTelemetry](const QJsonObject& obj) {
+                         const qint64 inuse = static_cast<qint64>(obj.value(QStringLiteral("inuse")).toDouble(0));
+                         if (inuse > 0) {
+                             lastMemInuse_ = inuse;
+                             pushTelemetry();
+                         }
+                     });
+}
+
+void ConsoleWindow::stopTrafficStream() {
+    abortNdjsonStream(this, trafficReply_, trafficBuffer_);
+    abortNdjsonStream(this, memoryReply_, memoryBuffer_);
+    lastTrafficPort_ = 0;
+    lastTrafficSecret_.clear();
+}
+
+void ConsoleWindow::pollTelemetrySnapshot() {
+    if (!isVisible() || !uiReady_) return;
+    const QJsonObject runtime = snapshot_.value(QStringLiteral("runtime")).toObject();
+    const int apiPort = runtime.value(QStringLiteral("api_port")).toInt();
+    const QString secret = runtime.value(QStringLiteral("api_secret")).toString();
+    if (apiPort <= 0) return;
+
+    // Fetch /connections (gives uploadTotal, downloadTotal, active count + optional list)
+    QNetworkRequest connReq(QUrl(QStringLiteral("http://127.0.0.1:%1/connections").arg(apiPort)));
+    connReq.setTransferTimeout(2000);
+    if (!secret.isEmpty()) {
+        connReq.setRawHeader("Authorization", QByteArray("Bearer ") + secret.toUtf8());
+    }
+    QNetworkReply* connReply = netMgr_->get(connReq);
+    connect(connReply, &QNetworkReply::finished, this, [this, connReply]() {
+        const bool ok = (connReply->error() == QNetworkReply::NoError);
+        const QByteArray data = connReply->readAll();
+        connReply->deleteLater();
+        if (!ok || !uiReady_) return;
+        const QJsonDocument doc = QJsonDocument::fromJson(data);
+        if (!doc.isObject()) return;
+        const QJsonObject obj = doc.object();
+        const QJsonArray conns = obj.value(QStringLiteral("connections")).toArray();
+        const qint64 connMem = static_cast<qint64>(obj.value(QStringLiteral("memory")).toDouble(0));
+        if (connMem > 0) {
+            lastMemInuse_ = connMem;
+        }
+        QJsonObject payload{
+            {QStringLiteral("type"), QStringLiteral("telemetry")},
+            {QStringLiteral("up"), lastUpRate_},
+            {QStringLiteral("down"), lastDownRate_},
+            {QStringLiteral("upTotal"), obj.value(QStringLiteral("uploadTotal"))},
+            {QStringLiteral("downTotal"), obj.value(QStringLiteral("downloadTotal"))},
+            {QStringLiteral("memory"), connMem > 0 ? connMem : lastMemInuse_},
+            {QStringLiteral("memInuse"), lastMemInuse_},
+            {QStringLiteral("connectionCount"), conns.size()},
+        };
+        if (telemetryConnections_) {
+            payload.insert(QStringLiteral("connections"), conns);
+        }
+        webView_->postJsonMessage(payload);
+    });
+}
+
+void ConsoleWindow::saveWindowGeometry() {
+    auto s = uiSettings();
+    s.setValue(QStringLiteral("window/maximized"), isMaximized());
+    if (!isMaximized()) {
+        s.setValue(QStringLiteral("window/geometry"), saveGeometry());
+    }
+}
+
+void ConsoleWindow::restoreWindowGeometry() {
+    const auto s = uiSettings();
+    const QByteArray geom = s.value(QStringLiteral("window/geometry")).toByteArray();
+    bool restored = false;
+    if (!geom.isEmpty()) {
+        restored = restoreGeometry(geom);
+    }
+    if (!restored) {
+        QRect avail(0, 0, 1440, 900);
+        if (auto* screen = QGuiApplication::primaryScreen()) {
+            avail = screen->availableGeometry();
+        }
+        const int w = qBound(980, qRound(avail.width() * 0.78), 1320);
+        const int h = qBound(640, qRound(avail.height() * 0.82), 860);
+        resize(w, h);
+        move(avail.center() - rect().center());
+    }
+}
+
+QString ConsoleWindow::findChromiumExecutable() {
+#ifdef Q_OS_WIN
+    const QString localApp = qEnvironmentVariable("LOCALAPPDATA");
+    const QString pf = qEnvironmentVariable("ProgramFiles");
+    const QString pf86 = qEnvironmentVariable("ProgramFiles(x86)");
+    const QStringList candidates{
+        pf + QStringLiteral("/Google/Chrome/Application/chrome.exe"),
+        pf86 + QStringLiteral("/Google/Chrome/Application/chrome.exe"),
+        localApp + QStringLiteral("/Google/Chrome/Application/chrome.exe"),
+        pf + QStringLiteral("/Microsoft/Edge/Application/msedge.exe"),
+        pf86 + QStringLiteral("/Microsoft/Edge/Application/msedge.exe"),
+    };
+    for (const QString& c : candidates) {
+        if (QFileInfo::exists(c)) return QDir::toNativeSeparators(c);
+    }
+#endif
+    return QString();
+}
+
+} // namespace clashfx

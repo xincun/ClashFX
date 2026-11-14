@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ClashFX</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <!-- Perimeter resize handles for frameless Win32 host -->
+  <div class="win-resize win-resize-n" data-resize="top"></div>
+  <div class="win-resize win-resize-s" data-resize="bottom"></div>
+  <div class="win-resize win-resize-w" data-resize="left"></div>
+  <div class="win-resize win-resize-e" data-resize="right"></div>
+  <div class="win-resize win-resize-nw" data-resize="top-left"></div>
+  <div class="win-resize win-resize-ne" data-resize="top-right"></div>
+  <div class="win-resize win-resize-sw" data-resize="bottom-left"></div>
+  <div class="win-resize win-resize-se" data-resize="bottom-right"></div>
+
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand-header" data-drag-region="true">
+        <div class="brand-mark">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M13.4 2.5L4.8 13.8h6.4l-1 7.7L19.2 10h-6.4l.6-7.5z" fill="currentColor"/>
+          </svg>
+        </div>
+        <div class="brand-meta">
+          <div class="brand-title-row">
+            <span class="brand-name">ClashFX</span>
+            <span id="brand-version" class="brand-ver">--</span>
+          </div>
+          <div id="brand-status-line" class="brand-sub">Connecting…</div>
+        </div>
+      </div>
+
+      <div class="mode-switcher" id="outbound-mode-bar" role="tablist" aria-label="Outbound Mode">
+        <button type="button" class="mode-btn" data-mode="rule"></button>
+        <button type="button" class="mode-btn" data-mode="global"></button>
+        <button type="button" class="mode-btn" data-mode="direct"></button>
+      </div>
+
+      <nav class="sidebar-nav" id="sidebar-nav"></nav>
+
+      <div class="sidebar-dock" id="sidebar-dock"></div>
+    </aside>
+
+    <div class="main-column">
+      <header class="topbar" data-drag-region="true">
+        <div class="topbar-left">
+          <span id="topbar-icon" class="topbar-icon"></span>
+          <h1 id="topbar-title" class="topbar-title">ClashFX</h1>
+          <span id="topbar-chip" class="topbar-chip"></span>
+        </div>
+        <div class="topbar-actions" data-no-drag="true">
+          <button type="button" class="icon-pill-btn" id="btn-reload-core" title="Reload Core"></button>
+          <button type="button" class="lang-pill-btn" id="btn-lang-toggle">中 / EN</button>
+          <button type="button" class="icon-pill-btn" id="btn-theme-toggle" title="Toggle Theme"></button>
+          <div class="win-captions">
+            <button type="button" class="cap-btn" id="win-min" aria-label="Minimize"></button>
+            <button type="button" class="cap-btn" id="win-max" aria-label="Maximize"></button>
+            <button type="button" class="cap-btn cap-close" id="win-close" aria-label="Close"></button>
+          </div>
+        </div>
+      </header>
+
+      <main id="page-content" class="page-content"></main>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+  <div id="modal-root" class="modal-root" aria-hidden="true"></div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

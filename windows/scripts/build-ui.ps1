@@ -146,6 +146,9 @@ if errorlevel 1 exit /b 1
     Copy-Item -Force (Join-Path $RepoRoot "ClashFX\Resources\Country.mmdb.gz") (Join-Path $stageRes "Country.mmdb.gz")
     Copy-Item -Force (Join-Path $RepoRoot "ClashFX\Resources\geosite.dat.gz") (Join-Path $stageRes "geosite.dat.gz")
     Copy-Item -Force (Join-Path $RepoRoot "windows\ui-qt\resources\clashfx.ico") (Join-Path $stageRes "clashfx.ico")
+    $stageUi = Join-Path $stageRes "ui"
+    if (Test-Path $stageUi) { Remove-Item -Recurse -Force $stageUi }
+    Copy-Item -Recurse -Force (Join-Path $RepoRoot "windows\ui-qt\web") $stageUi
 
     # Verify PE architecture headers strictly on all core executables & DLLs
     foreach ($peName in @("clashfx-ui.exe", "clashfx-daemon.exe", "clashfx-service.exe", "mihomo_core.exe", "wintun.dll", "Qt6Widgets.dll")) {

@@ -1,8 +1,9 @@
 #pragma once
 
+#include <QJsonObject>
+#include <QList>
 #include <QPointer>
 #include <QString>
-#include <QStringList>
 #include <QWidget>
 
 struct ICoreWebView2Environment;
@@ -17,17 +18,17 @@ public:
     explicit WebView2Widget(QWidget* parent = nullptr);
     ~WebView2Widget() override;
 
-    void configureDashboard(int apiPort,
-                            const QString& apiSecret,
-                            const QString& dashboardUrl,
-                            bool aiLocked = false);
+    void setUiRootDir(const QString& dirPath);
+    void setThemeDark(bool dark);
     void setPageActive(bool active);
-    void reloadDashboard();
+    void postJsonMessage(const QJsonObject& message);
+    void reloadApp();
     void retryInitialize();
 
 signals:
     void webViewReady();
     void webViewFailed(const QString& reason);
+    void webMessageReceived(const QJsonObject& message);
 
 protected:
     void showEvent(QShowEvent* event) override;
@@ -37,26 +38,19 @@ protected:
 private:
     void ensureInitialized();
     void syncBounds();
-    void applyScriptsAndNavigate(bool forceNavigate);
-    void removeDynamicScripts();
-
-    static QString readBundledCompatibilityJS();
-    static QString buildMetaCubeXDConfigJS(int port, const QString& secret);
-    static QString buildRulesSnapshotJS(int port, const QString& staleMessage, bool aiLocked);
+    void applyBackgroundColor();
+    void configureMappingAndNavigate();
+    QString resolvedUiRootDir() const;
 
     bool initStarted_ = false;
     bool pageActive_ = true;
-    bool staticScriptsInstalled_ = false;
-    int apiPort_ = 0;
-    QString apiSecret_;
-    QString dashboardUrl_;
-    bool aiLocked_ = false;
-    int appliedPort_ = 0;
-    QString appliedSecret_;
-    QString appliedUrl_;
-    bool appliedAiLocked_ = false;
-    QStringList dynamicScriptIds_;
+    bool themeDark_ = true;
+    bool navigated_ = false;
+    QString uiRootDir_;
 
+#ifdef Q_OS_WIN
+    unsigned long long webMessageTokenValue_ = 0;
+#endif
     ICoreWebView2Environment* env_ = nullptr;
     ICoreWebView2Controller* controller_ = nullptr;
     ICoreWebView2* webview_ = nullptr;
