@@ -353,12 +353,26 @@ func (s *Store) ReadProfileMixinBytes() ([]byte, error) {
 	return nil, nil
 }
 
+// IsDefaultStarterConfigFile reports whether the given file still matches the
+// auto-generated starter config.yaml template byte-for-byte (ignoring CRLF/whitespace).
+func IsDefaultStarterConfigFile(path string) bool {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	normalize := func(s string) string {
+		return strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n"))
+	}
+	return normalize(string(raw)) == normalize(DefaultStarterConfigYAML)
+}
+
 func (s *Store) ListProfiles() ([]string, error) {
 	dir := s.ActiveConfigDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
+	selected := s.Settings().SelectedProfile
 	var names []string
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -371,7 +385,13 @@ func (s *Store) ListProfiles() ([]string, error) {
 		if IsProfileMixinFileName(fn) {
 			continue
 		}
-		names = append(names, strings.TrimSuffix(fn, filepath.Ext(fn)))
+		stem := strings.TrimSuffix(fn, filepath.Ext(fn))
+		// Hide the auto-generated unmodified starter config.yaml when another
+		// profile is active so empty fallback templates don't clutter UI lists.
+		if strings.EqualFold(stem, "config") && !strings.EqualFold(selected, "config") && IsDefaultStarterConfigFile(filepath.Join(dir, fn)) {
+			continue
+		}
+		names = append(names, stem)
 	}
 	sort.Strings(names)
 	if len(names) == 0 {

@@ -1556,7 +1556,18 @@ func (e *Engine) RemoveSubscription(ctx context.Context, name string, deleteFile
 		return err
 	}
 	if deleteFile && e.store.Settings().SelectedProfile == name {
-		_ = e.SelectProfile(ctx, "config")
+		fallback := "config"
+		if subs := e.subMgr.List(); len(subs) > 0 {
+			fallback = subs[0].Name
+		} else if profs, err := e.store.ListProfiles(); err == nil {
+			for _, p := range profs {
+				if !strings.EqualFold(p, "config") && !strings.EqualFold(p, name) {
+					fallback = p
+					break
+				}
+			}
+		}
+		_ = e.SelectProfile(ctx, fallback)
 	} else {
 		e.notifyStateChanged()
 	}

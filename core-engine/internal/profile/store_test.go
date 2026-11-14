@@ -105,3 +105,68 @@ profile:
 		t.Fatal("expected fsnotify callback on work.yaml write")
 	}
 }
+
+func assertProfilesEqual(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("ListProfiles = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ListProfiles = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestListProfilesHidesUnmodifiedStarterConfigWhenInactive(t *testing.T) {
+	store, err := NewStore(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// 1. Fresh store: SelectedProfile == "config" -> [config]
+	profs, err := store.ListProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProfilesEqual(t, profs, "config")
+
+	// 2. Active subscription present while config.yaml is unmodified starter -> omit config
+	dir := store.ActiveConfigDir()
+	if err := WriteFileAtomic(filepath.Join(dir, "sub1.yaml"), []byte("mixed-port: 7890\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateSettings(func(st *AppSettings) error {
+		st.SelectedProfile = "sub1"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profs, err = store.ListProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProfilesEqual(t, profs, "sub1")
+
+	// 3. User adds a custom local YAML -> retained while unmodified starter config stays hidden
+	if err := WriteFileAtomic(filepath.Join(dir, "custom-local.yaml"), []byte("mixed-port: 7890\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	profs, err = store.ListProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProfilesEqual(t, profs, "custom-local", "sub1")
+
+	// 4. User modifies config.yaml -> config.yaml is no longer starter template, so keep it visible
+	customCfg := "mixed-port: 7890\nproxies:\n  - name: n1\n    type: direct\n"
+	if err := WriteFileAtomic(filepath.Join(dir, "config.yaml"), []byte(customCfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+	profs, err = store.ListProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProfilesEqual(t, profs, "config", "custom-local", "sub1")
+}
