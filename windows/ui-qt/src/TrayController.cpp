@@ -1,11 +1,8 @@
 #include "TrayController.h"
-#include "AiLockAndNodeDialogs.h"
 #include "ConsoleWindow.h"
 #include "DaemonClient.h"
 #include "HotkeyManager.h"
 #include "I18n.h"
-#include "RuleEditorDialog.h"
-#include "SubscriptionsAndSettingsDialogs.h"
 #include "TrayIconGenerator.h"
 
 #include <QActionGroup>
@@ -18,6 +15,7 @@
 #include <QJsonDocument>
 #include <QLocalSocket>
 #include <QMessageBox>
+#include <QPushButton>
 #include <QTimer>
 #include <QUrl>
 #include <algorithm>
@@ -32,23 +30,6 @@
 namespace clashfx {
 
 namespace {
-
-void presentTopLevelDialog(QDialog* dlg) {
-    if (!dlg) return;
-    if (dlg->isMinimized()) {
-        dlg->showNormal();
-    } else {
-        dlg->show();
-    }
-    dlg->setWindowState((dlg->windowState() & ~Qt::WindowMinimized) | Qt::WindowActive);
-    dlg->raise();
-    dlg->activateWindow();
-#ifdef Q_OS_WIN
-    if (HWND hwnd = reinterpret_cast<HWND>(dlg->winId())) {
-        SetForegroundWindow(hwnd);
-    }
-#endif
-}
 
 int proxyGroupSortTier(const QString& type) {
     if (type.compare(QStringLiteral("Selector"), Qt::CaseInsensitive) == 0 ||
@@ -129,7 +110,7 @@ TrayController::TrayController(DaemonClient* client,
     , client_(client)
     , uiServerName_(uiServerName) {
     hotkeys_ = new HotkeyManager(this);
-    consoleWindow_ = new ConsoleWindow();
+    consoleWindow_ = new ConsoleWindow(client_);
     trayMenu_ = new QMenu();
     trayIcon_ = new QSystemTrayIcon(TrayIconGenerator::generate(QStringLiteral("default"),
                                                                 TrayVisualState::Disconnected,
@@ -157,13 +138,6 @@ TrayController::TrayController(DaemonClient* client,
     connect(hotkeys_, &HotkeyManager::toggleSystemProxyTriggered, this, &TrayController::onToggleSystemProxyHotkey);
     connect(hotkeys_, &HotkeyManager::switchOutboundModeTriggered, this, &TrayController::onSwitchModeHotkey);
 
-    connect(consoleWindow_, &ConsoleWindow::openAiLockRequested, this, &TrayController::openAiLockDialog);
-    connect(consoleWindow_, &ConsoleWindow::openMultiNodeRequested, this, &TrayController::openMultiNodeDialog);
-    connect(consoleWindow_, &ConsoleWindow::openRulesRequested, this, &TrayController::openRuleEditorDialog);
-    connect(consoleWindow_, &ConsoleWindow::openSubscriptionsRequested, this, &TrayController::openSubscriptionsDialog);
-    connect(consoleWindow_, &ConsoleWindow::openDiagnosticsRequested, this, [this]() { openDiagnosticsDialog(); });
-    connect(consoleWindow_, &ConsoleWindow::openSettingsRequested, this, &TrayController::openSettingsDialog);
-
     connect(&I18n::instance(), &I18n::languageChanged, this, [this]() { rebuildTrayVisualsAndMenu(true); });
 
     if (client_) {
@@ -179,7 +153,6 @@ TrayController::TrayController(DaemonClient* client,
 }
 
 TrayController::~TrayController() {
-    closeAllDialogs();
     if (consoleWindow_) {
         consoleWindow_->setAllowClose(true);
         delete consoleWindow_;
@@ -187,22 +160,6 @@ TrayController::~TrayController() {
     }
     delete trayMenu_;
     trayMenu_ = nullptr;
-}
-
-void TrayController::closeAllDialogs() {
-    auto destroyDlg = [](auto& ptr) {
-        if (ptr) {
-            ptr->disconnect();
-            ptr->deleteLater();
-            ptr.clear();
-        }
-    };
-    destroyDlg(aiLockDlg_);
-    destroyDlg(multiNodeDlg_);
-    destroyDlg(rulesDlg_);
-    destroyDlg(subsDlg_);
-    destroyDlg(diagDlg_);
-    destroyDlg(settingsDlg_);
 }
 
 QWidget* TrayController::modalDialogParent() const {
@@ -990,71 +947,70 @@ void TrayController::showAboutBox() {
 }
 
 void TrayController::openConsole() {
+    if (!consoleWindow_) {
+        return;
+    }
+    consoleWindow_->navigateTo(ConsolePage::Dashboard);
     consoleWindow_->presentWindow();
 }
 
 void TrayController::openAiLockDialog() {
-    if (!aiLockDlg_) {
-        aiLockDlg_ = new AiLockDialog(client_, nullptr);
-        aiLockDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
+    if (!consoleWindow_) {
+        return;
     }
-    presentTopLevelDialog(aiLockDlg_);
+    consoleWindow_->navigateTo(ConsolePage::AiLock);
+    consoleWindow_->presentWindow();
 }
 
 void TrayController::openMultiNodeDialog() {
-    if (!multiNodeDlg_) {
-        multiNodeDlg_ = new MultiNodeDialog(client_, nullptr);
-        multiNodeDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
+    if (!consoleWindow_) {
+        return;
     }
-    presentTopLevelDialog(multiNodeDlg_);
+    consoleWindow_->navigateTo(ConsolePage::MultiNode);
+    consoleWindow_->presentWindow();
 }
 
 void TrayController::openRuleEditorDialog() {
-    if (!rulesDlg_) {
-        rulesDlg_ = new RuleEditorDialog(client_, nullptr);
-        rulesDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
-    } else {
-        rulesDlg_->reloadMixinFromDaemon();
+    if (!consoleWindow_) {
+        return;
     }
-    presentTopLevelDialog(rulesDlg_);
+    consoleWindow_->navigateTo(ConsolePage::Rules, 0);
+    consoleWindow_->presentWindow();
 }
 
 void TrayController::openActiveRulesDialog() {
-    openRuleEditorDialog();
-    if (rulesDlg_) {
-        rulesDlg_->selectTab(2);
+    if (!consoleWindow_) {
+        return;
     }
+    consoleWindow_->navigateTo(ConsolePage::Rules, 2);
+    consoleWindow_->presentWindow();
 }
 
 void TrayController::openSubscriptionsDialog() {
-    if (!subsDlg_) {
-        subsDlg_ = new SubscriptionsDialog(client_, nullptr);
-        subsDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
+    if (!consoleWindow_) {
+        return;
     }
-    presentTopLevelDialog(subsDlg_);
+    consoleWindow_->navigateTo(ConsolePage::Subscriptions);
+    consoleWindow_->presentWindow();
 }
 
 void TrayController::openDiagnosticsDialog(const QString& preselectNode) {
-    if (!diagDlg_) {
-        diagDlg_ = new NodeDiagnosticDialog(client_, nullptr);
-        diagDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
+    if (!consoleWindow_) {
+        return;
     }
-    if (!preselectNode.isEmpty()) {
-        diagDlg_->preselectNode(preselectNode);
-    }
-    presentTopLevelDialog(diagDlg_);
+    consoleWindow_->navigateTo(ConsolePage::Diagnostics, -1, preselectNode);
+    consoleWindow_->presentWindow();
 }
 
 void TrayController::openSettingsDialog() {
-    if (!settingsDlg_) {
-        settingsDlg_ = new SettingsDialog(client_, nullptr);
-        settingsDlg_->setAttribute(Qt::WA_DeleteOnClose, true);
+    if (!consoleWindow_) {
+        return;
     }
-    presentTopLevelDialog(settingsDlg_);
+    consoleWindow_->navigateTo(ConsolePage::Settings);
+    consoleWindow_->presentWindow();
 }
 
 void TrayController::quitAll(bool forceRestoreProxy) {
-    closeAllDialogs();
     if (consoleWindow_) {
         consoleWindow_->setAllowClose(true);
         consoleWindow_->close();

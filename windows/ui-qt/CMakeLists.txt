@@ -45,6 +45,8 @@ set(CLASHFX_UI_SOURCES
     src/TrayIconGenerator.cpp
     src/HotkeyManager.h
     src/HotkeyManager.cpp
+    src/ModernWidgets.h
+    src/ModernWidgets.cpp
     src/WebView2Widget.h
     src/WebView2Widget.cpp
     src/ConsoleWindow.h
@@ -81,4 +83,5 @@ target_link_libraries(clashfx-ui PRIVATE
     advapi32
     shlwapi
     version
+    dwmapi
 )

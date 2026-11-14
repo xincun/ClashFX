@@ -1,1303 +1,1276 @@
 #include "RuleEditorDialog.h"
+
 #include "DaemonClient.h"
 #include "I18n.h"
-#include "TrayIconGenerator.h"
+#include "ModernWidgets.h"
 
 #include <QAbstractItemView>
-#include <QCloseEvent>
-#include <QDesktopServices>
-#include <QFileInfo>
-#include <QFontDatabase>
+#include <QComboBox>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QIcon>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QSignalBlocker>
 #include <QSplitter>
-#include <QTimer>
-#include <QUrl>
+#include <QStackedWidget>
+#include <QStyle>
+#include <QTableWidget>
+#include <QTableWidgetItem>
 #include <QVBoxLayout>
 
 namespace clashfx {
 
 namespace {
 
-struct SimpleRuleTypeOption {
+inline QString uiText(const char* zh, const char* en) {
+    return I18n::instance().isChinese() ? QString::fromUtf8(zh) : QString::fromUtf8(en);
+}
+
+struct RuleTypeMeta {
     const char* code;
-    QString label;
+    const char* zhLabel;
+    const char* enLabel;
+    const char* placeholderZh;
+    const char* placeholderEn;
 };
 
-QVector<SimpleRuleTypeOption> primaryRuleTypeOptions() {
-    return {
-        {"DOMAIN-SUFFIX", L("网站域名 (含子域名)", "Domain Suffix (incl. subdomains)")},
-        {"DOMAIN", L("完整域名 (精确匹配)", "Exact Domain")},
-        {"DOMAIN-KEYWORD", L("网址关键词", "Domain Keyword")},
-        {"PROCESS-NAME", L("软件程序 (.exe)", "App Process (.exe)")},
-        {"IP-CIDR", L("IP 地址或网段", "IP / CIDR Range")},
+constexpr RuleTypeMeta kRuleTypes[] = {
+    {"DOMAIN-SUFFIX", "网站域名 (含子域名)", "Domain Suffix", "claude.ai / scholar.google.com", "claude.ai / example.com"},
+    {"DOMAIN", "精准域名 (仅本域名)", "Exact Domain", "api.openai.com", "api.openai.com"},
+    {"DOMAIN-KEYWORD", "域名关键词", "Domain Keyword", "openai", "openai"},
+    {"DOMAIN-WILDCARD", "域名通配符", "Domain Wildcard", "*.google.com", "*.google.com"},
+    {"DOMAIN-REGEX", "域名正则表达式", "Domain Regex", "^ai\\..+\\.com$", "^ai\\..+\\.com$"},
+    {"PROCESS-NAME", "软件程序 (.exe / 进程)", "Process Name (.exe)", "steam.exe / claude.exe", "steam.exe / claude.exe"},
+    {"PROCESS-PATH", "程序完整路径", "Process Path", "C:\\Program Files\\...", "C:\\Program Files\\..."},
+    {"GEOSITE", "GeoSite 规则分组", "GeoSite Group", "cn / openai / google", "cn / openai / google"},
+    {"IP-CIDR", "IPv4 网段 (CIDR)", "IPv4 CIDR", "192.168.1.0/24", "192.168.1.0/24"},
+    {"IP-CIDR6", "IPv6 网段 (CIDR)", "IPv6 CIDR", "240e::/20", "240e::/20"},
+    {"GEOIP", "GeoIP 国家地区", "GeoIP Country", "CN / US", "CN / US"},
+    {"DST-PORT", "目标端口", "Dest Port", "443 / 8080", "443 / 8080"},
+    {"SRC-IP-CIDR", "来源内网 IP", "Source IP CIDR", "10.0.0.0/8", "10.0.0.0/8"},
+    {"RULE-SET", "外部规则集名称", "Rule-Set Name", "clashfx-ai-lock", "clashfx-ai-lock"},
+    {"MATCH", "兜底默认规则", "Fallback MATCH", "<匹配所有剩余流量>", "<Matches remaining traffic>"},
+};
+
+QString payloadPlaceholderForType(const QString& typeCode) {
+    const QString upper = typeCode.trimmed().toUpper();
+    for (const auto& m : kRuleTypes) {
+        if (upper == QLatin1String(m.code)) {
+            return uiText(m.placeholderZh, m.placeholderEn);
+        }
+    }
+    return QStringLiteral("example.com");
+}
+
+void styleTableDark(QTableWidget* table) {
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setAlternatingRowColors(false);
+    table->setShowGrid(false);
+    table->setFocusPolicy(Qt::NoFocus);
+    table->verticalHeader()->setVisible(false);
+    table->horizontalHeader()->setHighlightSections(false);
+    table->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    table->setStyleSheet(QStringLiteral(
+        "QTableWidget { background: transparent; border: none; color: #e5e7eb;"
+        "  selection-background-color: #192238; selection-color: #f9fafb; }"
+        "QTableWidget::item { border-bottom: 1px solid #1f222d; padding: 4px 8px; }"
+        "QTableWidget::item:selected { background: #192238; }"
+        "QHeaderView::section { background: #14161e; color: #8b93a6; font-size: 11px; font-weight: 600;"
+        "  border: none; border-bottom: 1px solid #262a36; padding: 8px 10px; }"));
+}
+
+PillTone sourcePillTone(const QString& source) {
+    if (source == QLatin1String("system")) {
+        return PillTone::Green;
+    }
+    if (source == QLatin1String("ai_lock")) {
+        return PillTone::Violet;
+    }
+    if (source == QLatin1String("cn_apps") || source == QLatin1String("mixin")) {
+        return PillTone::Blue;
+    }
+    return PillTone::Muted;
+}
+
+QString sourceDisplayLabel(const QString& source) {
+    if (source == QLatin1String("system")) {
+        return uiText("系统守护", "System");
+    }
+    if (source == QLatin1String("ai_lock")) {
+        return uiText("AI 锁定", "AI Lock");
+    }
+    if (source == QLatin1String("cn_apps")) {
+        return uiText("CN 直连", "CN Apps");
+    }
+    if (source == QLatin1String("mixin")) {
+        return uiText("Mixin 补丁", "Mixin");
+    }
+    return uiText("订阅规则", "Profile");
+}
+
+}  // namespace
+
+// ===========================================================================
+// RuleEditorPage
+// ===========================================================================
+
+RuleEditorPage::RuleEditorPage(DaemonClient* client, QWidget* parent)
+    : QWidget(parent)
+    , client_(client) {
+    auto* outerLay = new QVBoxLayout(this);
+    outerLay->setContentsMargins(0, 0, 0, 0);
+    outerLay->setSpacing(0);
+
+    // Header bar
+    const WorkspaceHeaderRefs hdr = buildWorkspaceHeader(this);
+    titleLabel_ = hdr.titleLabel;
+    preservePill_ = hdr.primaryBadge;
+    statusPill_ = hdr.secondaryBadge;
+    subtitleLabel_ = hdr.subtitleLabel;
+
+    tabSwitch_ = new SegmentedControl(true, this);
+    tabSwitch_->setCompact(true);
+    tabSwitch_->setItems({QStringLiteral("1"), QStringLiteral("2"), QStringLiteral("3")});
+
+    reloadBtn_ = new QPushButton(this);
+    reloadBtn_->setProperty("ghost", true);
+    reloadBtn_->setFixedSize(34, 32);
+    reloadBtn_->setStyleSheet(QStringLiteral("QPushButton { padding: 0px; }"));
+    reloadBtn_->setIcon(
+        QIcon(renderVectorIcon(VectorIcon::Refresh, 15, QColor(QStringLiteral("#9ca3af")), devicePixelRatioF())));
+    reloadBtn_->setIconSize(QSize(15, 15));
+    saveBtn_ = new QPushButton(this);
+    saveBtn_->setProperty("primary", true);
+
+    hdr.actionsLayout->addWidget(tabSwitch_);
+    hdr.actionsLayout->addWidget(reloadBtn_);
+    hdr.actionsLayout->addWidget(saveBtn_);
+    outerLay->addWidget(hdr.container);
+
+    auto* body = new QWidget(this);
+    auto* root = new QVBoxLayout(body);
+    root->setContentsMargins(24, 16, 24, 18);
+    root->setSpacing(14);
+    outerLay->addWidget(body, 1);
+
+    subStack_ = new QStackedWidget(body);
+    root->addWidget(subStack_, 1);
+
+    // -----------------------------------------------------------------------
+    // Sub-tab 0: Visual Mixin Rules
+    // -----------------------------------------------------------------------
+    auto* visualPage = new QWidget(subStack_);
+    auto* visualLay = new QVBoxLayout(visualPage);
+    visualLay->setContentsMargins(0, 0, 0, 0);
+    visualLay->setSpacing(14);
+
+    auto* quickCardsRow = new QHBoxLayout();
+    quickCardsRow->setSpacing(14);
+
+    auto makeQuickCard = [&](QLabel*& titleLbl, BadgePill*& recPill, QLabel*& descLbl, ToggleSwitch*& sw) {
+        auto* card = createCardFrame(visualPage);
+        auto* h = new QHBoxLayout(card);
+        h->setContentsMargins(16, 14, 16, 14);
+        h->setSpacing(14);
+        auto* col = new QVBoxLayout();
+        col->setSpacing(6);
+        auto* top = new QHBoxLayout();
+        top->setSpacing(8);
+        titleLbl = new QLabel(card);
+        titleLbl->setStyleSheet(QStringLiteral("color: #f3f4f6; font-size: 13px; font-weight: 700;"));
+        recPill = new BadgePill(card, true);
+        top->addWidget(titleLbl);
+        top->addWidget(recPill);
+        top->addStretch(1);
+
+        descLbl = new QLabel(card);
+        descLbl->setWordWrap(true);
+        descLbl->setStyleSheet(QStringLiteral("color: #9ca3af; font-size: 11px; line-height: 1.4;"));
+
+        col->addLayout(top);
+        col->addWidget(descLbl);
+        sw = new ToggleSwitch(ToggleSwitch::Accent::Emerald, card);
+        h->addLayout(col, 1);
+        h->addWidget(sw, 0, Qt::AlignVCenter);
+        return card;
     };
-}
 
-QString friendlyTypeLabelForAdvanced(const QString& code) {
-    const QString upper = code.trimmed().toUpper();
-    if (upper == QStringLiteral("IP-CIDR6")) return L("IPv6 地址或网段 (IP-CIDR6)", "IPv6 CIDR");
-    if (upper == QStringLiteral("PROCESS-PATH")) return L("软件完整路径 (PROCESS-PATH)", "Process Path");
-    if (upper == QStringLiteral("GEOSITE")) return L("站点分类库 (GEOSITE)", "GeoSite Category");
-    if (upper == QStringLiteral("GEOIP")) return L("国家/地区 IP (GEOIP)", "GeoIP Country");
-    if (upper == QStringLiteral("DST-PORT")) return L("目标端口 (DST-PORT)", "Destination Port");
-    if (upper == QStringLiteral("SRC-IP-CIDR")) return L("来源局域网 IP (SRC-IP-CIDR)", "Source IP CIDR");
-    if (upper == QStringLiteral("DOMAIN-REGEX")) return L("域名正则 (DOMAIN-REGEX)", "Domain Regex");
-    return upper;
-}
+    quickCardsRow->addWidget(makeQuickCard(cnCardTitle_, cnRecPill_, cnCardDesc_, cnSwitch_), 1);
+    quickCardsRow->addWidget(makeQuickCard(lanCardTitle_, lanRecPill_, lanCardDesc_, lanSwitch_), 1);
+    visualLay->addLayout(quickCardsRow);
 
-QString sourceDisplayLabel(const QString& src) {
-    if (src == QStringLiteral("system")) return L("系统守护", "System");
-    if (src == QStringLiteral("ai_lock")) return L("AI 锁定", "AI Lock");
-    if (src == QStringLiteral("cn_apps")) return L("国内桌面应用", "CN Apps");
-    if (src == QStringLiteral("mixin")) return L("配置补丁", "Config Patch");
-    return L("订阅规则", "Subscription");
-}
+    // Custom Rules Card
+    auto* customCard = createCardFrame(visualPage);
+    auto* customLay = new QVBoxLayout(customCard);
+    customLay->setContentsMargins(16, 14, 16, 14);
+    customLay->setSpacing(12);
 
-QColor sourceBadgeColor(const QString& src) {
-    if (src == QStringLiteral("ai_lock")) return QColor(QStringLiteral("#a78bfa"));
-    if (src == QStringLiteral("mixin")) return QColor(QStringLiteral("#60a5fa"));
-    if (src == QStringLiteral("cn_apps")) return QColor(QStringLiteral("#34d399"));
-    if (src == QStringLiteral("system")) return QColor(QStringLiteral("#94a3b8"));
-    return QColor(QStringLiteral("#cbd5e1"));
-}
+    auto* customTop = new QHBoxLayout();
+    customTop->setSpacing(12);
+    auto* customTextCol = new QVBoxLayout();
+    customTextCol->setSpacing(3);
+    customTitle_ = new QLabel(customCard);
+    customTitle_->setStyleSheet(QStringLiteral("color: #f3f4f6; font-size: 13px; font-weight: 700;"));
+    customHint_ = new QLabel(customCard);
+    customHint_->setStyleSheet(QStringLiteral("color: #8b93a6; font-size: 11px;"));
+    customTextCol->addWidget(customTitle_);
+    customTextCol->addWidget(customHint_);
+    customTop->addLayout(customTextCol, 1);
 
-int variantIntOr(const QVariant& v, int fallback = -1) {
-    bool ok = false;
-    const int val = v.toInt(&ok);
-    return ok ? val : fallback;
-}
+    addRuleBtn_ = new QPushButton(customCard);
+    customTop->addWidget(addRuleBtn_, 0, Qt::AlignTop);
+    customLay->addLayout(customTop);
 
-} // namespace
+    customTable_ = new QTableWidget(0, 4, customCard);
+    styleTableDark(customTable_);
+    customTable_->verticalHeader()->setDefaultSectionSize(48);
+    QHeaderView* ch = customTable_->horizontalHeader();
+    ch->setSectionResizeMode(0, QHeaderView::Fixed);
+    customTable_->setColumnWidth(0, 184);
+    ch->setSectionResizeMode(1, QHeaderView::Stretch);
+    ch->setSectionResizeMode(2, QHeaderView::Fixed);
+    customTable_->setColumnWidth(2, 212);
+    ch->setSectionResizeMode(3, QHeaderView::Fixed);
+    customTable_->setColumnWidth(3, 168);  // >= 162px to prevent action button wrapping
+    customLay->addWidget(customTable_, 1);
 
-RuleEditorDialog::RuleEditorDialog(DaemonClient* client, QWidget* parent)
-    : QDialog(parent), client_(client) {
-    setWindowTitle(L("配置补丁与分流规则 (Profile Mixin)", "Config Patch & Routing Rules (Profile Mixin)"));
-    setWindowIcon(TrayIconGenerator::appIcon());
-    resize(940, 680);
-    setMinimumSize(800, 540);
+    visualLay->addWidget(customCard, 1);
+    subStack_->addWidget(visualPage);
 
-    auto* rootLayout = new QVBoxLayout(this);
-    rootLayout->setContentsMargins(16, 14, 16, 14);
-    rootLayout->setSpacing(10);
+    // -----------------------------------------------------------------------
+    // Sub-tab 1: YAML Patch Source
+    // -----------------------------------------------------------------------
+    auto* yamlPage = new QWidget(subStack_);
+    auto* yamlLay = new QVBoxLayout(yamlPage);
+    yamlLay->setContentsMargins(0, 0, 0, 0);
+    yamlLay->setSpacing(12);
 
-    headerDescLabel_ = new QLabel(this);
-    headerDescLabel_->setWordWrap(true);
-    headerDescLabel_->setStyleSheet(QStringLiteral(
-        "background-color: #1e293b; color: #dbeafe; border: 1px solid #334155; "
-        "border-radius: 6px; padding: 8px 12px; font-size: 12px;"));
-    rootLayout->addWidget(headerDescLabel_);
+    extraKeysBanner_ = createCardFrame(yamlPage, QStringLiteral("ExtraKeysCard"));
+    extraKeysBanner_->setStyleSheet(QStringLiteral(
+        "QFrame#ExtraKeysCard { background: #231e12; border: 1px solid #634918; border-radius: 10px; }"));
+    auto* exLay = new QHBoxLayout(extraKeysBanner_);
+    exLay->setContentsMargins(14, 10, 14, 10);
+    extraKeysLbl_ = new QLabel(extraKeysBanner_);
+    extraKeysLbl_->setWordWrap(true);
+    extraKeysLbl_->setStyleSheet(QStringLiteral("color: #fbbf24; font-size: 12px;"));
+    exLay->addWidget(extraKeysLbl_);
+    extraKeysBanner_->setVisible(false);
+    yamlLay->addWidget(extraKeysBanner_);
 
-    tabs_ = new QTabWidget(this);
+    auto* yamlCard = createCardFrame(yamlPage);
+    auto* ycLay = new QVBoxLayout(yamlCard);
+    ycLay->setContentsMargins(16, 14, 16, 14);
+    ycLay->setSpacing(10);
+    yamlHintLbl_ = new QLabel(yamlCard);
+    yamlHintLbl_->setStyleSheet(QStringLiteral("color: #9ca3af; font-size: 12px;"));
+    yamlHintLbl_->setWordWrap(true);
 
-    // ========================================================================
-    // Tab 0: Visual Config Patch (Simple Switches + Inline 3-Column Table)
-    // ========================================================================
-    auto* visualPage = new QWidget(tabs_);
-    auto* visualLayout = new QVBoxLayout(visualPage);
-    visualLayout->setContentsMargins(10, 10, 10, 10);
-    visualLayout->setSpacing(12);
+    yamlEdit_ = new QPlainTextEdit(yamlCard);
+    yamlEdit_->setStyleSheet(QStringLiteral(
+        "QPlainTextEdit { background: #101218; border: 1px solid #262a36; border-radius: 8px;"
+        "  padding: 12px; color: #e5e7eb; font-family: Consolas, 'Cascadia Mono', monospace; font-size: 12px; }"));
+    ycLay->addWidget(yamlHintLbl_);
+    ycLay->addWidget(yamlEdit_, 1);
+    yamlLay->addWidget(yamlCard, 1);
+    subStack_->addWidget(yamlPage);
 
-    auto* presetBox = new QGroupBox(
-        L("1. 常用直连开关（勾选后对所有订阅自动生效，更新订阅不会丢失）",
-          "1. One-Click Direct Switches (Active across all subscriptions)"),
-        visualPage);
-    auto* presetLayout = new QVBoxLayout(presetBox);
-    presetLayout->setSpacing(8);
-
-    bypassCNWebCheck_ = new QCheckBox(
-        L("国内网站与国内 IP 直连（推荐）", "Bypass Chinese Websites & CN IPs via DIRECT (Recommended)"),
-        presetBox);
-    bypassCNWebCheck_->setStyleSheet(QStringLiteral("font-weight: 600; font-size: 13px;"));
-    auto* cnHint = new QLabel(
-        L("让百度、淘宝、B站、知乎、微信网页等国内网站直接连接，不走海外代理、不触发安全验证码（自动启用 GEOSITE,cn + GEOIP,CN）",
-          "Routes 118,000+ domestic domains and Chinese IPs directly without going through overseas proxies (GEOSITE,cn + GEOIP,CN)."),
-        presetBox);
-    cnHint->setWordWrap(true);
-    cnHint->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px; margin-left: 22px;"));
-
-    bypassLANCheck_ = new QCheckBox(
-        L("局域网与内网地址直连（推荐）", "Bypass Local Network & Private IPs via DIRECT (Recommended)"),
-        presetBox);
-    bypassLANCheck_->setStyleSheet(QStringLiteral("font-weight: 600; font-size: 13px;"));
-    auto* lanHint = new QLabel(
-        L("让路由器后台、NAS、打印机及私有内网段 (192.168.x.x / 10.x.x.x / .local) 直接连接（自动启用 GEOSITE,private + GEOIP,LAN）",
-          "Routes localhost, .local domains, and private LAN subnets directly (GEOSITE,private + GEOIP,LAN)."),
-        presetBox);
-    lanHint->setWordWrap(true);
-    lanHint->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px; margin-left: 22px;"));
-
-    presetLayout->addWidget(bypassCNWebCheck_);
-    presetLayout->addWidget(cnHint);
-    presetLayout->addSpacing(2);
-    presetLayout->addWidget(bypassLANCheck_);
-    presetLayout->addWidget(lanHint);
-    visualLayout->addWidget(presetBox, 0);
-
-    auto* rulesBox = new QGroupBox(
-        L("2. 单独指定某个网站或软件怎么走（按从上到下顺序优先匹配）",
-          "2. Custom Website / App Rules (Matched top-to-bottom ahead of subscription rules)"),
-        visualPage);
-    auto* rulesBoxLayout = new QVBoxLayout(rulesBox);
-    rulesBoxLayout->setSpacing(8);
-
-    emptyHintLabel_ = new QLabel(
-        L("还没有单独添加的规则。上方两个开关已覆盖日常绝大多数分流；如果你还想单独指定某个网站或 .exe 软件走直连/代理，点击下方「+ 添加一条规则」即可。",
-          "No custom rules yet. Click '+ Add Rule' below if you want a specific website or .exe app to go Direct, Proxy, or Reject."),
-        rulesBox);
-    emptyHintLabel_->setWordWrap(true);
-    emptyHintLabel_->setStyleSheet(QStringLiteral(
-        "background-color: #222226; color: #a1a1aa; border: 1px dashed #3f3f46; "
-        "border-radius: 6px; padding: 14px; font-size: 12px;"));
-    rulesBoxLayout->addWidget(emptyHintLabel_);
-
-    customTable_ = new QTableWidget(0, 4, rulesBox);
-    customTable_->setHorizontalHeaderLabels({
-        L("匹配方式", "Match By"),
-        L("网址 / 软件名 / IP", "Domain / App (.exe) / IP"),
-        L("怎么走 (出口)", "Action / Outbound"),
-        L("排序与删除", "Order / Remove"),
-    });
-    customTable_->setSelectionMode(QAbstractItemView::NoSelection);
-    customTable_->verticalHeader()->setVisible(false);
-    customTable_->verticalHeader()->setDefaultSectionSize(36);
-    customTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Fixed);
-    customTable_->setColumnWidth(0, 195);
-    customTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-    customTable_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
-    customTable_->setColumnWidth(2, 230);
-    customTable_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
-    customTable_->setColumnWidth(3, 128);
-    rulesBoxLayout->addWidget(customTable_, 1);
-
-    auto* tableToolRow = new QHBoxLayout();
-    addRowBtn_ = new QPushButton(L("+ 添加一条规则", "+ Add Rule"), rulesBox);
-    addRowBtn_->setAutoDefault(false);
-    addRowBtn_->setStyleSheet(QStringLiteral(
-        "QPushButton { font-weight: 600; padding: 5px 14px; }"));
-    extraKeysBadge_ = new QLabel(rulesBox);
-    extraKeysBadge_->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
-    tableToolRow->addWidget(addRowBtn_);
-    tableToolRow->addStretch(1);
-    tableToolRow->addWidget(extraKeysBadge_);
-    rulesBoxLayout->addLayout(tableToolRow);
-
-    visualLayout->addWidget(rulesBox, 1);
-    tabs_->addTab(visualPage, L("可视化分流", "Visual Rules"));
-
-    // ========================================================================
-    // Tab 1: Raw YAML Editor (.profile_mixin.yaml)
-    // ========================================================================
-    auto* yamlPage = new QWidget(tabs_);
-    auto* yamlLayout = new QVBoxLayout(yamlPage);
-    yamlLayout->setContentsMargins(10, 10, 10, 10);
-    yamlLayout->setSpacing(8);
-
-    auto* yamlTopRow = new QHBoxLayout();
-    yamlPathLabel_ = new QLabel(yamlPage);
-    yamlPathLabel_->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
-    auto* openFolderBtn = new QPushButton(L("打开配置文件夹", "Open Config Folder"), yamlPage);
-    openFolderBtn->setAutoDefault(false);
-    yamlTopRow->addWidget(yamlPathLabel_, 1);
-    yamlTopRow->addWidget(openFolderBtn);
-    yamlLayout->addLayout(yamlTopRow);
-
-    yamlEdit_ = new QPlainTextEdit(yamlPage);
-    QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-    mono.setPointSize(10);
-    yamlEdit_->setFont(mono);
-    yamlEdit_->setTabStopDistance(16);
-    yamlLayout->addWidget(yamlEdit_, 1);
-
-    tabs_->addTab(yamlPage, L("YAML 源码 (高级)", "YAML Source"));
-
-    // ========================================================================
-    // Tab 2: Live Effective Rules Inspector & Dynamic Ruleset Editor
-    // ========================================================================
-    auto* effPage = new QWidget(tabs_);
-    auto* effLayout = new QVBoxLayout(effPage);
-    effLayout->setContentsMargins(10, 10, 10, 10);
-    effLayout->setSpacing(8);
-
-    auto* effTipLabel = new QLabel(
-        L("提示：① 勾选首列「启用」可实时临时开关任意顶层规则（内核重载后恢复）；"
-          "② 点击内置规则集（<b>clashfx-ai-lock</b> / <b>clashfx-cn-apps-direct</b>）可在下方直接编辑本地 .list 清单并<b>零断流热更新</b>。",
-          "Tip: 1) Toggle 'On / #' to dynamically enable/disable top-level rules in memory; "
-          "2) Select built-in rule-sets (clashfx-ai-lock / clashfx-cn-apps-direct) to edit local .list files and hot-reload in 0ms."),
-        effPage);
-    effTipLabel->setWordWrap(true);
-    effTipLabel->setStyleSheet(QStringLiteral(
-        "background-color: #222226; color: #d4d4d8; border: 1px solid #3f3f46; "
-        "border-radius: 5px; padding: 6px 10px; font-size: 12px;"));
-    effLayout->addWidget(effTipLabel);
-
-    auto* filterBar = new QHBoxLayout();
-    searchEdit_ = new QLineEdit(effPage);
-    searchEdit_->setPlaceholderText(L("搜索规则类型 / 域名 / 进程 / 规则集名称…",
-                                      "Filter by type, domain, process, or rule-set…"));
-    searchEdit_->setClearButtonEnabled(true);
-    effSummaryLabel_ = new QLabel(effPage);
-    refreshEffBtn_ = new QPushButton(L("刷新", "Refresh"), effPage);
-    refreshEffBtn_->setAutoDefault(false);
-    filterBar->addWidget(searchEdit_, 1);
-    filterBar->addWidget(effSummaryLabel_);
-    filterBar->addWidget(refreshEffBtn_);
-    effLayout->addLayout(filterBar);
+    // -----------------------------------------------------------------------
+    // Sub-tab 2: Effective Rules & Hot-Reload .list Providers
+    // -----------------------------------------------------------------------
+    auto* effPage = new QWidget(subStack_);
+    auto* effLay = new QVBoxLayout(effPage);
+    effLay->setContentsMargins(0, 0, 0, 0);
+    effLay->setSpacing(12);
 
     auto* splitter = new QSplitter(Qt::Vertical, effPage);
-    effTable_ = new QTableWidget(0, 6, splitter);
-    effTable_->setHorizontalHeaderLabels({
-        L("启用 / #", "On / #"),
-        L("来源", "Source"),
-        L("类型", "Type"),
-        L("匹配条件 / 规则集", "Payload / Rule-Set"),
-        L("出口", "Outbound"),
-        L("子规则 / 命中", "Size / Hits"),
+    splitter->setHandleWidth(6);
+
+    // Top half: Active top-level rules table
+    auto* topCard = createCardFrame(splitter);
+    auto* topLay = new QVBoxLayout(topCard);
+    topLay->setContentsMargins(16, 12, 16, 12);
+    topLay->setSpacing(10);
+
+    auto* effFilterRow = new QHBoxLayout();
+    effFilterRow->setSpacing(10);
+    effSearchEdit_ = new QLineEdit(topCard);
+    effSearchEdit_->setClearButtonEnabled(true);
+    effSearchEdit_->setMinimumWidth(240);
+    effSourceCombo_ = new QComboBox(topCard);
+    effSourceCombo_->setMinimumWidth(148);
+    effCountPill_ = new BadgePill(topCard, true);
+    effRefreshBtn_ = new QPushButton(topCard);
+    effFilterRow->addWidget(effSearchEdit_, 1);
+    effFilterRow->addWidget(effSourceCombo_);
+    effFilterRow->addWidget(effCountPill_);
+    effFilterRow->addWidget(effRefreshBtn_);
+    topLay->addLayout(effFilterRow);
+
+    effTable_ = new QTableWidget(0, 6, topCard);
+    styleTableDark(effTable_);
+    effTable_->verticalHeader()->setDefaultSectionSize(38);
+    effTable_->setItemDelegateForColumn(1, new PillItemDelegate(8, effTable_));
+    QHeaderView* eh = effTable_->horizontalHeader();
+    eh->setSectionResizeMode(0, QHeaderView::Fixed);
+    effTable_->setColumnWidth(0, 66);
+    eh->setSectionResizeMode(1, QHeaderView::Fixed);
+    effTable_->setColumnWidth(1, 114);
+    eh->setSectionResizeMode(2, QHeaderView::Fixed);
+    effTable_->setColumnWidth(2, 136);
+    eh->setSectionResizeMode(3, QHeaderView::Stretch);
+    eh->setSectionResizeMode(4, QHeaderView::Fixed);
+    effTable_->setColumnWidth(4, 150);
+    eh->setSectionResizeMode(5, QHeaderView::Fixed);
+    effTable_->setColumnWidth(5, 92);
+    topLay->addWidget(effTable_, 1);
+    splitter->addWidget(topCard);
+
+    // Bottom half: Editable local .list rule-providers hot update
+    auto* rsCard = createCardFrame(splitter);
+    auto* rsLay = new QVBoxLayout(rsCard);
+    rsLay->setContentsMargins(16, 12, 16, 12);
+    rsLay->setSpacing(10);
+
+    auto* rsTop = new QHBoxLayout();
+    rsTop->setSpacing(10);
+    rsTitleLbl_ = new QLabel(rsCard);
+    rsTitleLbl_->setStyleSheet(QStringLiteral("color: #f3f4f6; font-size: 13px; font-weight: 700;"));
+    rsProviderCombo_ = new QComboBox(rsCard);
+    rsProviderCombo_->setMinimumWidth(200);
+    rsBehaviorPill_ = new BadgePill(rsCard, true);
+    rsCountPill_ = new BadgePill(rsCard, true);
+    rsPathLbl_ = new QLabel(rsCard);
+    rsPathLbl_->setStyleSheet(QStringLiteral("color: #6b7280; font-size: 11px; font-family: Consolas, monospace;"));
+    rsResetBtn_ = new QPushButton(rsCard);
+    rsSaveBtn_ = new QPushButton(rsCard);
+    rsSaveBtn_->setProperty("primary", true);
+
+    rsTop->addWidget(rsTitleLbl_);
+    rsTop->addWidget(rsProviderCombo_);
+    rsTop->addWidget(rsBehaviorPill_);
+    rsTop->addWidget(rsCountPill_);
+    rsTop->addWidget(rsPathLbl_, 1);
+    rsTop->addWidget(rsResetBtn_);
+    rsTop->addWidget(rsSaveBtn_);
+    rsLay->addLayout(rsTop);
+
+    rsEdit_ = new QPlainTextEdit(rsCard);
+    rsEdit_->setStyleSheet(QStringLiteral(
+        "QPlainTextEdit { background: #101218; border: 1px solid #262a36; border-radius: 8px;"
+        "  padding: 10px; color: #e5e7eb; font-family: Consolas, 'Cascadia Mono', monospace; font-size: 12px; }"));
+    rsLay->addWidget(rsEdit_, 1);
+    splitter->addWidget(rsCard);
+    splitter->setStretchFactor(0, 3);
+    splitter->setStretchFactor(1, 2);
+    effLay->addWidget(splitter, 1);
+
+    subStack_->addWidget(effPage);
+
+    // Connections
+    connect(tabSwitch_, &SegmentedControl::currentIndexChanged, this, &RuleEditorPage::syncSubTabSwitch);
+    connect(reloadBtn_, &QPushButton::clicked, this, [this]() {
+        if (currentTab_ == 2) {
+            loadEffectiveRules();
+        } else {
+            loadProfileMixin();
+        }
     });
-    effTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    effTable_->setSelectionMode(QAbstractItemView::SingleSelection);
-    effTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    effTable_->verticalHeader()->setVisible(false);
-    effTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    effTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    effTable_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    effTable_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
-    effTable_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
-    effTable_->horizontalHeader()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
-
-    providerDetailBox_ = new QGroupBox(
-        L("规则详情与内置规则集在线编辑", "Rule Inspector & Live Ruleset Editor"),
-        splitter);
-    auto* detailLayout = new QVBoxLayout(providerDetailBox_);
-    detailLayout->setSpacing(6);
-
-    auto* providerToolRow = new QHBoxLayout();
-    providerMetaLabel_ = new QLabel(providerDetailBox_);
-    providerMetaLabel_->setWordWrap(true);
-    providerMetaLabel_->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
-
-    openRulesetFolderBtn_ = new QPushButton(L("打开所在目录", "Show in Folder"), providerDetailBox_);
-    openRulesetFolderBtn_->setAutoDefault(false);
-
-    resetRulesetBtn_ = new QPushButton(L("恢复默认清单", "Reset to Default"), providerDetailBox_);
-    resetRulesetBtn_->setAutoDefault(false);
-
-    saveRulesetBtn_ = new QPushButton(L("保存并热更新规则集", "Save & Hot-Update Ruleset"), providerDetailBox_);
-    saveRulesetBtn_->setAutoDefault(false);
-    saveRulesetBtn_->setStyleSheet(QStringLiteral(
-        "QPushButton { background-color: #059669; color: #ffffff; font-weight: 600; "
-        "border: 1px solid #047857; border-radius: 5px; padding: 5px 14px; }"
-        "QPushButton:hover { background-color: #047857; }"
-        "QPushButton:disabled { background-color: #1f2937; color: #6b7280; border-color: #374151; }"));
-
-    providerToolRow->addWidget(providerMetaLabel_, 1);
-    providerToolRow->addWidget(openRulesetFolderBtn_);
-    providerToolRow->addWidget(resetRulesetBtn_);
-    providerToolRow->addWidget(saveRulesetBtn_);
-    detailLayout->addLayout(providerToolRow);
-
-    providerDetailEdit_ = new QPlainTextEdit(providerDetailBox_);
-    providerDetailEdit_->setReadOnly(true);
-    providerDetailEdit_->setFont(mono);
-    providerDetailEdit_->setPlaceholderText(
-        L("点击上方表格中的 clashfx-ai-lock 或 clashfx-cn-apps-direct 可直接编辑对应的本地 .list 规则集文件并热更新。",
-          "Select clashfx-ai-lock or clashfx-cn-apps-direct above to edit its .list file and hot-update."));
-    detailLayout->addWidget(providerDetailEdit_, 1);
-
-    openRulesetFolderBtn_->setVisible(false);
-    resetRulesetBtn_->setVisible(false);
-    saveRulesetBtn_->setVisible(false);
-
-    splitter->addWidget(effTable_);
-    splitter->addWidget(providerDetailBox_);
-    splitter->setStretchFactor(0, 5);
-    splitter->setStretchFactor(1, 4);
-    effLayout->addWidget(splitter, 1);
-
-    tabs_->addTab(effPage, L("当前生效总览", "Active Rules"));
-    rootLayout->addWidget(tabs_, 1);
-
-    // ========================================================================
-    // Shared Persistent Footer
-    // ========================================================================
-    auto* footer = new QHBoxLayout();
-    statusLabel_ = new QLabel(this);
-    saveApplyBtn_ = new QPushButton(L("保存并立即生效", "Save & Apply Now"), this);
-    saveApplyBtn_->setAutoDefault(false);
-    saveApplyBtn_->setDefault(false);
-    saveApplyBtn_->setStyleSheet(QStringLiteral(
-        "QPushButton { background-color: #2563eb; color: #ffffff; font-weight: 600; "
-        "border: 1px solid #1d4ed8; border-radius: 6px; padding: 7px 20px; font-size: 13px; }"
-        "QPushButton:hover { background-color: #1d4ed8; }"
-        "QPushButton:disabled { background-color: #1e293b; color: #64748b; border-color: #334155; }"));
-    auto* closeBtn = new QPushButton(L("关闭", "Close"), this);
-    closeBtn->setAutoDefault(false);
-    closeBtn->setStyleSheet(QStringLiteral("padding: 7px 16px;"));
-
-    footer->addWidget(statusLabel_, 1);
-    footer->addWidget(saveApplyBtn_);
-    footer->addWidget(closeBtn);
-    rootLayout->addLayout(footer);
-
-    // Signals
-    connect(bypassCNWebCheck_, &QCheckBox::toggled, this, [this](bool) {
-        if (suppressSignals_) return;
-        visualModifiedSinceSync_ = true;
+    connect(saveBtn_, &QPushButton::clicked, this, &RuleEditorPage::saveMixin);
+    connect(addRuleBtn_, &QPushButton::clicked, this, [this]() {
+        addCustomRuleRow({QStringLiteral("DOMAIN-SUFFIX"), QString(), QStringLiteral("PROXY")}, 0);
         setDirty(true);
     });
-    connect(bypassLANCheck_, &QCheckBox::toggled, this, [this](bool) {
-        if (suppressSignals_) return;
-        visualModifiedSinceSync_ = true;
-        setDirty(true);
+    connect(cnSwitch_, &ToggleSwitch::toggled, this, [this](bool) {
+        if (!loading_) {
+            setDirty(true);
+        }
     });
-    connect(addRowBtn_, &QPushButton::clicked, this, &RuleEditorDialog::onAddRuleRow);
-    connect(openFolderBtn, &QPushButton::clicked, this, &RuleEditorDialog::onOpenMixinFolder);
+    connect(lanSwitch_, &ToggleSwitch::toggled, this, [this](bool) {
+        if (!loading_) {
+            setDirty(true);
+        }
+    });
     connect(yamlEdit_, &QPlainTextEdit::textChanged, this, [this]() {
-        if (suppressSignals_) return;
-        yamlModifiedSinceSync_ = true;
-        setDirty(true);
+        if (!loading_) {
+            setDirty(true);
+        }
     });
-    connect(tabs_, &QTabWidget::currentChanged, this, &RuleEditorDialog::onTabChanged);
-    connect(saveApplyBtn_, &QPushButton::clicked, this, &RuleEditorDialog::onSaveAndApply);
-    connect(closeBtn, &QPushButton::clicked, this, &QDialog::close);
 
-    connect(refreshEffBtn_, &QPushButton::clicked, this, &RuleEditorDialog::refreshEffectiveRules);
-    connect(searchEdit_, &QLineEdit::textChanged, this, &RuleEditorDialog::onFilterEffectiveRules);
-    connect(effTable_, &QTableWidget::itemSelectionChanged, this, &RuleEditorDialog::onEffectiveSelectionChanged);
-    connect(effTable_, &QTableWidget::itemChanged, this, &RuleEditorDialog::onEffectiveItemChanged);
+    connect(effSearchEdit_, &QLineEdit::textChanged, this, [this](const QString&) { renderEffectiveRulesTable(); });
+    connect(effSourceCombo_, &QComboBox::currentIndexChanged, this, [this](int) { renderEffectiveRulesTable(); });
+    connect(effRefreshBtn_, &QPushButton::clicked, this, [this]() { loadEffectiveRules(); });
 
-    connect(providerDetailEdit_, &QPlainTextEdit::textChanged, this, [this]() {
-        if (suppressRulesetSignals_ || activeEditableProvider_.isEmpty()) return;
-        setRulesetDirty(true);
+    connect(effTable_, &QTableWidget::itemChanged, this, [this](QTableWidgetItem* item) {
+        if (togglingRule_ || loading_ || !item || item->column() != 0) {
+            return;
+        }
+        const QString source = item->data(Qt::UserRole + 2).toString();
+        const QString payload = item->data(Qt::UserRole + 3).toString();
+        if (source == QLatin1String("system") || payload == QLatin1String("clashfx-internal-direct")) {
+            togglingRule_ = true;
+            item->setCheckState(Qt::Checked);
+            togglingRule_ = false;
+            ToastOverlay::show(window(),
+                               uiText("系统防环回守护规则 (clashfx-internal-direct) 不可禁用",
+                                      "Loop-prevention rule (clashfx-internal-direct) cannot be disabled"),
+                               PillTone::Amber);
+            return;
+        }
+
+        bool okIdx = false;
+        const int ruleIdx = item->data(Qt::UserRole + 1).toInt(&okIdx);
+        if (!okIdx || ruleIdx < 0 || !client_) {
+            return;
+        }
+        const bool wantDisabled = (item->checkState() != Qt::Checked);
+
+        QJsonArray indices;
+        indices.append(ruleIdx);
+        QJsonObject params;
+        params.insert(QStringLiteral("indices"), indices);
+        params.insert(QStringLiteral("disabled"), wantDisabled);
+
+        togglingRule_ = true;
+        client_->call(QStringLiteral("set_rule_disabled"), params,
+                      [this, source, wantDisabled](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+                          togglingRule_ = false;
+                          if (!ok) {
+                              ToastOverlay::show(window(), I18n::instance().translateBackendText(err), PillTone::Red);
+                              loadEffectiveRules();
+                              return;
+                          }
+                          effectiveRulesView_ = data.toObject();
+                          renderEffectiveRulesTable();
+                          if (source == QLatin1String("ai_lock")) {
+                              ToastOverlay::show(
+                                  window(),
+                                  uiText("已联动切换双条 AI 锁定规则状态并零断流生效",
+                                         "Synced both AI-lock rules live without disconnect"),
+                                  PillTone::Violet);
+                          } else {
+                              ToastOverlay::show(
+                                  window(),
+                                  wantDisabled ? uiText("已动态禁用该顶层规则", "Rule disabled live")
+                                               : uiText("已动态启用该顶层规则", "Rule enabled live"),
+                                  PillTone::Green);
+                          }
+                      });
     });
-    connect(saveRulesetBtn_, &QPushButton::clicked, this, &RuleEditorDialog::onSaveRulesetProvider);
-    connect(resetRulesetBtn_, &QPushButton::clicked, this, &RuleEditorDialog::onResetRulesetProvider);
-    connect(openRulesetFolderBtn_, &QPushButton::clicked, this, &RuleEditorDialog::onOpenRulesetFolder);
 
-    setDirty(false);
-    updateFooterButtonsForTab();
+    connect(rsProviderCombo_, &QComboBox::currentTextChanged, this, [this](const QString& name) {
+        if (!loading_ && !name.isEmpty()) {
+            currentProviderName_ = name;
+            loadSelectedProviderIntoEditor();
+        }
+    });
+    connect(rsEdit_, &QPlainTextEdit::textChanged, this, [this]() {
+        if (!loading_) {
+            setRulesetDirty(true);
+        }
+    });
+    connect(rsSaveBtn_, &QPushButton::clicked, this, [this]() { saveSelectedRuleProvider(); });
+    connect(rsResetBtn_, &QPushButton::clicked, this, [this]() { resetSelectedRuleProvider(); });
+    connect(&I18n::instance(), &I18n::languageChanged, this, [this](const QString&) { retranslateUi(); });
 
+    retranslateUi();
     if (client_) {
-        connect(client_, &DaemonClient::stateChanged, this, &RuleEditorDialog::refreshFromSnapshot);
-        refreshFromSnapshot(client_->snapshot());
-        reloadMixinFromDaemon();
+        updateSnapshot(client_->snapshot());
     }
 }
 
-QString RuleEditorDialog::placeholderForRuleType(const QString& ruleType) {
-    const QString upper = ruleType.trimmed().toUpper();
-    if (upper == QStringLiteral("DOMAIN-SUFFIX")) {
-        return L("输入主域名，如 baidu.com 或 scholar.org（可直接粘贴网址）",
-                 "e.g. baidu.com or scholar.org (URLs auto-cleaned)");
+void RuleEditorPage::onPageActivated(int subTab) {
+    if (subTab >= 0 && subTab <= 2 && subTab != currentTab_) {
+        tabSwitch_->setCurrentIndex(subTab, false);
+        syncSubTabSwitch(subTab);
     }
-    if (upper == QStringLiteral("DOMAIN")) {
-        return L("输入完整域名，如 api.example.com", "e.g. api.example.com");
-    }
-    if (upper == QStringLiteral("DOMAIN-KEYWORD")) {
-        return L("输入网址关键词，如 github", "e.g. github");
-    }
-    if (upper == QStringLiteral("PROCESS-NAME") || upper == QStringLiteral("PROCESS-PATH")) {
-        return L("输入软件名，如 steam.exe（需开启增强模式 TUN）", "e.g. steam.exe (requires TUN mode)");
-    }
-    if (upper == QStringLiteral("IP-CIDR") || upper == QStringLiteral("IP-CIDR6")) {
-        return L("输入 IP 或网段，如 192.168.50.1 或 10.0.0.0/8", "e.g. 192.168.50.1 or 10.0.0.0/8");
-    }
-    return L("输入匹配内容", "Enter match value");
-}
-
-void RuleEditorDialog::refreshFromSnapshot(const QJsonObject& snapshot) {
-    if (snapshot.isEmpty()) return;
-
-    const QJsonObject settings = snapshot.value(QStringLiteral("settings")).toObject();
-    selectedProfile_ = settings.value(QStringLiteral("selected_profile")).toString(QStringLiteral("config"));
-    outboundMode_ = settings.value(QStringLiteral("outbound_mode")).toString(QStringLiteral("rule")).toUpper();
-
-    const QString prevDef = defaultTarget_;
-    defaultTarget_ = snapshot.value(QStringLiteral("default_rule_target")).toString(QStringLiteral("DIRECT"));
-
-    QStringList newGroups;
-    for (const QJsonValue& gv : snapshot.value(QStringLiteral("proxy_groups")).toArray()) {
-        const QString gName = gv.toObject().value(QStringLiteral("name")).toString().trimmed();
-        if (!gName.isEmpty() && gName.compare(QStringLiteral("GLOBAL"), Qt::CaseInsensitive) != 0) {
-            newGroups.append(gName);
+    if (!dirty_ && !rulesetDirty_) {
+        loadProfileMixin();
+        if (currentTab_ == 2) {
+            loadEffectiveRules();
         }
     }
-    QStringList newNodes;
-    for (const QJsonValue& nv : snapshot.value(QStringLiteral("ai_lock_candidates")).toArray()) {
-        const QString nName = nv.toObject().value(QStringLiteral("name")).toString().trimmed();
-        if (!nName.isEmpty()) {
-            newNodes.append(nName);
-        }
-    }
-
-    const bool targetsChanged = (prevDef != defaultTarget_) || (groupTargets_ != newGroups) || (nodeTargets_ != newNodes);
-    groupTargets_ = newGroups;
-    nodeTargets_ = newNodes;
-
-    QString header = L("这里编辑的是全局<b>配置补丁 (Profile Mixin)</b>：保存后自动合并进当前及后续切换的所有订阅配置（当前订阅：<b>%1</b>，主代理组：<b>%2</b>）。",
-                       "Editing global <b>Config Patch (Profile Mixin)</b>: automatically merged into all profiles at runtime (Active: <b>%1</b>, Primary Group: <b>%2</b>).")
-                         .arg(selectedProfile_.toHtmlEscaped(), defaultTarget_.toHtmlEscaped());
-    if (outboundMode_ != QStringLiteral("RULE")) {
-        header += L("  <span style='color:#fbbf24;'>[注意：当前出站模式为 %1，切回 RULE 规则模式后分流才会生效]</span>",
-                    "  <span style='color:#fbbf24;'>[Note: Outbound mode is %1; switch to RULE mode for split routing]</span>")
-                      .arg(outboundMode_);
-    }
-    headerDescLabel_->setText(header);
-
-    if (targetsChanged && !workingRules_.isEmpty()) {
-        rebuildCustomTable();
-    }
 }
 
-void RuleEditorDialog::reloadMixinFromDaemon() {
-    if (!client_) return;
-    client_->call(QStringLiteral("get_profile_mixin"), QJsonObject(),
-                  [this](bool ok, const QJsonValue& data, const QString&, const QString&) {
-                      if (!ok || !data.isObject()) return;
-                      applyMixinDocument(data.toObject(), true);
-                  });
-}
-
-void RuleEditorDialog::applyMixinDocument(const QJsonObject& doc, bool markClean) {
-    suppressSignals_ = true;
-    if (doc.contains(QStringLiteral("path"))) {
-        mixinFilePath_ = doc.value(QStringLiteral("path")).toString();
-        yamlPathLabel_->setText(L("补丁文件：", "File: ") + mixinFilePath_);
-    }
-    const QString defTgt = doc.value(QStringLiteral("default_target")).toString();
-    if (!defTgt.isEmpty()) {
-        defaultTarget_ = defTgt;
-    }
-
-    lastSyncedYaml_ = doc.value(QStringLiteral("yaml")).toString();
-    yamlEdit_->setPlainText(lastSyncedYaml_);
-
-    bypassCNWebCheck_->setChecked(doc.value(QStringLiteral("bypass_cn_web")).toBool(false));
-    bypassLANCheck_->setChecked(doc.value(QStringLiteral("bypass_lan")).toBool(false));
-    hasExtraYamlKeys_ = doc.value(QStringLiteral("has_extra_keys")).toBool(false);
-    extraKeysBadge_->setText(hasExtraYamlKeys_
-                                 ? L("已包含其他 YAML 补丁字段（可视化保存时自动保留）",
-                                     "Contains additional YAML keys (preserved on visual save)")
-                                 : QString());
-
-    workingRules_.clear();
-    for (const QJsonValue& rv : doc.value(QStringLiteral("rules")).toArray()) {
-        const QJsonObject ro = rv.toObject();
-        MixinRuleRow row;
-        row.type = ro.value(QStringLiteral("type")).toString(QStringLiteral("DOMAIN-SUFFIX"));
-        row.payload = ro.value(QStringLiteral("payload")).toString();
-        row.target = ro.value(QStringLiteral("target")).toString(QStringLiteral("DIRECT"));
-        workingRules_.push_back(row);
-    }
-    suppressSignals_ = false;
-
-    rebuildCustomTable();
-
-    visualModifiedSinceSync_ = false;
-    yamlModifiedSinceSync_ = false;
-    if (markClean) {
-        setDirty(false);
-    }
-}
-
-void RuleEditorDialog::populateTargetCombo(QComboBox* combo, const QString& currentTarget) const {
-    combo->clear();
-    combo->addItem(L("直连 (DIRECT)", "Direct (DIRECT)"), QStringLiteral("DIRECT"));
-    combo->addItem(L("走代理 (跟随主策略组: %1)", "Proxy (Primary Group: %1)").arg(defaultTarget_),
-                   QStringLiteral("PROXY"));
-    combo->addItem(L("拦截阻止 (REJECT)", "Block (REJECT)"), QStringLiteral("REJECT"));
-
-    if (!groupTargets_.isEmpty() || !nodeTargets_.isEmpty()) {
-        combo->insertSeparator(combo->count());
-    }
-    for (const QString& g : groupTargets_) {
-        combo->addItem(L("策略组: ", "Group: ") + g, g);
-    }
-    for (const QString& n : nodeTargets_) {
-        combo->addItem(L("节点: ", "Node: ") + n, n);
-    }
-
-    QString norm = currentTarget.trimmed();
-    if (norm.compare(QStringLiteral("PROXY"), Qt::CaseInsensitive) == 0 ||
-        norm.compare(QStringLiteral("@DEFAULT"), Qt::CaseInsensitive) == 0) {
-        norm = QStringLiteral("PROXY");
-    } else if (norm.compare(QStringLiteral("DIRECT"), Qt::CaseInsensitive) == 0) {
-        norm = QStringLiteral("DIRECT");
-    } else if (norm.compare(QStringLiteral("REJECT"), Qt::CaseInsensitive) == 0) {
-        norm = QStringLiteral("REJECT");
-    }
-
-    int idx = combo->findData(norm);
-    if (idx < 0 && !norm.isEmpty()) {
-        combo->addItem(norm, norm);
-        idx = combo->count() - 1;
-    }
-    if (idx >= 0) {
-        combo->setCurrentIndex(idx);
-    }
-}
-
-void RuleEditorDialog::rebuildCustomTable(int focusRow) {
-    const bool prevSuppress = suppressSignals_;
-    suppressSignals_ = true;
-
-    const int n = workingRules_.size();
-    emptyHintLabel_->setVisible(n == 0);
-    customTable_->setVisible(n > 0);
-    customTable_->setRowCount(n);
-
-    QLineEdit* focusEdit = nullptr;
-    const auto typeOptions = primaryRuleTypeOptions();
-
-    for (int i = 0; i < n; ++i) {
-        const MixinRuleRow& r = workingRules_[i];
-
-        auto* typeCombo = new QComboBox(customTable_);
-        for (const auto& opt : typeOptions) {
-            typeCombo->addItem(opt.label, QString::fromLatin1(opt.code));
-        }
-        const QString upperType = r.type.trimmed().toUpper();
-        int tIdx = typeCombo->findData(upperType);
-        if (tIdx < 0 && !upperType.isEmpty()) {
-            typeCombo->addItem(friendlyTypeLabelForAdvanced(upperType), upperType);
-            tIdx = typeCombo->count() - 1;
-        }
-        if (tIdx >= 0) {
-            typeCombo->setCurrentIndex(tIdx);
-        }
-
-        auto* payloadEdit = new QLineEdit(r.payload, customTable_);
-        payloadEdit->setPlaceholderText(placeholderForRuleType(upperType));
-        payloadEdit->setClearButtonEnabled(true);
-        if (i == focusRow) {
-            focusEdit = payloadEdit;
-        }
-
-        auto* targetCombo = new QComboBox(customTable_);
-        populateTargetCombo(targetCombo, r.target);
-
-        auto* actionWrap = new QWidget(customTable_);
-        auto* actionRow = new QHBoxLayout(actionWrap);
-        actionRow->setContentsMargins(4, 2, 4, 2);
-        actionRow->setSpacing(4);
-
-        auto* upBtn = new QPushButton(QStringLiteral("↑"), actionWrap);
-        upBtn->setFixedWidth(26);
-        upBtn->setAutoDefault(false);
-        upBtn->setEnabled(i > 0);
-        upBtn->setToolTip(L("上移（更高优先级）", "Move up"));
-
-        auto* downBtn = new QPushButton(QStringLiteral("↓"), actionWrap);
-        downBtn->setFixedWidth(26);
-        downBtn->setAutoDefault(false);
-        downBtn->setEnabled(i + 1 < n);
-        downBtn->setToolTip(L("下移", "Move down"));
-
-        auto* delBtn = new QPushButton(L("删除", "Del"), actionWrap);
-        delBtn->setAutoDefault(false);
-        delBtn->setStyleSheet(QStringLiteral("color: #f87171; padding: 2px 6px;"));
-
-        actionRow->addWidget(upBtn);
-        actionRow->addWidget(downBtn);
-        actionRow->addWidget(delBtn);
-
-        customTable_->setCellWidget(i, 0, typeCombo);
-        customTable_->setCellWidget(i, 1, payloadEdit);
-        customTable_->setCellWidget(i, 2, targetCombo);
-        customTable_->setCellWidget(i, 3, actionWrap);
-
-        connect(typeCombo, qOverload<int>(&QComboBox::currentIndexChanged), this,
-                [this, i, typeCombo, payloadEdit](int) {
-                    if (suppressSignals_ || i < 0 || i >= workingRules_.size()) return;
-                    const QString code = typeCombo->currentData().toString();
-                    workingRules_[i].type = code;
-                    payloadEdit->setPlaceholderText(placeholderForRuleType(code));
-                    visualModifiedSinceSync_ = true;
-                    setDirty(true);
-                });
-
-        connect(payloadEdit, &QLineEdit::textEdited, this, [this, i](const QString& text) {
-            if (suppressSignals_ || i < 0 || i >= workingRules_.size()) return;
-            workingRules_[i].payload = text;
-            visualModifiedSinceSync_ = true;
-            setDirty(true);
-        });
-
-        connect(targetCombo, qOverload<int>(&QComboBox::currentIndexChanged), this,
-                [this, i, targetCombo](int) {
-                    if (suppressSignals_ || i < 0 || i >= workingRules_.size()) return;
-                    workingRules_[i].target = targetCombo->currentData().toString();
-                    visualModifiedSinceSync_ = true;
-                    setDirty(true);
-                });
-
-        connect(upBtn, &QPushButton::clicked, this, [this, i]() {
-            if (i <= 0 || i >= workingRules_.size()) return;
-            workingRules_.swapItemsAt(i, i - 1);
-            visualModifiedSinceSync_ = true;
-            rebuildCustomTable(i - 1);
-            setDirty(true);
-        });
-
-        connect(downBtn, &QPushButton::clicked, this, [this, i]() {
-            if (i < 0 || i + 1 >= workingRules_.size()) return;
-            workingRules_.swapItemsAt(i, i + 1);
-            visualModifiedSinceSync_ = true;
-            rebuildCustomTable(i + 1);
-            setDirty(true);
-        });
-
-        connect(delBtn, &QPushButton::clicked, this, [this, i]() {
-            if (i < 0 || i >= workingRules_.size()) return;
-            workingRules_.removeAt(i);
-            visualModifiedSinceSync_ = true;
-            rebuildCustomTable();
-            setDirty(true);
-        });
-    }
-
-    suppressSignals_ = prevSuppress;
-    if (focusEdit) {
-        QTimer::singleShot(0, focusEdit, [focusEdit]() { focusEdit->setFocus(); });
-    }
-}
-
-void RuleEditorDialog::onAddRuleRow() {
-    MixinRuleRow row;
-    row.type = QStringLiteral("DOMAIN-SUFFIX");
-    row.target = bypassCNWebCheck_->isChecked() ? QStringLiteral("PROXY") : QStringLiteral("DIRECT");
-    workingRules_.push_back(row);
-    visualModifiedSinceSync_ = true;
-    rebuildCustomTable(workingRules_.size() - 1);
-    setDirty(true);
-}
-
-QJsonArray RuleEditorDialog::serializeVisualRulesJson(bool skipBlankPayload) const {
-    QJsonArray arr;
-    for (const MixinRuleRow& r : workingRules_) {
-        const QString tp = r.type.trimmed().toUpper();
-        const QString pl = r.payload.trimmed();
-        if (skipBlankPayload && tp != QStringLiteral("MATCH") && pl.isEmpty()) {
-            continue;
-        }
-        QJsonObject obj;
-        obj.insert(QStringLiteral("type"), tp);
-        obj.insert(QStringLiteral("payload"), pl);
-        obj.insert(QStringLiteral("target"), r.target.trimmed());
-        arr.append(obj);
-    }
-    return arr;
-}
-
-void RuleEditorDialog::updateFooterButtonsForTab() {
-    if (!tabs_ || !saveApplyBtn_) return;
-    if (tabs_->currentIndex() == 2) {
-        saveApplyBtn_->setVisible(dirty_);
-        saveApplyBtn_->setText(L("保存补丁修改", "Save Patch Changes"));
+void RuleEditorPage::setDirty(bool dirty) {
+    dirty_ = dirty;
+    if (dirty_) {
+        statusPill_->setPill(uiText("有未保存改动", "Unsaved Changes"), PillTone::Amber);
+    } else if (hasExtraKeys_) {
+        statusPill_->setPill(uiText("含自定义 YAML 附加键", "Extra YAML Keys Present"), PillTone::Violet);
     } else {
-        saveApplyBtn_->setVisible(true);
-        saveApplyBtn_->setText(L("保存并立即生效", "Save & Apply Now"));
+        statusPill_->setPill(QString(), PillTone::Muted);
     }
 }
 
-void RuleEditorDialog::onTabChanged(int index) {
-    updateFooterButtonsForTab();
-    if (!client_) {
-        lastTabIndex_ = index;
+void RuleEditorPage::setRulesetDirty(bool dirty) {
+    rulesetDirty_ = dirty;
+}
+
+void RuleEditorPage::retranslateUi() {
+    titleLabel_->setText(uiText("分流规则与全局配置补丁 (Profile Mixin)", "Routing Rules & Profile Mixin"));
+    preservePill_->setPill(uiText("切换订阅自动保留", "Preserved Across Profiles"), PillTone::Blue);
+    subtitleLabel_->setText(uiText(
+        "可视化配置常用直连与自定义分流，或实时开关顶层规则、零断流热更新本地 .list 规则集",
+        "Manage CN/LAN bypass, top-priority custom rules, raw Mixin YAML, and live hot-reload .list rulesets"));
+
+    const int effCount = effectiveRulesView_.value(QStringLiteral("total_rules")).toInt(0);
+    tabSwitch_->setItemText(0, uiText("可视化分流", "Visual Rules"));
+    tabSwitch_->setItemText(1, uiText("YAML 补丁源码", "YAML Source"));
+    tabSwitch_->setItemText(2, effCount > 0 ? (uiText("当前生效与热更新 (", "Live Rules (") +
+                                               QString::number(effCount) + QStringLiteral(")"))
+                                            : uiText("当前生效与热更新", "Live Rules"));
+
+    reloadBtn_->setToolTip(uiText("重新读取配置", "Reload Configuration"));
+    saveBtn_->setText(uiText("保存并立即生效", "Save & Apply"));
+
+    cnCardTitle_->setText(uiText("🇨🇳 国内网站与国内 IP 自动直连", "🇨🇳 Bypass CN Websites & IPs"));
+    cnRecPill_->setPill(uiText("推荐", "Recommended"), PillTone::Green);
+    cnCardDesc_->setText(uiText(
+        "百度、淘宝、B站、知乎等 11.8 万+ 国内域名与 CN IP 直接连接，不绕海外代理、不弹安全验证 (GEOSITE,cn + GEOIP,CN)",
+        "Route Chinese domains and CN CIDRs directly without proxy detour (GEOSITE,cn + GEOIP,CN)"));
+
+    lanCardTitle_->setText(uiText("🏠 局域网与私有内网直连", "🏠 Bypass LAN & Private Networks"));
+    lanRecPill_->setPill(uiText("推荐", "Recommended"), PillTone::Green);
+    lanCardDesc_->setText(uiText(
+        "路由器后台、NAS、打印机及 192.168.x.x / 10.x.x.x / .local 域名直接连接 (GEOSITE,private + GEOIP,LAN)",
+        "Keep router, NAS, printer & 192.168/10.x/.local traffic direct (GEOSITE,private + GEOIP,LAN)"));
+
+    customTitle_->setText(uiText("自定义网站与客户端软件分流规则（按从上到下优先于订阅规则匹配）",
+                                 "Custom Domain, App Process & IP Rules (Evaluated Before Profile Rules)"));
+    customHint_->setText(uiText(
+        "直接粘贴完整网址也会自动提取域名；进程名规则在增强模式 (TUN) 下自动生效",
+        "Full URLs are automatically stripped to domain hosts; PROCESS-NAME rules work automatically under Enhanced TUN"));
+    addRuleBtn_->setText(uiText("+ 添加一条规则", "+ Add Rule"));
+
+    customTable_->setHorizontalHeaderLabels({
+        uiText("匹配方式", "Match Type"),
+        uiText("网址域名 / 软件进程 (.exe) / IP 网段", "Domain / Process (.exe) / IP CIDR"),
+        uiText("走哪个出口", "Target Outbound"),
+        uiText("优先级与操作", "Order & Remove"),
+    });
+
+    extraKeysLbl_->setText(uiText(
+        "检测到 Mixin 中还包含额外高级配置键（如 dns / proxy-groups / tun 覆盖），可视化编辑保存后将原样保留这些扩展键。",
+        "Additional top-level Mixin keys (e.g. dns / proxy-groups) exist and will be preserved intact on Visual save."));
+    yamlHintLbl_->setText(uiText(
+        "高级用户可直接编辑 `.profile_mixin.yaml` 完整源码；切回“可视化分流”时会自动校验并解析常用规则。",
+        "Edit the raw `.profile_mixin.yaml` document directly; switching back to Visual Rules parses and validates YAML."));
+
+    effSearchEdit_->setPlaceholderText(uiText("搜索生效规则（类型 / 域名 / 策略 / 来源）...",
+                                              "Filter active rules (type / payload / proxy / source)..."));
+    {
+        QSignalBlocker sb(effSourceCombo_);
+        const int prevIdx = effSourceCombo_->currentIndex();
+        effSourceCombo_->clear();
+        effSourceCombo_->addItem(uiText("全部规则来源", "All Sources"), QStringLiteral("all"));
+        effSourceCombo_->addItem(uiText("Mixin 补丁", "Mixin Patch"), QStringLiteral("mixin"));
+        effSourceCombo_->addItem(uiText("AI 专用锁定", "AI Lock"), QStringLiteral("ai_lock"));
+        effSourceCombo_->addItem(uiText("CN 应用直连", "CN Apps"), QStringLiteral("cn_apps"));
+        effSourceCombo_->addItem(uiText("订阅原规则", "Profile Rules"), QStringLiteral("profile"));
+        effSourceCombo_->addItem(uiText("系统守护", "System Guard"), QStringLiteral("system"));
+        if (prevIdx >= 0 && prevIdx < effSourceCombo_->count()) {
+            effSourceCombo_->setCurrentIndex(prevIdx);
+        }
+    }
+    effRefreshBtn_->setText(uiText("刷新生效规则", "Refresh Rules"));
+    effTable_->setHorizontalHeaderLabels({
+        uiText("启用", "On"),
+        uiText("规则来源", "Source"),
+        uiText("规则类型", "Type"),
+        uiText("匹配内容 (Payload)", "Payload"),
+        uiText("命中策略组", "Target"),
+        uiText("命中/未中", "Hits / Miss"),
+    });
+
+    rsTitleLbl_->setText(uiText("本地规则集热更新 (.list)", "Live .list Ruleset Editor"));
+    rsResetBtn_->setText(uiText("恢复内置默认", "Reset Default"));
+    rsSaveBtn_->setText(uiText("保存并零断流热更新", "Save & Hot-Reload"));
+
+    setDirty(dirty_);
+    if (!effectiveRulesView_.isEmpty()) {
+        renderEffectiveRulesTable();
+    }
+}
+
+void RuleEditorPage::updateSnapshot(const QJsonObject& snapshot) {
+    lastSnapshot_ = snapshot;
+    const QString def = snapshot.value(QStringLiteral("default_rule_target")).toString().trimmed();
+    if (!def.isEmpty()) {
+        defaultTarget_ = def;
+    }
+    refreshProxyTargetsFromSnapshot(snapshot);
+    const bool connected = client_ ? client_->isConnected() : false;
+    reloadBtn_->setEnabled(connected);
+    saveBtn_->setEnabled(connected && currentTab_ != 2);
+    effRefreshBtn_->setEnabled(connected);
+    rsSaveBtn_->setEnabled(connected);
+    rsResetBtn_->setEnabled(connected);
+}
+
+void RuleEditorPage::refreshProxyTargetsFromSnapshot(const QJsonObject& snapshot) {
+    QStringList newGroups;
+    const QJsonArray groups = snapshot.value(QStringLiteral("proxy_groups")).toArray();
+    for (const QJsonValue& gVal : groups) {
+        const QString name = gVal.toObject().value(QStringLiteral("name")).toString().trimmed();
+        if (!name.isEmpty() && !newGroups.contains(name)) {
+            newGroups.push_back(name);
+        }
+    }
+    if (newGroups == proxyGroupChoices_) {
+        return;
+    }
+    proxyGroupChoices_ = newGroups;
+
+    for (int r = 0; r < customTable_->rowCount(); ++r) {
+        if (auto* combo = qobject_cast<QComboBox*>(customTable_->cellWidget(r, 2))) {
+            const QString curVal = combo->currentData().toString();
+            QSignalBlocker sb(combo);
+            combo->clear();
+            combo->addItem(uiText("🚀 走代理 (跟随主策略组)", "🚀 Proxy (Primary Group)"), QStringLiteral("PROXY"));
+            combo->addItem(uiText("🏠 直连 (DIRECT)", "🏠 DIRECT"), QStringLiteral("DIRECT"));
+            combo->addItem(uiText("⛔ 拦截阻止 (REJECT)", "⛔ REJECT"), QStringLiteral("REJECT"));
+            for (const QString& g : proxyGroupChoices_) {
+                combo->addItem(uiText("🎯 策略组: ", "🎯 Group: ") + g, g);
+            }
+            int idx = combo->findData(curVal);
+            if (idx < 0 && !curVal.isEmpty()) {
+                combo->addItem(curVal, curVal);
+                idx = combo->count() - 1;
+            }
+            combo->setCurrentIndex(idx >= 0 ? idx : 0);
+            updateTargetComboStyle(combo);
+        }
+    }
+}
+
+void RuleEditorPage::syncSubTabSwitch(int nextIndex) {
+    if (switchingTab_) {
+        return;
+    }
+    if (nextIndex == currentTab_) {
         return;
     }
 
-    if (lastTabIndex_ == 0 && index == 1 && visualModifiedSinceSync_) {
+    auto setVisualTabOnly = [&](int idx) {
+        currentTab_ = idx;
+        subStack_->setCurrentIndex(idx);
+        saveBtn_->setVisible(idx != 2);
+        saveBtn_->setEnabled(client_ && client_->isConnected() && idx != 2);
+    };
+
+    // Moving Visual (0) -> YAML (1): serialize visual form to YAML via daemon
+    if (currentTab_ == 0 && nextIndex == 1 && client_ && client_->isConnected()) {
+        QJsonArray arr;
+        for (const auto& r : collectCustomRules()) {
+            QJsonObject obj;
+            obj.insert(QStringLiteral("type"), r.type);
+            obj.insert(QStringLiteral("payload"), r.payload);
+            obj.insert(QStringLiteral("target"), r.target);
+            arr.append(obj);
+        }
         QJsonObject params;
         params.insert(QStringLiteral("direction"), QStringLiteral("to_yaml"));
-        params.insert(QStringLiteral("yaml"), lastSyncedYaml_);
-        params.insert(QStringLiteral("bypass_cn_web"), bypassCNWebCheck_->isChecked());
-        params.insert(QStringLiteral("bypass_lan"), bypassLANCheck_->isChecked());
-        params.insert(QStringLiteral("rules"), serializeVisualRulesJson(true));
+        params.insert(QStringLiteral("yaml"), baseYamlCache_);
+        params.insert(QStringLiteral("bypass_cn_web"), cnSwitch_->isChecked());
+        params.insert(QStringLiteral("bypass_lan"), lanSwitch_->isChecked());
+        params.insert(QStringLiteral("rules"), arr);
+
+        switchingTab_ = true;
         client_->call(QStringLiteral("convert_profile_mixin"), params,
-                      [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+                      [this, nextIndex, setVisualTabOnly](bool ok, const QJsonValue& data, const QString& err,
+                                                          const QString&) {
+                          switchingTab_ = false;
                           if (!ok) {
-                              QMessageBox::warning(this, windowTitle(), err);
+                              tabSwitch_->setCurrentIndex(0, false);
+                              ToastOverlay::show(window(), I18n::instance().translateBackendText(err), PillTone::Red);
                               return;
                           }
-                          const QString built = data.toObject().value(QStringLiteral("yaml")).toString();
-                          suppressSignals_ = true;
-                          yamlEdit_->setPlainText(built);
-                          suppressSignals_ = false;
-                          lastSyncedYaml_ = built;
-                          visualModifiedSinceSync_ = false;
-                          yamlModifiedSinceSync_ = false;
+                          const QJsonObject doc = data.toObject();
+                          loading_ = true;
+                          const QString yml = doc.value(QStringLiteral("yaml")).toString();
+                          baseYamlCache_ = yml;
+                          yamlEdit_->setPlainText(yml);
+                          loading_ = false;
+                          setVisualTabOnly(nextIndex);
                       });
-    } else if (lastTabIndex_ == 1 && index == 0 && yamlModifiedSinceSync_) {
+        return;
+    }
+
+    // Moving YAML (1) -> Visual (0) or (2): parse YAML back to visual fields first
+    if (currentTab_ == 1 && nextIndex == 0 && client_ && client_->isConnected()) {
         QJsonObject params;
         params.insert(QStringLiteral("direction"), QStringLiteral("from_yaml"));
         params.insert(QStringLiteral("yaml"), yamlEdit_->toPlainText());
+
+        switchingTab_ = true;
         client_->call(QStringLiteral("convert_profile_mixin"), params,
-                      [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+                      [this, nextIndex, setVisualTabOnly](bool ok, const QJsonValue& data, const QString& err,
+                                                          const QString&) {
+                          switchingTab_ = false;
                           if (!ok) {
-                              QMessageBox::warning(this, L("YAML 语法有误", "YAML Syntax Error"), err);
-                              suppressSignals_ = true;
-                              tabs_->setCurrentIndex(1);
-                              suppressSignals_ = false;
-                              lastTabIndex_ = 1;
-                              updateFooterButtonsForTab();
+                              tabSwitch_->setCurrentIndex(1, false);
+                              ToastOverlay::show(window(), I18n::instance().translateBackendText(err), PillTone::Red);
                               return;
                           }
-                          applyMixinDocument(data.toObject(), false);
+                          const bool wasDirty = dirty_;
+                          applyDocument(data.toObject(), true);
+                          setDirty(wasDirty);
+                          setVisualTabOnly(nextIndex);
                       });
-    } else if (index == 2) {
-        refreshEffectiveRules();
+        return;
     }
 
-    lastTabIndex_ = index;
-}
-
-void RuleEditorDialog::setDirty(bool dirty, const QString& savedHint) {
-    dirty_ = dirty;
-    updateFooterButtonsForTab();
-    if (dirty) {
-        statusLabel_->setStyleSheet(QStringLiteral("color: #fbbf24; font-weight: 600;"));
-        statusLabel_->setText(L("● 配置补丁有未保存修改，点击右侧「保存并立即生效」即可应用",
-                                "● Unsaved Config Patch changes — click 'Save & Apply Now'"));
-    } else if (!savedHint.isEmpty()) {
-        statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-weight: 600;"));
-        statusLabel_->setText(savedHint);
-    } else if (!rulesetDirty_) {
-        statusLabel_->clear();
+    setVisualTabOnly(nextIndex);
+    if (nextIndex == 2) {
+        loadEffectiveRules();
     }
 }
 
-void RuleEditorDialog::setRulesetDirty(bool dirty, const QString& savedHint) {
-    rulesetDirty_ = dirty;
-    if (dirty) {
-        statusLabel_->setStyleSheet(QStringLiteral("color: #fbbf24; font-weight: 600;"));
-        statusLabel_->setText(L("● 规则集 %1 已修改，点击「保存并热更新规则集」立即生效（无需重启内核）",
-                                "● Ruleset %1 modified — click 'Save & Hot-Update Ruleset' to apply in 0ms")
-                                  .arg(activeEditableProvider_));
-    } else if (!savedHint.isEmpty()) {
-        statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-weight: 600;"));
-        statusLabel_->setText(savedHint);
-    } else if (!dirty_) {
-        statusLabel_->clear();
+void RuleEditorPage::loadProfileMixin() {
+    if (!client_ || !client_->isConnected()) {
+        return;
+    }
+    client_->call(QStringLiteral("get_profile_mixin"), QJsonObject(),
+                  [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+                      if (!ok) {
+                          ToastOverlay::show(window(), I18n::instance().translateBackendText(err), PillTone::Red);
+                          return;
+                      }
+                      applyDocument(data.toObject(), true);
+                      setDirty(false);
+                  });
+}
+
+void RuleEditorPage::applyDocument(const QJsonObject& doc, bool preserveActiveTab) {
+    loading_ = true;
+    baseYamlCache_ = doc.value(QStringLiteral("yaml")).toString();
+    hasExtraKeys_ = doc.value(QStringLiteral("has_extra_keys")).toBool(false);
+    extraKeysBanner_->setVisible(hasExtraKeys_);
+
+    cnSwitch_->setCheckedSilent(doc.value(QStringLiteral("bypass_cn_web")).toBool(false));
+    lanSwitch_->setCheckedSilent(doc.value(QStringLiteral("bypass_lan")).toBool(false));
+    yamlEdit_->setPlainText(baseYamlCache_);
+
+    QList<MixinRuleRow> rows;
+    const QJsonArray arr = doc.value(QStringLiteral("rules")).toArray();
+    rows.reserve(arr.size());
+    for (const QJsonValue& v : arr) {
+        const QJsonObject o = v.toObject();
+        rows.push_back({
+            o.value(QStringLiteral("type")).toString(),
+            o.value(QStringLiteral("payload")).toString(),
+            o.value(QStringLiteral("target")).toString(),
+        });
+    }
+    populateCustomTable(rows);
+    loading_ = false;
+
+    if (!preserveActiveTab) {
+        currentTab_ = 0;
+        tabSwitch_->setCurrentIndex(0, false);
+        subStack_->setCurrentIndex(0);
     }
 }
 
-void RuleEditorDialog::onSaveAndApply() {
-    if (!client_) return;
+void RuleEditorPage::populateCustomTable(const QList<MixinRuleRow>& rows) {
+    QSignalBlocker sb(customTable_);
+    customTable_->setRowCount(0);
+    for (const auto& item : rows) {
+        addCustomRuleRow(item, -1);
+    }
+}
 
+void RuleEditorPage::addCustomRuleRow(const MixinRuleRow& item, int insertAt) {
+    const int row = (insertAt >= 0 && insertAt <= customTable_->rowCount()) ? insertAt : customTable_->rowCount();
+    customTable_->insertRow(row);
+
+    // Col 0: Rule Type Combo
+    auto* typeCombo = new QComboBox(customTable_);
+    for (const auto& m : kRuleTypes) {
+        typeCombo->addItem(uiText(m.zhLabel, m.enLabel), QString::fromLatin1(m.code));
+    }
+    const QString normType = item.type.trimmed().toUpper();
+    int typeIdx = typeCombo->findData(normType);
+    if (typeIdx < 0 && !normType.isEmpty()) {
+        typeCombo->addItem(normType, normType);
+        typeIdx = typeCombo->count() - 1;
+    }
+    typeCombo->setCurrentIndex(typeIdx >= 0 ? typeIdx : 0);
+    customTable_->setCellWidget(row, 0, typeCombo);
+
+    // Col 1: Payload Input
+    auto* payloadEdit = new QLineEdit(item.payload, customTable_);
+    const QString curType = typeCombo->currentData().toString();
+    payloadEdit->setPlaceholderText(payloadPlaceholderForType(curType));
+    payloadEdit->setEnabled(curType != QLatin1String("MATCH"));
+    customTable_->setCellWidget(row, 1, payloadEdit);
+
+    // Col 2: Target Outbound Combo
+    auto* targetCombo = new QComboBox(customTable_);
+    targetCombo->addItem(uiText("🚀 走代理 (跟随主策略组)", "🚀 Proxy (Primary Group)"), QStringLiteral("PROXY"));
+    targetCombo->addItem(uiText("🏠 直连 (DIRECT)", "🏠 DIRECT"), QStringLiteral("DIRECT"));
+    targetCombo->addItem(uiText("⛔ 拦截阻止 (REJECT)", "⛔ REJECT"), QStringLiteral("REJECT"));
+    for (const QString& g : proxyGroupChoices_) {
+        targetCombo->addItem(uiText("🎯 策略组: ", "🎯 Group: ") + g, g);
+    }
+    const QString normTarget = item.target.trimmed().isEmpty() ? QStringLiteral("PROXY") : item.target.trimmed();
+    int tIdx = targetCombo->findData(normTarget);
+    if (tIdx < 0) {
+        targetCombo->addItem(normTarget, normTarget);
+        tIdx = targetCombo->count() - 1;
+    }
+    targetCombo->setCurrentIndex(tIdx);
+    updateTargetComboStyle(targetCombo);
+    customTable_->setCellWidget(row, 2, targetCombo);
+
+    // Col 3: Order & Remove Action Buttons
+    auto* actWrap = new QWidget(customTable_);
+    actWrap->setObjectName(QStringLiteral("RuleActWrap"));
+    actWrap->setStyleSheet(QStringLiteral("QWidget#RuleActWrap { background: transparent; }"));
+    auto* actLay = new QHBoxLayout(actWrap);
+    actLay->setContentsMargins(6, 0, 6, 0);
+    actLay->setSpacing(6);
+    auto* upBtn = new QPushButton(QStringLiteral("↑"), actWrap);
+    auto* downBtn = new QPushButton(QStringLiteral("↓"), actWrap);
+    auto* delBtn = new QPushButton(uiText("删除", "Del"), actWrap);
+    upBtn->setFixedSize(32, 28);
+    downBtn->setFixedSize(32, 28);
+    delBtn->setMinimumWidth(58);
+    delBtn->setFixedHeight(28);
+    delBtn->setProperty("danger", true);
+    for (QPushButton* b : {upBtn, downBtn}) {
+        b->setStyleSheet(QStringLiteral("padding: 0; font-size: 12px; border-radius: 6px;"));
+    }
+    delBtn->setStyleSheet(QStringLiteral(
+        "QPushButton { background: #26161b; border: 1px solid #592632; color: #f87171;"
+        "  border-radius: 6px; padding: 3px 10px; font-size: 11px; font-weight: 600; }"
+        "QPushButton:hover { background: #361d25; }"));
+    actLay->addWidget(upBtn);
+    actLay->addWidget(downBtn);
+    actLay->addWidget(delBtn);
+    actLay->addStretch(1);
+    customTable_->setCellWidget(row, 3, actWrap);
+
+    auto findWidgetRow = [this](QWidget* w) -> int {
+        for (int r = 0; r < customTable_->rowCount(); ++r) {
+            for (int c = 0; c < customTable_->columnCount(); ++c) {
+                if (customTable_->cellWidget(r, c) == w) {
+                    return r;
+                }
+            }
+        }
+        return -1;
+    };
+
+    connect(typeCombo, &QComboBox::currentIndexChanged, this, [this, typeCombo, payloadEdit](int) {
+        const QString tp = typeCombo->currentData().toString();
+        payloadEdit->setPlaceholderText(payloadPlaceholderForType(tp));
+        payloadEdit->setEnabled(tp != QLatin1String("MATCH"));
+        if (!loading_) {
+            setDirty(true);
+        }
+    });
+    connect(payloadEdit, &QLineEdit::textChanged, this, [this](const QString&) {
+        if (!loading_) {
+            setDirty(true);
+        }
+    });
+    connect(targetCombo, &QComboBox::currentIndexChanged, this, [this, targetCombo](int) {
+        updateTargetComboStyle(targetCombo);
+        if (!loading_) {
+            setDirty(true);
+        }
+    });
+    connect(upBtn, &QPushButton::clicked, this, [this, actWrap, findWidgetRow]() {
+        const int r = findWidgetRow(actWrap);
+        if (r >= 0) {
+            moveCustomRow(r, -1);
+        }
+    });
+    connect(downBtn, &QPushButton::clicked, this, [this, actWrap, findWidgetRow]() {
+        const int r = findWidgetRow(actWrap);
+        if (r >= 0) {
+            moveCustomRow(r, +1);
+        }
+    });
+    connect(delBtn, &QPushButton::clicked, this, [this, actWrap, findWidgetRow]() {
+        const int r = findWidgetRow(actWrap);
+        if (r >= 0) {
+            removeCustomRow(r);
+        }
+    });
+}
+
+void RuleEditorPage::updateTargetComboStyle(QComboBox* combo) {
+    const QString target = combo->currentData().toString();
+    QString bg = QStringLiteral("#131d33");
+    QString border = QStringLiteral("#254170");
+    QString fg = QStringLiteral("#60a5fa");
+    if (target == QLatin1String("DIRECT")) {
+        bg = QStringLiteral("#13251f");
+        border = QStringLiteral("#20523c");
+        fg = QStringLiteral("#34d399");
+    } else if (target == QLatin1String("REJECT")) {
+        bg = QStringLiteral("#291519");
+        border = QStringLiteral("#5c242d");
+        fg = QStringLiteral("#f87171");
+    }
+    combo->setStyleSheet(QStringLiteral(
+                             "QComboBox { background: %1; border: 1px solid %2; border-radius: 14px;"
+                             "  color: %3; padding: 4px 12px; font-size: 12px; font-weight: 600; }"
+                             "QComboBox::drop-down { border: none; width: 18px; }")
+                             .arg(bg, border, fg));
+}
+
+QList<RuleEditorPage::MixinRuleRow> RuleEditorPage::collectCustomRules() const {
+    QList<MixinRuleRow> list;
+    list.reserve(customTable_->rowCount());
+    for (int r = 0; r < customTable_->rowCount(); ++r) {
+        auto* typeCombo = qobject_cast<QComboBox*>(customTable_->cellWidget(r, 0));
+        auto* payloadEdit = qobject_cast<QLineEdit*>(customTable_->cellWidget(r, 1));
+        auto* targetCombo = qobject_cast<QComboBox*>(customTable_->cellWidget(r, 2));
+        if (!typeCombo || !payloadEdit || !targetCombo) {
+            continue;
+        }
+        const QString tp = typeCombo->currentData().toString();
+        const QString pay = payloadEdit->text().trimmed();
+        if (tp != QLatin1String("MATCH") && pay.isEmpty()) {
+            continue;
+        }
+        list.push_back({tp, pay, targetCombo->currentData().toString()});
+    }
+    return list;
+}
+
+void RuleEditorPage::moveCustomRow(int row, int delta) {
+    const int dst = row + delta;
+    if (row < 0 || dst < 0 || dst >= customTable_->rowCount()) {
+        return;
+    }
+    auto readRow = [this](int r) -> MixinRuleRow {
+        auto* tc = qobject_cast<QComboBox*>(customTable_->cellWidget(r, 0));
+        auto* pe = qobject_cast<QLineEdit*>(customTable_->cellWidget(r, 1));
+        auto* oc = qobject_cast<QComboBox*>(customTable_->cellWidget(r, 2));
+        return {
+            tc ? tc->currentData().toString() : QStringLiteral("DOMAIN-SUFFIX"),
+            pe ? pe->text() : QString(),
+            oc ? oc->currentData().toString() : QStringLiteral("PROXY"),
+        };
+    };
+    const MixinRuleRow moved = readRow(row);
+    loading_ = true;
+    customTable_->removeRow(row);
+    addCustomRuleRow(moved, dst);
+    customTable_->selectRow(dst);
+    loading_ = false;
+    setDirty(true);
+}
+
+void RuleEditorPage::removeCustomRow(int row) {
+    if (row < 0 || row >= customTable_->rowCount()) {
+        return;
+    }
+    loading_ = true;
+    customTable_->removeRow(row);
+    loading_ = false;
+    setDirty(true);
+}
+
+void RuleEditorPage::saveMixin() {
+    if (!client_) {
+        return;
+    }
     QJsonObject params;
-    const bool saveAsRawYaml = (tabs_->currentIndex() == 1 && yamlModifiedSinceSync_) ||
-                               (yamlModifiedSinceSync_ && !visualModifiedSinceSync_);
-    if (saveAsRawYaml) {
+    if (currentTab_ == 1) {
         params.insert(QStringLiteral("mode"), QStringLiteral("yaml"));
         params.insert(QStringLiteral("yaml"), yamlEdit_->toPlainText());
     } else {
+        QJsonArray arr;
+        for (const auto& r : collectCustomRules()) {
+            QJsonObject o;
+            o.insert(QStringLiteral("type"), r.type);
+            o.insert(QStringLiteral("payload"), r.payload);
+            o.insert(QStringLiteral("target"), r.target);
+            arr.append(o);
+        }
         params.insert(QStringLiteral("mode"), QStringLiteral("visual"));
-        params.insert(QStringLiteral("base_yaml"), lastSyncedYaml_);
-        params.insert(QStringLiteral("bypass_cn_web"), bypassCNWebCheck_->isChecked());
-        params.insert(QStringLiteral("bypass_lan"), bypassLANCheck_->isChecked());
-        params.insert(QStringLiteral("rules"), serializeVisualRulesJson(true));
+        params.insert(QStringLiteral("base_yaml"), baseYamlCache_);
+        params.insert(QStringLiteral("bypass_cn_web"), cnSwitch_->isChecked());
+        params.insert(QStringLiteral("bypass_lan"), lanSwitch_->isChecked());
+        params.insert(QStringLiteral("rules"), arr);
     }
 
-    saveApplyBtn_->setEnabled(false);
-    saveApplyBtn_->setText(L("正在保存并热重载…", "Saving & Reloading…"));
-
+    saveBtn_->setEnabled(false);
     client_->call(QStringLiteral("save_profile_mixin"), params,
                   [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
-                      saveApplyBtn_->setEnabled(true);
-                      updateFooterButtonsForTab();
+                      saveBtn_->setEnabled(client_ && client_->isConnected() && currentTab_ != 2);
                       if (!ok) {
-                          QMessageBox::warning(this, L("保存配置补丁失败", "Failed to Save Config Patch"), err);
+                          QMessageBox::warning(window(), uiText("保存 Mixin 失败", "Save Mixin Failed"),
+                                               I18n::instance().translateBackendText(err));
                           return;
                       }
-                      if (data.isObject()) {
-                          applyMixinDocument(data.toObject(), true);
-                      }
-                      setDirty(false, L("✓ 已写入配置补丁 (.profile_mixin.yaml) 并立即生效",
-                                        "✓ Saved to Profile Mixin and hot-reloaded"));
-                      refreshEffectiveRules();
+                      applyDocument(data.toObject(), true);
+                      setDirty(false);
+                      ToastOverlay::show(
+                          window(),
+                          uiText("分流规则与全局补丁已保存并热重载生效", "Profile Mixin saved & applied"),
+                          PillTone::Green);
                   });
 }
 
-void RuleEditorDialog::onOpenMixinFolder() {
-    if (mixinFilePath_.isEmpty()) return;
-    const QFileInfo fi(mixinFilePath_);
-    QDesktopServices::openUrl(QUrl::fromLocalFile(fi.absolutePath()));
-}
-
-void RuleEditorDialog::applyEffectiveRulesData(const QJsonObject& obj, int preferredRuleIndex) {
-    effectiveRules_ = obj.value(QStringLiteral("rules")).toArray();
-    ruleProviders_ = obj.value(QStringLiteral("rule_providers")).toObject();
-    renderEffectiveTable(preferredRuleIndex);
-}
-
-void RuleEditorDialog::refreshEffectiveRules() {
-    if (!client_) return;
-    int keepRuleIdx = -1;
-    if (effTable_->currentRow() >= 0) {
-        if (const auto* it = effTable_->item(effTable_->currentRow(), 0)) {
-            const int orig = variantIntOr(it->data(Qt::UserRole), -1);
-            if (orig >= 0 && orig < effectiveRules_.size()) {
-                keepRuleIdx = effectiveRules_.at(orig).toObject().value(QStringLiteral("index")).toInt(-1);
-            }
-        }
+void RuleEditorPage::loadEffectiveRules() {
+    if (!client_ || !client_->isConnected()) {
+        return;
     }
-    refreshEffBtn_->setEnabled(false);
+    effRefreshBtn_->setEnabled(false);
     client_->call(QStringLiteral("get_effective_rules"), QJsonObject(),
-                  [this, keepRuleIdx](bool ok, const QJsonValue& data, const QString& err, const QString&) {
-                      refreshEffBtn_->setEnabled(true);
-                      if (!ok || !data.isObject()) {
-                          effSummaryLabel_->setText(err);
+                  [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+                      effRefreshBtn_->setEnabled(client_ && client_->isConnected());
+                      if (!ok) {
+                          ToastOverlay::show(window(), I18n::instance().translateBackendText(err), PillTone::Red);
                           return;
                       }
-                      applyEffectiveRulesData(data.toObject(), keepRuleIdx);
+                      effectiveRulesView_ = data.toObject();
+                      ruleProvidersMap_ = effectiveRulesView_.value(QStringLiteral("rule_providers")).toObject();
+                      retranslateUi();
+                      populateRuleProviderSelector();
                   });
 }
 
-void RuleEditorDialog::onFilterEffectiveRules(const QString&) {
-    renderEffectiveTable();
-}
+void RuleEditorPage::renderEffectiveRulesTable() {
+    const QJsonArray rules = effectiveRulesView_.value(QStringLiteral("rules")).toArray();
+    const QString filterText = effSearchEdit_->text().trimmed().toLower();
+    const QString sourceFilter = effSourceCombo_->currentData().toString();
 
-void RuleEditorDialog::renderEffectiveTable(int preferredRuleIndex) {
-    const QString kw = searchEdit_->text().trimmed().toLower();
-    suppressEffectiveItemSignals_ = true;
-    effTable_->setRowCount(0);
+    struct EffRow {
+        int index;
+        QString source;
+        QString type;
+        QString payload;
+        QString proxy;
+        qint64 hitCount;
+        qint64 missCount;
+        bool disabled;
+    };
+    QList<EffRow> filtered;
+    filtered.reserve(rules.size());
 
-    int shown = 0;
-    int disabledCount = 0;
-    int rowToSelect = -1;
+    for (const QJsonValue& v : rules) {
+        const QJsonObject o = v.toObject();
+        const QString src = o.value(QStringLiteral("source")).toString();
+        const QString tp = o.value(QStringLiteral("type")).toString();
+        const QString pay = o.value(QStringLiteral("payload")).toString();
+        const QString prx = o.value(QStringLiteral("proxy")).toString();
 
-    for (int i = 0; i < effectiveRules_.size(); ++i) {
-        const QJsonObject r = effectiveRules_.at(i).toObject();
-        const int idx = r.value(QStringLiteral("index")).toInt(i);
-        const QString tp = r.value(QStringLiteral("type")).toString();
-        const QString payload = r.value(QStringLiteral("payload")).toString();
-        const QString proxy = r.value(QStringLiteral("proxy")).toString();
-        const int size = r.value(QStringLiteral("size")).toInt(-1);
-        const bool disabled = r.value(QStringLiteral("disabled")).toBool(false);
-        const QString src = r.value(QStringLiteral("source")).toString();
-        const QString srcLabel = sourceDisplayLabel(src);
-        const qint64 hitCount = static_cast<qint64>(r.value(QStringLiteral("hit_count")).toDouble(0));
-
-        if (disabled) {
-            ++disabledCount;
+        if (!sourceFilter.isEmpty() && sourceFilter != QLatin1String("all") && src != sourceFilter) {
+            continue;
         }
-
-        if (!kw.isEmpty()) {
-            const QString hay = (tp + QLatin1Char(' ') + payload + QLatin1Char(' ') +
-                                 proxy + QLatin1Char(' ') + srcLabel)
-                                    .toLower();
-            bool providerHit = false;
-            if (ruleProviders_.contains(payload)) {
-                const QJsonArray pArr = ruleProviders_.value(payload).toObject().value(QStringLiteral("payload")).toArray();
-                for (const QJsonValue& pv : pArr) {
-                    if (pv.toString().toLower().contains(kw)) {
-                        providerHit = true;
-                        break;
-                    }
-                }
-            }
-            if (!hay.contains(kw) && !providerHit) {
+        if (!filterText.isEmpty()) {
+            const QString hay = (src + QLatin1Char(' ') + tp + QLatin1Char(' ') + pay + QLatin1Char(' ') + prx).toLower();
+            if (!hay.contains(filterText)) {
                 continue;
             }
         }
+        filtered.push_back({
+            o.value(QStringLiteral("index")).toInt(-1),
+            src,
+            tp,
+            pay,
+            prx,
+            static_cast<qint64>(o.value(QStringLiteral("hit_count")).toDouble(0)),
+            static_cast<qint64>(o.value(QStringLiteral("miss_count")).toDouble(0)),
+            o.value(QStringLiteral("disabled")).toBool(false),
+        });
+    }
 
-        const int row = effTable_->rowCount();
-        effTable_->insertRow(row);
+    effCountPill_->setPill(
+        QString::number(filtered.size()) + QStringLiteral(" / ") + QString::number(rules.size()), PillTone::Blue);
 
-        // Column 0: Live Enable/Disable checkbox + 1-based rule index
-        auto* idxItem = new QTableWidgetItem(QString::number(idx + 1));
-        idxItem->setData(Qt::UserRole, i);
-        idxItem->setData(Qt::UserRole + 1, idx);
-        idxItem->setCheckState(disabled ? Qt::Unchecked : Qt::Checked);
-        if (src == QStringLiteral("system") || payload == QStringLiteral("clashfx-internal-direct")) {
-            idxItem->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled);
-            idxItem->setToolTip(L("系统防环回守护规则固定开启，防止内核流量死循环",
-                                  "System loop-prevention guard is permanently enabled"));
+    togglingRule_ = true;
+    effTable_->setRowCount(static_cast<int>(filtered.size()));
+    for (int i = 0; i < filtered.size(); ++i) {
+        const EffRow& r = filtered.at(i);
+        const bool isSystemGuard = (r.source == QLatin1String("system") || r.payload == QLatin1String("clashfx-internal-direct"));
+
+        auto* chk = new QTableWidgetItem();
+        chk->setData(Qt::UserRole + 1, r.index);
+        chk->setData(Qt::UserRole + 2, r.source);
+        chk->setData(Qt::UserRole + 3, r.payload);
+        if (isSystemGuard) {
+            chk->setFlags(Qt::ItemIsSelectable);
+            chk->setCheckState(Qt::Checked);
+            chk->setToolTip(uiText("系统防环回守护规则不可禁用", "System loop-guard rule cannot be disabled"));
         } else {
-            idxItem->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable);
-            if (payload == QStringLiteral("clashfx-ai-lock")) {
-                idxItem->setToolTip(L("动态开关 AI 锁定顶层规则（配对的防泄漏 REJECT 规则会自动同步切换；内核重载后恢复）",
-                                      "Dynamically toggle AI Lock rule pair in memory (restored on reload)"));
-            } else {
-                idxItem->setToolTip(L("勾选/取消勾选可实时启用或停用此规则（内核重载后恢复）",
-                                      "Toggle live rule evaluation in Mihomo memory"));
-            }
+            chk->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsUserCheckable);
+            chk->setCheckState(r.disabled ? Qt::Unchecked : Qt::Checked);
         }
-        effTable_->setItem(row, 0, idxItem);
+        effTable_->setItem(i, 0, chk);
 
-        auto* srcItem = new QTableWidgetItem(srcLabel);
-        srcItem->setForeground(disabled ? QColor(QStringLiteral("#71717a")) : sourceBadgeColor(src));
-        QFont f = srcItem->font();
-        f.setBold(true);
-        f.setStrikeOut(disabled);
-        srcItem->setFont(f);
-        effTable_->setItem(row, 1, srcItem);
+        auto* srcItem = new QTableWidgetItem(sourceDisplayLabel(r.source));
+        srcItem->setTextAlignment(Qt::AlignCenter);
+        srcItem->setData(kPillToneRole, static_cast<int>(sourcePillTone(r.source)));
+        effTable_->setItem(i, 1, srcItem);
 
-        const QJsonObject provObj = ruleProviders_.value(payload).toObject();
-        const bool isEditableProv = provObj.value(QStringLiteral("editable")).toBool(false);
-        QString displayPayload = payload.isEmpty() ? QStringLiteral("*") : payload;
-        if (isEditableProv) {
-            displayPayload += L("  [可编辑 .list]", "  [Editable .list]");
-        }
+        auto* typeItem = new QTableWidgetItem(r.type);
+        typeItem->setForeground(QColor(r.disabled ? QStringLiteral("#6b7280") : QStringLiteral("#9ca3af")));
+        effTable_->setItem(i, 2, typeItem);
 
-        auto* tpItem = new QTableWidgetItem(tp);
-        auto* plItem = new QTableWidgetItem(displayPayload);
-        auto* pxItem = new QTableWidgetItem(proxy);
+        auto* payItem = new QTableWidgetItem(r.payload);
+        payItem->setForeground(QColor(r.disabled ? QStringLiteral("#6b7280") : QStringLiteral("#f3f4f6")));
+        effTable_->setItem(i, 3, payItem);
 
-        QString statText;
-        if (disabled) {
-            statText = L("已临时停用", "Disabled");
-        }
-        if (ruleProviders_.contains(payload)) {
-            const int cnt = provObj.value(QStringLiteral("rule_count")).toInt(size);
-            if (!statText.isEmpty()) statText += QStringLiteral(" | ");
-            statText += L("%1 条子规则", "%1 sub-rules").arg(cnt);
-        } else if (size > 0) {
-            if (!statText.isEmpty()) statText += QStringLiteral(" | ");
-            statText += QString::number(size);
-        }
-        if (hitCount > 0) {
-            if (!statText.isEmpty()) statText += QStringLiteral(" | ");
-            statText += L("命中 %1", "Hits %1").arg(hitCount);
-        }
-        auto* stItem = new QTableWidgetItem(statText);
+        auto* prxItem = new QTableWidgetItem(r.proxy);
+        prxItem->setForeground(QColor(r.disabled ? QStringLiteral("#6b7280") : QStringLiteral("#93c5fd")));
+        effTable_->setItem(i, 4, prxItem);
 
-        for (QTableWidgetItem* cell : {tpItem, plItem, pxItem, stItem}) {
-            if (disabled) {
-                QFont cf = cell->font();
-                cf.setStrikeOut(true);
-                cell->setFont(cf);
-                cell->setForeground(QColor(QStringLiteral("#71717a")));
-            }
-        }
-        if (isEditableProv && !disabled) {
-            plItem->setForeground(QColor(QStringLiteral("#34d399")));
-            QFont pf = plItem->font();
-            pf.setBold(true);
-            plItem->setFont(pf);
-        }
-
-        effTable_->setItem(row, 2, tpItem);
-        effTable_->setItem(row, 3, plItem);
-        effTable_->setItem(row, 4, pxItem);
-        effTable_->setItem(row, 5, stItem);
-
-        if (preferredRuleIndex >= 0 && idx == preferredRuleIndex) {
-            rowToSelect = row;
-        }
-        ++shown;
+        auto* hitItem = new QTableWidgetItem(QStringLiteral("%1 / %2").arg(r.hitCount).arg(r.missCount));
+        hitItem->setForeground(QColor(QStringLiteral("#9ca3af")));
+        hitItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        effTable_->setItem(i, 5, hitItem);
     }
-
-    suppressEffectiveItemSignals_ = false;
-
-    QString summary = L("共 %1 条顶层规则（显示 %2 条）", "%1 top-level rules (%2 shown)")
-                          .arg(effectiveRules_.size())
-                          .arg(shown);
-    if (disabledCount > 0) {
-        summary += L(" · 已临时停用 %1 条", " · %1 temporarily disabled").arg(disabledCount);
-    }
-    effSummaryLabel_->setText(summary);
-
-    if (effTable_->rowCount() > 0) {
-        effTable_->selectRow(rowToSelect >= 0 ? rowToSelect : 0);
-    } else if (!rulesetDirty_) {
-        activeEditableProvider_.clear();
-        activeRulesetFilePath_.clear();
-        openRulesetFolderBtn_->setVisible(false);
-        resetRulesetBtn_->setVisible(false);
-        saveRulesetBtn_->setVisible(false);
-        providerDetailEdit_->setReadOnly(true);
-        providerDetailEdit_->clear();
-    }
+    togglingRule_ = false;
 }
 
-void RuleEditorDialog::onEffectiveItemChanged(QTableWidgetItem* item) {
-    if (suppressEffectiveItemSignals_ || !item || item->column() != 0 || !client_) return;
+void RuleEditorPage::populateRuleProviderSelector() {
+    QStringList editableNames;
+    QStringList readonlyNames;
+    for (auto it = ruleProvidersMap_.constBegin(); it != ruleProvidersMap_.constEnd(); ++it) {
+        const QJsonObject pv = it.value().toObject();
+        if (pv.value(QStringLiteral("editable")).toBool(false)) {
+            editableNames.push_back(it.key());
+        } else {
+            readonlyNames.push_back(it.key());
+        }
+    }
+    editableNames.sort();
+    readonlyNames.sort();
+    const QStringList allNames = editableNames + readonlyNames;
 
-    const int ruleIndex = variantIntOr(item->data(Qt::UserRole + 1), -1);
-    if (ruleIndex < 0) return;
-
-    const bool wantDisabled = (item->checkState() != Qt::Checked);
-
-    QJsonObject params;
-    QJsonArray indices;
-    indices.append(ruleIndex);
-    params.insert(QStringLiteral("indices"), indices);
-    params.insert(QStringLiteral("disabled"), wantDisabled);
-
-    effTable_->setEnabled(false);
-    client_->call(QStringLiteral("set_rule_disabled"), params,
-                  [this, ruleIndex, wantDisabled](bool ok, const QJsonValue& data, const QString& err, const QString&) {
-                      effTable_->setEnabled(true);
-                      if (!ok) {
-                          QMessageBox::warning(this, L("动态切换规则失败", "Failed to Toggle Rule"), err);
-                          refreshEffectiveRules();
-                          return;
-                      }
-                      if (data.isObject()) {
-                          applyEffectiveRulesData(data.toObject(), ruleIndex);
-                      }
-                      statusLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-weight: 600;"));
-                      statusLabel_->setText(
-                          wantDisabled
-                              ? L("✓ 已实时停用顶层规则 #%1（内存即时生效，重载配置后恢复启用）",
-                                  "✓ Rule #%1 disabled live in memory (restored on reload)")
-                                    .arg(ruleIndex + 1)
-                              : L("✓ 已恢复启用顶层规则 #%1",
-                                  "✓ Rule #%1 re-enabled")
-                                    .arg(ruleIndex + 1));
-                  });
+    loading_ = true;
+    rsProviderCombo_->clear();
+    for (const QString& n : allNames) {
+        rsProviderCombo_->addItem(n, n);
+    }
+    if (!currentProviderName_.isEmpty() && allNames.contains(currentProviderName_)) {
+        rsProviderCombo_->setCurrentText(currentProviderName_);
+    } else if (!allNames.isEmpty()) {
+        currentProviderName_ = allNames.first();
+        rsProviderCombo_->setCurrentIndex(0);
+    }
+    loading_ = false;
+    loadSelectedProviderIntoEditor();
 }
 
-void RuleEditorDialog::onEffectiveSelectionChanged() {
-    const int row = effTable_->currentRow();
-    if (row < 0) return;
+void RuleEditorPage::loadSelectedProviderIntoEditor() {
+    const QString name = rsProviderCombo_->currentText();
+    currentProviderName_ = name;
+    const QJsonObject pv = ruleProvidersMap_.value(name).toObject();
+    const bool editable = pv.value(QStringLiteral("editable")).toBool(false);
+    const bool canReset = pv.value(QStringLiteral("can_reset")).toBool(false);
+    const QString behavior = pv.value(QStringLiteral("behavior")).toString();
+    const int count = pv.value(QStringLiteral("rule_count")).toInt(0);
+    const QString filePath = pv.value(QStringLiteral("file_path")).toString();
 
-    const QTableWidgetItem* idxItem = effTable_->item(row, 0);
-    if (!idxItem) return;
-    bool convOk = false;
-    const int origIdx = idxItem->data(Qt::UserRole).toInt(&convOk);
-    if (!convOk || origIdx < 0 || origIdx >= effectiveRules_.size()) return;
+    rsBehaviorPill_->setPill(behavior.isEmpty() ? QStringLiteral("RuleSet") : behavior,
+                             editable ? PillTone::Blue : PillTone::Muted);
+    rsCountPill_->setPill(QString::number(count) + uiText(" 条规则", " rules"), PillTone::Green);
+    rsPathLbl_->setText(rsPathLbl_->fontMetrics().elidedText(filePath, Qt::ElideMiddle, 220));
+    rsPathLbl_->setToolTip(filePath);
 
-    const QJsonObject r = effectiveRules_.at(origIdx).toObject();
-    const QString nextPayload = r.value(QStringLiteral("payload")).toString();
-
-    // Keep unsaved .list edits intact if switching between paired clashfx-ai-lock rows;
-    // prompt before discarding if switching away from an edited ruleset!
-    if (rulesetDirty_ && !activeEditableProvider_.isEmpty() && nextPayload != activeEditableProvider_) {
-        const auto ans = QMessageBox::question(
-            this,
-            windowTitle(),
-            L("本地规则集 %1 有未保存的修改，确定放弃这些修改并切换查看其他规则吗？",
-              "Ruleset %1 has unsaved changes. Discard them and switch rows?")
-                .arg(activeEditableProvider_),
-            QMessageBox::Yes | QMessageBox::No,
-            QMessageBox::No);
-        if (ans == QMessageBox::No) {
-            if (lastSelectedEffOrigIdx_ >= 0) {
-                for (int rIdx = 0; rIdx < effTable_->rowCount(); ++rIdx) {
-                    if (effTable_->item(rIdx, 0) &&
-                        variantIntOr(effTable_->item(rIdx, 0)->data(Qt::UserRole), -1) == lastSelectedEffOrigIdx_) {
-                        effTable_->blockSignals(true);
-                        effTable_->selectRow(rIdx);
-                        effTable_->blockSignals(false);
-                        break;
-                    }
-                }
-            }
-            return;
+    QString content = pv.value(QStringLiteral("raw_text")).toString();
+    if (content.isEmpty()) {
+        const QJsonArray pl = pv.value(QStringLiteral("payload")).toArray();
+        QStringList lines;
+        lines.reserve(pl.size());
+        for (const QJsonValue& v : pl) {
+            lines.push_back(v.toString());
         }
-        setRulesetDirty(false);
+        content = lines.join(QLatin1Char('\n'));
     }
 
-    lastSelectedEffOrigIdx_ = origIdx;
-    loadDetailForRuleObject(r, false);
+    loading_ = true;
+    rsEdit_->setPlainText(content);
+    rsEdit_->setReadOnly(!editable);
+    loading_ = false;
+    setRulesetDirty(false);
+
+    const bool connected = client_ && client_->isConnected();
+    rsSaveBtn_->setEnabled(connected && editable);
+    rsResetBtn_->setEnabled(connected && canReset);
 }
 
-void RuleEditorDialog::loadDetailForRuleObject(const QJsonObject& r, bool forceReloadEditor) {
-    const QString tp = r.value(QStringLiteral("type")).toString();
-    const QString payload = r.value(QStringLiteral("payload")).toString();
-    const QString proxy = r.value(QStringLiteral("proxy")).toString();
-    const QString src = sourceDisplayLabel(r.value(QStringLiteral("source")).toString());
-
-    const QJsonObject rp = ruleProviders_.value(payload).toObject();
-    const bool editable = rp.value(QStringLiteral("editable")).toBool(false);
-
-    if (editable) {
-        const int ruleCount = rp.value(QStringLiteral("rule_count")).toInt(0);
-        const QString filePath = rp.value(QStringLiteral("file_path")).toString();
-        const QString rawText = rp.value(QStringLiteral("raw_text")).toString();
-
-        openRulesetFolderBtn_->setVisible(true);
-        resetRulesetBtn_->setVisible(rp.value(QStringLiteral("can_reset")).toBool(true));
-        saveRulesetBtn_->setVisible(true);
-
-        providerMetaLabel_->setStyleSheet(QStringLiteral("color: #34d399; font-weight: 600; font-size: 12px;"));
-        providerMetaLabel_->setText(
-            L("本地可编辑规则集：%1（当前生效 %2 条）— 每行一条 TYPE,VALUE，无需写出口目标",
-              "Editable local ruleset: %1 (%2 active rules) — one TYPE,VALUE per line, no target needed")
-                .arg(payload)
-                .arg(ruleCount));
-
-        providerDetailEdit_->setReadOnly(false);
-        providerDetailEdit_->setStyleSheet(QStringLiteral(
-            "QPlainTextEdit { background-color: #18181b; color: #f4f4f5; border: 1px solid #10b981; border-radius: 4px; }"));
-
-        if (forceReloadEditor || activeEditableProvider_ != payload || !rulesetDirty_) {
-            activeEditableProvider_ = payload;
-            activeRulesetFilePath_ = filePath;
-            suppressRulesetSignals_ = true;
-            providerDetailEdit_->setPlainText(rawText);
-            suppressRulesetSignals_ = false;
-            setRulesetDirty(false);
-        }
+void RuleEditorPage::saveSelectedRuleProvider() {
+    if (!client_ || currentProviderName_.isEmpty()) {
         return;
     }
-
-    activeEditableProvider_.clear();
-    activeRulesetFilePath_ = rp.value(QStringLiteral("file_path")).toString();
-    openRulesetFolderBtn_->setVisible(!activeRulesetFilePath_.isEmpty());
-    resetRulesetBtn_->setVisible(false);
-    saveRulesetBtn_->setVisible(false);
-
-    providerMetaLabel_->setStyleSheet(QStringLiteral("color: #a1a1aa; font-size: 12px;"));
-    if (payload == QStringLiteral("clashfx-internal-direct")) {
-        providerMetaLabel_->setText(
-            L("只读预览：ClashFX 内核自身防环回守护规则集（固定直连，不可修改或禁用，防止 TUN 流量死循环）",
-              "Read-only: ClashFX internal self-loop guard (permanently DIRECT to prevent TUN deadlocks)"));
-    } else {
-        providerMetaLabel_->setText(
-            L("只读预览（如需长期增删网站或软件分流，请切至「可视化分流」标签页；上方首列勾选框可临时开关此规则）",
-              "Read-only preview (use 'Visual Rules' tab to add persistent rules, or toggle 'On / #' above)"));
-    }
-
-    providerDetailEdit_->setReadOnly(true);
-    providerDetailEdit_->setStyleSheet(QStringLiteral(
-        "QPlainTextEdit { background-color: #1f1f23; color: #d4d4d8; border: 1px solid #3f3f46; border-radius: 4px; }"));
-
-    QStringList lines;
-    lines << QStringLiteral("[%1]  %2,%3%4")
-                 .arg(src, tp, payload.isEmpty() ? QString() : (payload + QStringLiteral(",")), proxy);
-
-    if (ruleProviders_.contains(payload)) {
-        const QString behavior = rp.value(QStringLiteral("behavior")).toString();
-        const QString vehicle = rp.value(QStringLiteral("vehicle_type")).toString();
-        const QJsonArray inner = rp.value(QStringLiteral("payload")).toArray();
-        const int ruleCount = rp.value(QStringLiteral("rule_count")).toInt(inner.size());
-
-        lines << QString();
-        lines << L("=== 规则集 %1（类型: %2 / %3，共 %4 条子规则）===",
-                   "=== Rule-Set %1 (%2 / %3, %4 entries) ===")
-                     .arg(payload, vehicle, behavior)
-                     .arg(ruleCount);
-        for (int k = 0; k < inner.size(); ++k) {
-            lines << QStringLiteral("  %1. %2").arg(k + 1, 2).arg(inner.at(k).toString());
-        }
-    }
-
-    suppressRulesetSignals_ = true;
-    providerDetailEdit_->setPlainText(lines.join(QLatin1Char('\n')));
-    suppressRulesetSignals_ = false;
-}
-
-void RuleEditorDialog::onSaveRulesetProvider() {
-    if (!client_ || activeEditableProvider_.isEmpty()) return;
-
-    const QString providerName = activeEditableProvider_;
     QJsonObject params;
-    params.insert(QStringLiteral("provider_name"), providerName);
-    params.insert(QStringLiteral("content"), providerDetailEdit_->toPlainText());
+    params.insert(QStringLiteral("provider_name"), currentProviderName_);
+    params.insert(QStringLiteral("content"), rsEdit_->toPlainText());
 
-    int keepRuleIdx = -1;
-    if (effTable_->currentRow() >= 0 && effTable_->item(effTable_->currentRow(), 0)) {
-        keepRuleIdx = variantIntOr(effTable_->item(effTable_->currentRow(), 0)->data(Qt::UserRole + 1), -1);
-    }
-
-    saveRulesetBtn_->setEnabled(false);
-    saveRulesetBtn_->setText(L("正在热更新…", "Hot-Updating…"));
-
+    rsSaveBtn_->setEnabled(false);
     client_->call(QStringLiteral("save_rule_provider"), params,
-                  [this, providerName, keepRuleIdx](bool ok, const QJsonValue& data, const QString& err, const QString&) {
-                      saveRulesetBtn_->setEnabled(true);
-                      saveRulesetBtn_->setText(L("保存并热更新规则集", "Save & Hot-Update Ruleset"));
+                  [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+                      rsSaveBtn_->setEnabled(client_ && client_->isConnected());
                       if (!ok) {
-                          QMessageBox::warning(this, L("保存规则集失败", "Failed to Save Ruleset"), err);
+                          QMessageBox::warning(window(), uiText("热更新规则集失败", "Hot-Reload Failed"),
+                                               I18n::instance().translateBackendText(err));
                           return;
                       }
+                      effectiveRulesView_ = data.toObject();
+                      ruleProvidersMap_ = effectiveRulesView_.value(QStringLiteral("rule_providers")).toObject();
                       setRulesetDirty(false);
-                      if (data.isObject()) {
-                          applyEffectiveRulesData(data.toObject(), keepRuleIdx);
-                      }
-                      const int newCnt = ruleProviders_.value(providerName)
-                                             .toObject()
-                                             .value(QStringLiteral("rule_count"))
-                                             .toInt(0);
-                      setRulesetDirty(false,
-                                      L("✓ 已保存 %1（共 %2 条子规则）并完成零断流热更新！",
-                                        "✓ Saved %1 (%2 rules) and hot-updated in 0ms!")
-                                          .arg(providerName)
-                                          .arg(newCnt));
+                      renderEffectiveRulesTable();
+                      loadSelectedProviderIntoEditor();
+                      ToastOverlay::show(
+                          window(),
+                          uiText("已写入并零断流热更新规则集 ", "Saved & hot-reloaded ruleset ") +
+                              currentProviderName_,
+                          PillTone::Green);
                   });
 }
 
-void RuleEditorDialog::onResetRulesetProvider() {
-    if (!client_ || activeEditableProvider_.isEmpty()) return;
-
-    const QString providerName = activeEditableProvider_;
-    const auto ans = QMessageBox::question(
-        this,
-        windowTitle(),
-        L("确定将规则集 %1 恢复为 ClashFX 默认清单并立即热更新吗？（你自定义的增删条目将被覆盖）",
-          "Reset ruleset %1 to ClashFX defaults and hot-update immediately?")
-            .arg(providerName),
-        QMessageBox::Yes | QMessageBox::No,
-        QMessageBox::No);
-    if (ans != QMessageBox::Yes) return;
-
-    int keepRuleIdx = -1;
-    if (effTable_->currentRow() >= 0 && effTable_->item(effTable_->currentRow(), 0)) {
-        keepRuleIdx = variantIntOr(effTable_->item(effTable_->currentRow(), 0)->data(Qt::UserRole + 1), -1);
-    }
-
-    QJsonObject params;
-    params.insert(QStringLiteral("provider_name"), providerName);
-
-    resetRulesetBtn_->setEnabled(false);
-    client_->call(QStringLiteral("reset_rule_provider"), params,
-                  [this, providerName, keepRuleIdx](bool ok, const QJsonValue& data, const QString& err, const QString&) {
-                      resetRulesetBtn_->setEnabled(true);
-                      if (!ok) {
-                          QMessageBox::warning(this, L("恢复默认清单失败", "Failed to Reset Ruleset"), err);
-                          return;
-                      }
-                      setRulesetDirty(false);
-                      if (data.isObject()) {
-                          applyEffectiveRulesData(data.toObject(), keepRuleIdx);
-                          if (effTable_->currentRow() >= 0 && effTable_->item(effTable_->currentRow(), 0)) {
-                              const int orig = variantIntOr(effTable_->item(effTable_->currentRow(), 0)->data(Qt::UserRole), -1);
-                              if (orig >= 0 && orig < effectiveRules_.size()) {
-                                  loadDetailForRuleObject(effectiveRules_.at(orig).toObject(), true);
-                              }
-                          }
-                      }
-                      setRulesetDirty(false,
-                                      L("✓ 已将 %1 恢复为默认清单并热更新生效",
-                                        "✓ Reset %1 to default list and hot-updated")
-                                          .arg(providerName));
-                  });
-}
-
-void RuleEditorDialog::onOpenRulesetFolder() {
-    if (activeRulesetFilePath_.isEmpty()) return;
-    const QFileInfo fi(activeRulesetFilePath_);
-    QDesktopServices::openUrl(QUrl::fromLocalFile(fi.absolutePath()));
-}
-
-void RuleEditorDialog::selectTab(int index) {
-    if (!tabs_ || index < 0 || index >= tabs_->count()) return;
-    tabs_->setCurrentIndex(index);
-}
-
-void RuleEditorDialog::closeEvent(QCloseEvent* event) {
-    if (!dirty_ && !rulesetDirty_) {
-        event->accept();
+void RuleEditorPage::resetSelectedRuleProvider() {
+    if (!client_ || currentProviderName_.isEmpty()) {
         return;
     }
     const auto ans = QMessageBox::question(
-        this,
-        windowTitle(),
-        L("当前有未保存的配置补丁或规则集修改，确定放弃并关闭吗？",
-          "You have unsaved Config Patch or Ruleset changes. Discard and close?"),
-        QMessageBox::Yes | QMessageBox::No,
-        QMessageBox::No);
-    if (ans == QMessageBox::Yes) {
-        event->accept();
-    } else {
-        event->ignore();
+        window(), uiText("恢复内置默认规则集", "Reset Ruleset to Default"),
+        uiText("确认将内置规则集 ", "Reset ") + currentProviderName_ +
+            uiText(" 恢复为默认内置规则并立即热更新吗？", " to built-in defaults and hot-reload now?"));
+    if (ans != QMessageBox::Yes) {
+        return;
     }
+
+    QJsonObject params;
+    params.insert(QStringLiteral("provider_name"), currentProviderName_);
+    rsResetBtn_->setEnabled(false);
+    client_->call(QStringLiteral("reset_rule_provider"), params,
+                  [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+                      rsResetBtn_->setEnabled(client_ && client_->isConnected());
+                      if (!ok) {
+                          QMessageBox::warning(window(), uiText("恢复默认失败", "Reset Failed"),
+                                               I18n::instance().translateBackendText(err));
+                          return;
+                      }
+                      effectiveRulesView_ = data.toObject();
+                      ruleProvidersMap_ = effectiveRulesView_.value(QStringLiteral("rule_providers")).toObject();
+                      setRulesetDirty(false);
+                      renderEffectiveRulesTable();
+                      loadSelectedProviderIntoEditor();
+                      ToastOverlay::show(
+                          window(),
+                          uiText("已恢复默认规则集并零断流生效", "Reset ruleset to defaults & hot-reloaded"),
+                          PillTone::Blue);
+                  });
 }
 
-} // namespace clashfx
+}  // namespace clashfx

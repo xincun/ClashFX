@@ -21,6 +21,7 @@ public:
                             const QString& apiSecret,
                             const QString& dashboardUrl,
                             bool aiLocked = false);
+    void setPageActive(bool active);
     void reloadDashboard();
     void retryInitialize();
 
@@ -44,6 +45,7 @@ private:
     static QString buildRulesSnapshotJS(int port, const QString& staleMessage, bool aiLocked);
 
     bool initStarted_ = false;
+    bool pageActive_ = true;
     bool staticScriptsInstalled_ = false;
     int apiPort_ = 0;
     QString apiSecret_;

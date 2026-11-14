@@ -1,10 +1,12 @@
 #include "DaemonClient.h"
 #include "I18n.h"
+#include "ModernWidgets.h"
 #include "TrayController.h"
 #include "TrayIconGenerator.h"
 
 #include <QApplication>
 #include <QColor>
+#include <QFont>
 #include <QLocalSocket>
 #include <QPalette>
 #include <QStyleFactory>
@@ -24,54 +26,85 @@ void applyUnifiedDarkTheme(QApplication& app) {
         QApplication::setStyle(QStringLiteral("Fusion"));
     }
 
+    QFont appFont(QStringLiteral("Microsoft YaHei UI"));
+    appFont.setFamilies({QStringLiteral("Microsoft YaHei UI"), QStringLiteral("Segoe UI"), QStringLiteral("PingFang SC")});
+    appFont.setPointSize(9);
+    app.setFont(appFont);
+
     QPalette pal;
-    pal.setColor(QPalette::Window, QColor(0x18, 0x18, 0x1b));
+    pal.setColor(QPalette::Window, QColor(0x14, 0x15, 0x1a));
     pal.setColor(QPalette::WindowText, QColor(0xf4, 0xf4, 0xf5));
-    pal.setColor(QPalette::Base, QColor(0x1f, 0x1f, 0x23));
-    pal.setColor(QPalette::AlternateBase, QColor(0x27, 0x27, 0x2a));
-    pal.setColor(QPalette::ToolTipBase, QColor(0x27, 0x27, 0x2a));
+    pal.setColor(QPalette::Base, QColor(0x18, 0x1a, 0x22));
+    pal.setColor(QPalette::AlternateBase, QColor(0x1c, 0x1f, 0x29));
+    pal.setColor(QPalette::ToolTipBase, QColor(0x1e, 0x20, 0x2a));
     pal.setColor(QPalette::ToolTipText, QColor(0xf4, 0xf4, 0xf5));
-    pal.setColor(QPalette::Text, QColor(0xf4, 0xf4, 0xf5));
-    pal.setColor(QPalette::Button, QColor(0x27, 0x27, 0x2a));
-    pal.setColor(QPalette::ButtonText, QColor(0xf4, 0xf4, 0xf5));
+    pal.setColor(QPalette::Text, QColor(0xf1, 0xf5, 0xf9));
+    pal.setColor(QPalette::Button, QColor(0x21, 0x23, 0x2d));
+    pal.setColor(QPalette::ButtonText, QColor(0xe2, 0xe8, 0xf0));
     pal.setColor(QPalette::BrightText, QColor(0xff, 0xff, 0xff));
     pal.setColor(QPalette::Link, QColor(0x60, 0xa5, 0xfa));
     pal.setColor(QPalette::Highlight, QColor(0x25, 0x63, 0xeb));
     pal.setColor(QPalette::HighlightedText, QColor(0xff, 0xff, 0xff));
-    pal.setColor(QPalette::PlaceholderText, QColor(0x71, 0x71, 0x7a));
-    pal.setColor(QPalette::Disabled, QPalette::WindowText, QColor(0x71, 0x71, 0x7a));
-    pal.setColor(QPalette::Disabled, QPalette::Text, QColor(0x71, 0x71, 0x7a));
-    pal.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(0x71, 0x71, 0x7a));
+    pal.setColor(QPalette::PlaceholderText, QColor(0x64, 0x74, 0x8b));
+    pal.setColor(QPalette::Disabled, QPalette::WindowText, QColor(0x64, 0x74, 0x8b));
+    pal.setColor(QPalette::Disabled, QPalette::Text, QColor(0x64, 0x74, 0x8b));
+    pal.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(0x64, 0x74, 0x8b));
     app.setPalette(pal);
 
     app.setStyleSheet(QStringLiteral(
-        "QDialog, QMainWindow { background-color: #18181b; color: #f4f4f5; }"
-        "QGroupBox { border: 1px solid #2e2e33; border-radius: 6px; margin-top: 10px; padding-top: 8px; font-weight: 600; color: #e4e4e7; }"
-        "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
-        "QTabWidget::pane { border: 1px solid #2e2e33; border-radius: 6px; background-color: #18181b; }"
-        "QTabBar::tab { background-color: #222226; color: #a1a1aa; border: 1px solid #2e2e33; border-bottom: none; "
-        "border-top-left-radius: 6px; border-top-right-radius: 6px; padding: 6px 14px; margin-right: 2px; }"
-        "QTabBar::tab:selected { background-color: #27272a; color: #f4f4f5; font-weight: 600; }"
-        "QTabBar::tab:hover:!selected { background-color: #27272a; color: #e4e4e7; }"
+        "QDialog, QMainWindow { background-color: #14151a; color: #f4f4f5; }"
+        "QMessageBox { background-color: #181a22; color: #f4f4f5; }"
+        "QScrollArea { background-color: transparent; border: none; }"
+        "QScrollArea > QWidget > QWidget { background-color: transparent; }"
+        "QGroupBox { background-color: #1a1c24; border: 1px solid #272a36; border-radius: 10px; "
+        "margin-top: 12px; padding: 14px 12px 12px 12px; font-weight: 600; color: #e2e8f0; }"
+        "QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f1f5f9; }"
         "QLineEdit, QPlainTextEdit, QSpinBox, QComboBox, QKeySequenceEdit { "
-        "background-color: #222226; color: #f4f4f5; border: 1px solid #3f3f46; border-radius: 5px; padding: 4px 8px; selection-background-color: #2563eb; }"
-        "QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QComboBox:focus, QKeySequenceEdit:focus { border-color: #3b82f6; }"
-        "QComboBox QAbstractItemView { background-color: #222226; color: #f4f4f5; selection-background-color: #2563eb; border: 1px solid #3f3f46; }"
-        "QPushButton { background-color: #27272a; color: #f4f4f5; border: 1px solid #3f3f46; border-radius: 6px; padding: 5px 12px; }"
-        "QPushButton:hover { background-color: #323238; border-color: #52525b; }"
-        "QPushButton:pressed { background-color: #3f3f46; }"
-        "QPushButton:default { background-color: #2563eb; border-color: #1d4ed8; color: #ffffff; font-weight: 600; }"
-        "QPushButton:default:hover { background-color: #1d4ed8; }"
-        "QPushButton:disabled { background-color: #202024; color: #52525b; border-color: #27272a; }"
-        "QTableView, QTableWidget { background-color: #1c1c20; alternate-background-color: #222227; color: #f4f4f5; "
-        "gridline-color: #2e2e33; border: 1px solid #2e2e33; border-radius: 6px; selection-background-color: #1d4ed8; selection-color: #ffffff; }"
-        "QHeaderView::section { background-color: #27272a; color: #d4d4d8; border: none; border-right: 1px solid #323238; border-bottom: 1px solid #323238; padding: 5px 8px; font-weight: 600; }"
-        "QMenu { background-color: #1f1f23; color: #f4f4f5; border: 1px solid #3f3f46; padding: 4px; }"
-        "QMenu::item { padding: 5px 24px 5px 24px; border-radius: 4px; }"
+        "background-color: #14161d; color: #f1f5f9; border: 1px solid #303444; border-radius: 6px; "
+        "padding: 5px 10px; selection-background-color: #2563eb; }"
+        "QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QComboBox:focus, QKeySequenceEdit:focus { "
+        "border-color: #3b82f6; }"
+        "QComboBox::drop-down { border: none; width: 22px; }"
+        "QComboBox QAbstractItemView { background-color: #1a1c24; color: #f1f5f9; "
+        "selection-background-color: #2563eb; border: 1px solid #303444; outline: none; }"
+        "QSpinBox::up-button, QSpinBox::down-button { width: 16px; border: none; background: transparent; }"
+        "QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: #252836; }"
+        "QPushButton { background-color: #21232d; color: #e2e8f0; border: 1px solid #323544; "
+        "border-radius: 7px; padding: 6px 13px; font-weight: 600; }"
+        "QPushButton:hover { background-color: #2a2d3a; border-color: #42475a; }"
+        "QPushButton:pressed { background-color: #323646; }"
+        "QPushButton:default, QPushButton[primary=\"true\"] { "
+        "background-color: #2563eb; border-color: #3b82f6; color: #ffffff; }"
+        "QPushButton:default:hover, QPushButton[primary=\"true\"]:hover { background-color: #1d4ed8; }"
+        "QPushButton[danger=\"true\"] { "
+        "background-color: rgba(239,68,68,24); border-color: rgba(248,113,113,85); color: #f87171; }"
+        "QPushButton[danger=\"true\"]:hover { background-color: rgba(239,68,68,48); }"
+        "QPushButton[ghost=\"true\"] { "
+        "background-color: transparent; border-color: #2b2e3b; color: #94a3b8; }"
+        "QPushButton[ghost=\"true\"]:hover { background-color: #20222c; color: #e2e8f0; }"
+        "QPushButton:disabled { background-color: #191b22; color: #52525b; border-color: #232530; }"
+        "QTableView, QTableWidget { background-color: #181a22; alternate-background-color: #1c1e28; "
+        "color: #e2e8f0; gridline-color: #21242f; border: 1px solid #272a36; border-radius: 10px; "
+        "selection-background-color: rgba(37,99,235,40); selection-color: #ffffff; outline: none; }"
+        "QTableView::item, QTableWidget::item { padding: 4px 10px; border-bottom: 1px solid #21242f; }"
+        "QHeaderView::section { background-color: #1e202a; color: #94a3b8; border: none; "
+        "border-bottom: 1px solid #272a36; padding: 8px 12px; font-size: 11px; font-weight: 600; }"
+        "QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }"
+        "QScrollBar::handle:vertical { background: #2e3244; border-radius: 4px; min-height: 28px; }"
+        "QScrollBar::handle:vertical:hover { background: #3f445c; }"
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+        "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
+        "QScrollBar:horizontal { background: transparent; height: 8px; margin: 2px; }"
+        "QScrollBar::handle:horizontal { background: #2e3244; border-radius: 4px; min-width: 28px; }"
+        "QScrollBar::handle:horizontal:hover { background: #3f445c; }"
+        "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }"
+        "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }"
+        "QMenu { background-color: #1a1c24; color: #f1f5f9; border: 1px solid #303444; border-radius: 8px; padding: 5px; }"
+        "QMenu::item { padding: 6px 24px; border-radius: 5px; }"
         "QMenu::item:selected:enabled { background-color: #2563eb; color: #ffffff; }"
-        "QMenu::item:disabled { color: #71717a; }"
-        "QMenu::separator { height: 1px; background: #2e2e33; margin: 4px 6px; }"
-        "QToolTip { background-color: #27272a; color: #f4f4f5; border: 1px solid #3f3f46; padding: 4px 6px; }"));
+        "QMenu::item:disabled { color: #64748b; }"
+        "QMenu::separator { height: 1px; background: #272a36; margin: 4px 8px; }"
+        "QToolTip { background-color: #1e202a; color: #f1f5f9; border: 1px solid #303444; border-radius: 6px; padding: 5px 8px; }"));
 }
 
 bool forwardToExistingInstance(const QString& serverName, const QString& payload) {
@@ -106,6 +139,7 @@ int main(int argc, char* argv[]) {
     QApplication::setWindowIcon(clashfx::TrayIconGenerator::appIcon());
 
     applyUnifiedDarkTheme(app);
+    clashfx::Win11Dwm::installGlobalDarkTitleBarFilter(app);
 
     // Touch singleton so QTranslator is installed on qApp immediately
     (void)clashfx::I18n::instance();

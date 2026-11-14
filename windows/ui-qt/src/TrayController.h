@@ -11,15 +11,9 @@
 
 namespace clashfx {
 
-class AiLockDialog;
 class ConsoleWindow;
 class DaemonClient;
 class HotkeyManager;
-class MultiNodeDialog;
-class NodeDiagnosticDialog;
-class RuleEditorDialog;
-class SettingsDialog;
-class SubscriptionsDialog;
 
 class TrayController final : public QObject {
     Q_OBJECT
@@ -66,7 +60,6 @@ private:
     void copyDiagnosticInfo();
     void checkForUpdates();
     void showAboutBox();
-    void closeAllDialogs();
     QWidget* modalDialogParent() const;
 
     DaemonClient* client_ = nullptr;
@@ -76,13 +69,6 @@ private:
     QSystemTrayIcon* trayIcon_ = nullptr;
     QMenu* trayMenu_ = nullptr;
     ConsoleWindow* consoleWindow_ = nullptr;
-
-    QPointer<AiLockDialog> aiLockDlg_;
-    QPointer<MultiNodeDialog> multiNodeDlg_;
-    QPointer<RuleEditorDialog> rulesDlg_;
-    QPointer<SubscriptionsDialog> subsDlg_;
-    QPointer<NodeDiagnosticDialog> diagDlg_;
-    QPointer<SettingsDialog> settingsDlg_;
 
     bool connected_ = false;
     bool menuDirty_ = true;

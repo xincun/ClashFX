@@ -145,13 +145,29 @@ void WebView2Widget::reloadDashboard() {
 #endif
 }
 
+void WebView2Widget::setPageActive(bool active) {
+    pageActive_ = active;
+#ifdef Q_OS_WIN
+    if (controller_) {
+        const bool vis = pageActive_ && isVisible();
+        controller_->put_IsVisible(vis ? TRUE : FALSE);
+        if (vis) {
+            syncBounds();
+        }
+    }
+#endif
+}
+
 void WebView2Widget::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
     ensureInitialized();
 #ifdef Q_OS_WIN
     if (controller_) {
-        controller_->put_IsVisible(TRUE);
-        syncBounds();
+        const bool vis = pageActive_ && isVisible();
+        controller_->put_IsVisible(vis ? TRUE : FALSE);
+        if (vis) {
+            syncBounds();
+        }
     }
 #endif
 }
@@ -265,7 +281,7 @@ void WebView2Widget::ensureInitialized() {
                         }
                     }
 
-                    self->controller_->put_IsVisible(self->isVisible() ? TRUE : FALSE);
+                    self->controller_->put_IsVisible((self->pageActive_ && self->isVisible()) ? TRUE : FALSE);
                     self->syncBounds();
                     self->applyScriptsAndNavigate(true);
                     emit self->webViewReady();
