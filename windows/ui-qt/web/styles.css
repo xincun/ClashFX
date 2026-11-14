@@ -135,6 +135,10 @@ html[data-platform="darwin"]:not([data-fullscreen="1"]) .sidebar {
   padding-top: 38px;
 }
 
+html[data-platform="darwin"] .topbar {
+  padding-right: 16px;
+}
+
 /* Main App Layout */
 .app-shell {
   display: flex;

@@ -1,3 +1,4 @@
+#include "ConsoleWindow.h"
 #include "DaemonClient.h"
 #include "I18n.h"
 #include "ModernWidgets.h"
@@ -6,6 +7,7 @@
 
 #include <QApplication>
 #include <QColor>
+#include <QCryptographicHash>
 #include <QFont>
 #include <QLocalSocket>
 #include <QPalette>
@@ -134,7 +136,7 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("ClashFX"));
     QApplication::setOrganizationName(QStringLiteral("ClashFX"));
-    QApplication::setApplicationVersion(QStringLiteral("1.19.24-win.1"));
+    QApplication::setApplicationVersion(QStringLiteral("1.19.24"));
     QApplication::setQuitOnLastWindowClosed(false);
     QApplication::setWindowIcon(clashfx::TrayIconGenerator::appIcon());
 
@@ -150,6 +152,8 @@ int main(int argc, char* argv[]) {
     QString customDataDir;
     QString startupUri;
     QString startupCmd;
+    int smokeTestMs = 0;
+    QString smokeReportPath;
     bool backgroundStart = false;
 
     for (int i = 1; i < args.size(); ++i) {
@@ -160,10 +164,15 @@ int main(int argc, char* argv[]) {
             customUiPipe = args.at(++i);
         } else if (a == QStringLiteral("--data-dir") && i + 1 < args.size()) {
             customDataDir = args.at(++i);
+        } else if (a == QStringLiteral("--smoke-test-ms") && i + 1 < args.size()) {
+            smokeTestMs = args.at(++i).toInt();
+        } else if (a == QStringLiteral("--smoke-report") && i + 1 < args.size()) {
+            smokeReportPath = args.at(++i);
         } else if (a == QStringLiteral("--background") || a == QStringLiteral("--minimized")) {
             backgroundStart = true;
         } else if (a.startsWith(QStringLiteral("clash://"), Qt::CaseInsensitive) ||
-                   a.startsWith(QStringLiteral("clashfx://"), Qt::CaseInsensitive)) {
+                   a.startsWith(QStringLiteral("clashfx://"), Qt::CaseInsensitive) ||
+                   a.startsWith(QStringLiteral("clash-verge://"), Qt::CaseInsensitive)) {
             startupUri = a;
         } else if (a == QStringLiteral("--open-console") ||
                    a == QStringLiteral("--open-ai-lock") ||
@@ -179,9 +188,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    const QString uiServerName = customUiPipe.trimmed().isEmpty()
-                                     ? (QStringLiteral("ClashFXUI-") + clashfx::DaemonClient::sanitizedUsername())
-                                     : customUiPipe.trimmed();
+    QString uiServerName = customUiPipe.trimmed();
+    if (uiServerName.isEmpty()) {
+        if (!customDaemonPipe.trimmed().isEmpty()) {
+            const QByteArray pipeHash = QCryptographicHash::hash(
+                customDaemonPipe.trimmed().toUtf8(), QCryptographicHash::Sha256).toHex().left(12);
+            uiServerName = QStringLiteral("ClashFXUI-%1-%2")
+                               .arg(clashfx::DaemonClient::sanitizedUsername(),
+                                    QString::fromLatin1(pipeHash));
+        } else {
+            uiServerName = QStringLiteral("ClashFXUI-") + clashfx::DaemonClient::sanitizedUsername();
+        }
+    }
 
     QString forwardMsg = QStringLiteral("ACTIVATE");
     if (!startupUri.isEmpty()) {
@@ -190,7 +208,7 @@ int main(int argc, char* argv[]) {
         forwardMsg = startupCmd;
     }
 
-    if (forwardToExistingInstance(uiServerName, forwardMsg)) {
+    if (smokeTestMs <= 0 && forwardToExistingInstance(uiServerName, forwardMsg)) {
         return 0;
     }
     if (startupCmd == QStringLiteral("CMD:--quit") ||
@@ -198,10 +216,15 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    const bool showInitially = (!backgroundStart || smokeTestMs > 0);
     auto* client = new clashfx::DaemonClient(customDaemonPipe, customDataDir, &app);
-    clashfx::TrayController controller(client, uiServerName, !backgroundStart, &app);
+    clashfx::TrayController controller(client, uiServerName, showInitially, &app);
     controller.startSingleInstanceServer();
     client->start();
+
+    if (smokeTestMs > 0 && controller.consoleWindow()) {
+        controller.consoleWindow()->configureSmokeTest(smokeTestMs, smokeReportPath);
+    }
 
     if (!startupUri.isEmpty()) {
         QTimer::singleShot(700, &controller, [&controller, startupUri]() {

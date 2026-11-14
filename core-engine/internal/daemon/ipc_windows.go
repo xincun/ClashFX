@@ -3,6 +3,8 @@
 package daemon
 
 import (
+	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -10,9 +12,11 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Microsoft/go-winio"
+	"github.com/clashfx/core-engine/internal/service"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -62,12 +66,19 @@ func sanitizedUsername() string {
 	return b.String()
 }
 
-func AcquireSingleInstanceLock(customKey string) (func(), error) {
-	key := customKey
-	if strings.TrimSpace(key) == "" {
-		key = sanitizedUsername()
+func mutexObjectSuffix(customKey string) string {
+	trimmed := strings.TrimSpace(customKey)
+	if trimmed == "" {
+		return sanitizedUsername()
 	}
-	namePtr, err := windows.UTF16PtrFromString(`Local\ClashFXDaemonMutex-` + key)
+	// Win32 mutex names treat backslashes after "Local\" as object namespace separators.
+	sum := sha256.Sum256([]byte(strings.ToLower(trimmed)))
+	return fmt.Sprintf("custom-%x", sum[:8])
+}
+
+func AcquireSingleInstanceLock(customKey string) (func(), error) {
+	suffix := mutexObjectSuffix(customKey)
+	namePtr, err := windows.UTF16PtrFromString(`Local\ClashFXDaemonMutex-` + suffix)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +87,7 @@ func AcquireSingleInstanceLock(customKey string) (func(), error) {
 		if h != 0 {
 			_ = windows.CloseHandle(h)
 		}
-		return nil, fmt.Errorf("clashfx-daemon is already running for user %s", key)
+		return nil, fmt.Errorf("clashfx-daemon is already running for %s", suffix)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create daemon mutex: %w", err)
@@ -126,18 +137,26 @@ func buildCurrentUserPipeSDDL() string {
 }
 
 func IsPrivilegedServiceInstalled(serviceName string) bool {
+	registered := false
 	m, err := mgr.Connect()
 	if err != nil {
 		// Connect with read-only SC_MANAGER_CONNECT via OpenSCManager if full access denied for Medium-IL!
-		return isServiceRegisteredReadOnly(serviceName)
+		registered = isServiceRegisteredReadOnly(serviceName)
+	} else {
+		s, openErr := m.OpenService(serviceName)
+		if openErr == nil {
+			_ = s.Close()
+			registered = true
+		}
+		_ = m.Disconnect()
 	}
-	defer m.Disconnect()
-	s, err := m.OpenService(serviceName)
-	if err != nil {
+	if !registered {
 		return false
 	}
-	_ = s.Close()
-	return true
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	resp, callErr := service.Call(ctx, service.Request{Action: "status"})
+	return callErr == nil && resp.OK
 }
 
 func isServiceRegisteredReadOnly(serviceName string) bool {

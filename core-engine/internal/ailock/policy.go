@@ -355,6 +355,7 @@ func isInternalCoreDirectRule(rule string) bool {
 		"PROCESS-NAME,mihomo_core.exe,DIRECT",
 		"PROCESS-NAME,clashfx-daemon.exe,DIRECT",
 		"PROCESS-NAME,clashfx-service.exe,DIRECT",
+		"PROCESS-NAME,clashfx-ui.exe,DIRECT",
 		"PROCESS-NAME,mihomo_core,DIRECT",
 		"PROCESS-NAME,clashfx-daemon,DIRECT",
 		"PROCESS-NAME,clashfx-service,DIRECT",

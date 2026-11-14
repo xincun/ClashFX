@@ -3,14 +3,17 @@
 #include "DaemonClient.h"
 #include "I18n.h"
 #include "ModernWidgets.h"
+#include "TrayIconGenerator.h"
 #include "WebView2Widget.h"
 
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QEvent>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGuiApplication>
@@ -71,7 +74,7 @@ ConsoleWindow::ConsoleWindow(DaemonClient* client, QWidget* parent)
       netMgr_(new QNetworkAccessManager(this)) {
     setObjectName(QStringLiteral("ClashConsoleWindow"));
     setWindowTitle(QStringLiteral("ClashFX"));
-    setWindowIcon(QIcon(QStringLiteral(":/clashfx.ico")));
+    setWindowIcon(TrayIconGenerator::appIcon());
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowMinimizeButtonHint |
                    Qt::WindowMaximizeButtonHint | Qt::WindowSystemMenuHint);
     setMinimumSize(960, 620);
@@ -274,6 +277,7 @@ void ConsoleWindow::pushWindowState() {
     webView_->postJsonMessage(QJsonObject{
         {QStringLiteral("type"), QStringLiteral("window_state")},
         {QStringLiteral("maximized"), isMaximized()},
+        {QStringLiteral("fullscreen"), isFullScreen()},
     });
 }
 
@@ -281,12 +285,14 @@ void ConsoleWindow::pushInitPayload() {
     QJsonObject initMsg{
         {QStringLiteral("type"), QStringLiteral("init")},
         {QStringLiteral("connected"), connected_},
+        {QStringLiteral("platform"), QStringLiteral("windows")},
         {QStringLiteral("snapshot"), snapshot_},
         {QStringLiteral("language"), I18n::instance().language()},
         {QStringLiteral("theme"), theme_},
         {QStringLiteral("page"), static_cast<int>(currentPage_)},
         {QStringLiteral("subTab"), pendingSubTab_},
         {QStringLiteral("maximized"), isMaximized()},
+        {QStringLiteral("fullscreen"), isFullScreen()},
     };
     if (!pendingDiagNode_.isEmpty()) {
         initMsg.insert(QStringLiteral("diagNode"), pendingDiagNode_);
@@ -301,6 +307,11 @@ void ConsoleWindow::onWebMessageReceived(const QJsonObject& msg) {
         uiReady_ = true;
         pushInitPayload();
         syncTelemetryState();
+        return;
+    }
+
+    if (type == QLatin1String("smoke_report")) {
+        finishSmokeTest(msg.value(QStringLiteral("dom")).toObject(), QString());
         return;
     }
 
@@ -415,7 +426,7 @@ void ConsoleWindow::handleRpcMessage(const QJsonObject& msg) {
             {QStringLiteral("id"), id},
             {QStringLiteral("ok"), ok},
             {QStringLiteral("data"), data},
-            {QStringLiteral("error"), err},
+            {QStringLiteral("error"), I18n::translateBackendText(err)},
             {QStringLiteral("error_code"), code},
         });
     });
@@ -445,14 +456,14 @@ void ConsoleWindow::handleMihomoMessage(const QJsonObject& msg) {
 
     const QUrl url(QStringLiteral("http://127.0.0.1:%1%2").arg(apiPort).arg(path));
     QNetworkRequest req(url);
-    req.setTransferTimeout(6000);
+    req.setTransferTimeout(8000);
     if (!secret.isEmpty()) {
         req.setRawHeader("Authorization", QByteArray("Bearer ") + secret.toUtf8());
     }
 
     QByteArray bodyBytes;
     const QJsonValue bodyVal = msg.value(QStringLiteral("body"));
-    if (!bodyVal.isUndefined() && !bodyVal.isNull()) {
+    if (!bodyVal.isUndefined() && !bodyVal.isNull() && verb != QLatin1String("GET") && verb != QLatin1String("DELETE")) {
         req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
         if (bodyVal.isObject()) {
             bodyBytes = QJsonDocument(bodyVal.toObject()).toJson(QJsonDocument::Compact);
@@ -471,18 +482,19 @@ void ConsoleWindow::handleMihomoMessage(const QJsonObject& msg) {
         const QString errStr = netOk ? QString() : reply->errorString();
         reply->deleteLater();
 
-        QJsonValue parsed = QString::fromUtf8(payload);
+        QJsonValue parsed;
         if (!payload.trimmed().isEmpty()) {
             const QJsonDocument doc = QJsonDocument::fromJson(payload);
             if (doc.isObject()) parsed = doc.object();
             else if (doc.isArray()) parsed = doc.array();
+            else parsed = QString::fromUtf8(payload);
         }
 
         if (!uiReady_) return;
         webView_->postJsonMessage(QJsonObject{
             {QStringLiteral("type"), QStringLiteral("mihomo_result")},
             {QStringLiteral("id"), id},
-            {QStringLiteral("ok"), netOk && status >= 200 && status < 400},
+            {QStringLiteral("ok"), netOk && status >= 200 && status < 300},
             {QStringLiteral("status"), status},
             {QStringLiteral("data"), parsed},
             {QStringLiteral("error"), errStr},
@@ -546,9 +558,13 @@ void ConsoleWindow::handleNativeAction(const QJsonObject& msg) {
 
     if (action == QLatin1String("launch_chrome_proxy")) {
         const int port = msg.value(QStringLiteral("port")).toInt();
+        if (port <= 0 || port > 65535) {
+            reply(false, QJsonValue(), L("代理端口无效", "Invalid proxy port"));
+            return;
+        }
         const QString exe = findChromiumExecutable();
-        if (exe.isEmpty() || port <= 0) {
-            reply(false, QJsonValue(), L("未找到 Chrome 或 Edge 浏览器", "Chrome or Edge browser not found"));
+        if (exe.isEmpty()) {
+            reply(false, QJsonValue(), L("未找到 Chrome / Edge / Brave / Chromium 浏览器", "Chrome / Edge / Brave / Chromium browser not found"));
             return;
         }
         const QString dataBase = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
@@ -711,14 +727,20 @@ void ConsoleWindow::pollTelemetrySnapshot() {
         if (!doc.isObject()) return;
         const QJsonObject obj = doc.object();
         const QJsonArray conns = obj.value(QStringLiteral("connections")).toArray();
+        QJsonArray cappedConns;
+        const qsizetype keepCount = qMin<qsizetype>(conns.size(), 250);
+        for (qsizetype i = 0; i < keepCount; ++i) {
+            cappedConns.append(conns.at(i));
+        }
         const QJsonObject payload{
             {QStringLiteral("type"), QStringLiteral("telemetry")},
             {QStringLiteral("up"), lastUpRate_},
             {QStringLiteral("down"), lastDownRate_},
             {QStringLiteral("upTotal"), obj.value(QStringLiteral("uploadTotal"))},
             {QStringLiteral("downTotal"), obj.value(QStringLiteral("downloadTotal"))},
+            {QStringLiteral("memory"), obj.value(QStringLiteral("memory"))},
             {QStringLiteral("connectionCount"), conns.size()},
-            {QStringLiteral("connections"), conns},
+            {QStringLiteral("connections"), cappedConns},
         };
         webView_->postJsonMessage(payload);
     });
@@ -762,12 +784,116 @@ QString ConsoleWindow::findChromiumExecutable() {
         localApp + QStringLiteral("/Google/Chrome/Application/chrome.exe"),
         pf + QStringLiteral("/Microsoft/Edge/Application/msedge.exe"),
         pf86 + QStringLiteral("/Microsoft/Edge/Application/msedge.exe"),
+        pf + QStringLiteral("/BraveSoftware/Brave-Browser/Application/brave.exe"),
+        pf86 + QStringLiteral("/BraveSoftware/Brave-Browser/Application/brave.exe"),
+        localApp + QStringLiteral("/BraveSoftware/Brave-Browser/Application/brave.exe"),
+        pf + QStringLiteral("/Chromium/Application/chrome.exe"),
+        localApp + QStringLiteral("/Chromium/Application/chrome.exe"),
     };
     for (const QString& c : candidates) {
         if (QFileInfo::exists(c)) return QDir::toNativeSeparators(c);
     }
 #endif
     return QString();
+}
+
+void ConsoleWindow::configureSmokeTest(int dwellMs, const QString& reportPath) {
+    if (dwellMs <= 0) return;
+    smokeTestMs_ = dwellMs;
+    smokeReportPath_ = reportPath;
+    smokeInitEpochMs_ = QDateTime::currentMSecsSinceEpoch();
+
+    if (!smokePollTimer_) {
+        smokePollTimer_ = new QTimer(this);
+        smokePollTimer_->setInterval(200);
+        connect(smokePollTimer_, &QTimer::timeout, this, [this]() {
+            if (smokeStarted_ || smokeCompleted_) {
+                smokePollTimer_->stop();
+                return;
+            }
+            const qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - smokeInitEpochMs_;
+            const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
+            const bool ready = uiReady_ && connected_ && coreRunning;
+            if ((ready && elapsed >= 1200) || elapsed >= qMax(2000, smokeTestMs_)) {
+                smokePollTimer_->stop();
+                beginSmokeWalk();
+            }
+        });
+    }
+    smokePollTimer_->start();
+}
+
+void ConsoleWindow::beginSmokeWalk() {
+    if (smokeStarted_ || smokeCompleted_) return;
+    smokeStarted_ = true;
+
+    if (!smokeDeadlineTimer_) {
+        smokeDeadlineTimer_ = new QTimer(this);
+        smokeDeadlineTimer_->setSingleShot(true);
+        connect(smokeDeadlineTimer_, &QTimer::timeout, this, [this]() {
+            finishSmokeTest(QJsonObject(), QStringLiteral("Timed out waiting for WebView smoke report"));
+        });
+    }
+    smokeDeadlineTimer_->start(4500);
+
+    if (uiReady_ && webView_) {
+        webView_->postJsonMessage(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("run_smoke_test")},
+            {QStringLiteral("dwellMs"), qBound(35, smokeTestMs_ / 15, 120)},
+        });
+    } else {
+        finishSmokeTest(QJsonObject(), QStringLiteral("WebView did not reach ui_ready state"));
+    }
+}
+
+void ConsoleWindow::finishSmokeTest(const QJsonObject& dom, const QString& timeoutErr) {
+    if (smokeCompleted_) return;
+    smokeCompleted_ = true;
+    if (smokePollTimer_) smokePollTimer_->stop();
+    if (smokeDeadlineTimer_) smokeDeadlineTimer_->stop();
+
+    const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
+    QJsonObject finalDom = dom;
+    if (!timeoutErr.isEmpty() && finalDom.isEmpty()) {
+        finalDom.insert(QStringLiteral("ok"), false);
+        finalDom.insert(QStringLiteral("errors"), QJsonArray{timeoutErr});
+    }
+    const bool domOk = finalDom.value(QStringLiteral("ok")).toBool(false);
+    const bool passed = uiReady_ && connected_ && domOk;
+
+    QJsonObject report{
+        {QStringLiteral("ui_ready"), uiReady_},
+        {QStringLiteral("daemon_connected"), connected_},
+        {QStringLiteral("core_running"), coreRunning},
+        {QStringLiteral("platform"), snapshot_.value(QStringLiteral("platform")).toString()},
+        {QStringLiteral("arch"), snapshot_.value(QStringLiteral("arch")).toString()},
+        {QStringLiteral("dom"), finalDom},
+    };
+    if (!smokeReportPath_.isEmpty()) {
+        QFile f(smokeReportPath_);
+        const QString parentDir = QFileInfo(f).absolutePath();
+        if (!parentDir.isEmpty()) {
+            QDir().mkpath(parentDir);
+        }
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            f.write(QJsonDocument(report).toJson(QJsonDocument::Indented));
+            f.close();
+        }
+    }
+
+    setAllowClose(true);
+    close();
+    if (client_ && client_->isConnected()) {
+        client_->stopReconnect();
+        client_->call(QStringLiteral("quit_daemon"), QJsonObject(), [passed](bool, const QJsonValue&, const QString&, const QString&) {
+            QCoreApplication::exit(passed ? 0 : 1);
+        });
+    } else if (client_) {
+        client_->stopReconnect();
+    }
+    QTimer::singleShot(900, qApp, [passed]() {
+        QCoreApplication::exit(passed ? 0 : 1);
+    });
 }
 
 } // namespace clashfx

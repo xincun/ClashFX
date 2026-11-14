@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -692,5 +693,111 @@ func TestConcurrentReadRPCsOverIPCCachedNetworkSignature(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("concurrent IPC RPC batch took unexpectedly long: %v", elapsed)
+	}
+}
+
+func TestSingleConnectionConcurrentRPCNoHeadOfLineBlock(t *testing.T) {
+	sockDir, err := os.MkdirTemp("", "cfx-hol-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+
+	appData := t.TempDir()
+	t.Setenv("CLASHFX_SERVICE_SOCK", filepath.Join(appData, "nonexistent-service.sock"))
+	t.Setenv("CLASHFX_DISABLE_LAUNCH_AGENT", "1")
+
+	slowSubSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(350 * time.Millisecond)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer slowSubSrv.Close()
+
+	endpoint := filepath.Join(sockDir, "d.sock")
+	if runtime.GOOS == "windows" {
+		endpoint = fmt.Sprintf(`\\.\pipe\ClashFXDaemonHoLTest-%d`, time.Now().UnixNano())
+	}
+
+	ln, err := ListenIPC(endpoint)
+	if err != nil {
+		t.Fatalf("ListenIPC failed: %v", err)
+	}
+	eng, err := NewEngine(Config{AppDataDir: appData}, nil)
+	if err != nil {
+		_ = ln.Close()
+		t.Fatal(err)
+	}
+	defer eng.Shutdown()
+
+	srv := &Server{
+		endpoint: endpoint,
+		engine:   eng,
+		ln:       ln,
+		clients:  map[*clientConn]struct{}{},
+		quitCh:   make(chan struct{}),
+	}
+	go srv.acceptLoop()
+	defer func() {
+		_ = ln.Close()
+		srv.clientsMu.Lock()
+		for c := range srv.clients {
+			_ = c.conn.Close()
+		}
+		srv.clients = map[*clientConn]struct{}{}
+		srv.clientsMu.Unlock()
+	}()
+
+	conn, err := DialIPC(endpoint)
+	if err != nil {
+		t.Fatalf("DialIPC failed: %v", err)
+	}
+	defer conn.Close()
+
+	slowSchemeURI := "clash-verge://install-config?url=" + url.QueryEscape(slowSubSrv.URL)
+	reqs := []RPCRequest{
+		{ID: 1, Method: "import_url_scheme", Params: json.RawMessage(fmt.Sprintf(`{"uri":%q}`, slowSchemeURI))},
+		{ID: 2, Method: "ping"},
+		{ID: 3, Method: "get_state"},
+		{ID: 4, Method: "get_profile_mixin"},
+	}
+	var buf bytes.Buffer
+	for _, r := range reqs {
+		line, _ := json.Marshal(r)
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		t.Fatalf("pipelined write failed: %v", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	order := make([]int64, 0, len(reqs))
+	resps := map[int64]RPCResponse{}
+	for len(resps) < len(reqs) {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		line, rErr := reader.ReadBytes('\n')
+		if rErr != nil {
+			t.Fatalf("read reply failed: %v", rErr)
+		}
+		var resp RPCResponse
+		if jErr := json.Unmarshal(line, &resp); jErr != nil {
+			t.Fatalf("unmarshal reply: %v", jErr)
+		}
+		order = append(order, resp.ID)
+		resps[resp.ID] = resp
+	}
+
+	if order[len(order)-1] != 1 {
+		t.Fatalf("expected fast RPCs (2,3,4) to complete BEFORE slow RPC 1 on same connection, got order %v", order)
+	}
+	for _, id := range []int64{2, 3, 4} {
+		if !resps[id].OK {
+			t.Fatalf("fast RPC id=%d failed: %+v", id, resps[id])
+		}
+	}
+	// Slow import hit HTTP 500 rather than "unsupported scheme", verifying clash-verge:// scheme is accepted.
+	if strings.Contains(resps[1].Error, "unsupported scheme") {
+		t.Fatalf("expected clash-verge:// scheme accepted, got %q", resps[1].Error)
 	}
 }

@@ -164,6 +164,7 @@ func SetLaunchAtLogin(enabled bool, uiExePath string) error {
 	<key>ProgramArguments</key>
 	<array>
 		<string>%s</string>
+		<string>--minimized</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

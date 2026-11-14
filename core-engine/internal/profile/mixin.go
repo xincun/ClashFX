@@ -361,6 +361,7 @@ func SystemGuardPrefixCount(rules []string) int {
 			trimmed == "PROCESS-NAME,mihomo_core.exe,DIRECT" ||
 			trimmed == "PROCESS-NAME,clashfx-daemon.exe,DIRECT" ||
 			trimmed == "PROCESS-NAME,clashfx-service.exe,DIRECT" ||
+			trimmed == "PROCESS-NAME,clashfx-ui.exe,DIRECT" ||
 			trimmed == "PROCESS-NAME,mihomo_core,DIRECT" ||
 			trimmed == "PROCESS-NAME,clashfx-daemon,DIRECT" ||
 			trimmed == "PROCESS-NAME,clashfx-service,DIRECT" ||

@@ -53,6 +53,8 @@ private:
 
 #ifdef Q_OS_WIN
     unsigned long long webMessageTokenValue_ = 0;
+    unsigned long long newWindowTokenValue_ = 0;
+    unsigned long long navStartingTokenValue_ = 0;
 #endif
     ICoreWebView2Environment* env_ = nullptr;
     ICoreWebView2Controller* controller_ = nullptr;

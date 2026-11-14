@@ -154,8 +154,18 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 				"prerelease": false,
 				"html_url":   "https://example.com/stable",
 				"assets": []map[string]string{
+					{"name": "ClashFX-macOS-arm64.zip", "browser_download_url": "https://example.com/mac-arm64.zip"},
+					{"name": "ClashFX-Portable-arm64.zip", "browser_download_url": "https://example.com/portable-arm64.zip"},
 					{"name": "ClashFX-Setup-arm64.exe", "browser_download_url": "https://example.com/arm64.exe"},
 					{"name": "ClashFX-Setup-amd64.exe", "browser_download_url": "https://example.com/amd64.exe"},
+				},
+			},
+			{
+				"tag_name":   "v1.9.9",
+				"prerelease": false,
+				"html_url":   "https://example.com/mac-zip-only",
+				"assets": []map[string]string{
+					{"name": "ClashFX-macOS-arm64.zip", "browser_download_url": "https://example.com/mac-only-arm64.zip"},
 				},
 			},
 		})
@@ -173,6 +183,10 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 	stableMac, err := CheckForUpdatesForPlatform(context.Background(), "v1.19.24", "stable", relSrv.URL, 0, "darwin", "arm64")
 	if err != nil || !stableMac.UpdateAvailable || stableMac.LatestVersion != "v9.9.9" || stableMac.DownloadURL != "https://example.com/ClashFX.dmg" {
 		t.Fatalf("unexpected macOS stable update result: %+v (%v)", stableMac, err)
+	}
+	macZipWin, err := CheckForUpdatesForPlatform(context.Background(), "v1.9.8", "stable", relSrv.URL, 0, "windows", "arm64")
+	if err != nil || macZipWin.LatestVersion != "v2.0.0" || macZipWin.DownloadURL != "https://example.com/arm64.exe" {
+		t.Fatalf("Windows should prefer .exe over .zip and skip macOS zip releases, got %+v (%v)", macZipWin, err)
 	}
 }
 

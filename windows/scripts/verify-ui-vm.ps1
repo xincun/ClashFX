@@ -120,6 +120,27 @@ rules:
     $uiPipe = "ClashFXUI-Verify-$arch"
     $uiExe = Join-Path $appDir "clashfx-ui.exe"
 
+    # Run automated DOM + WebView2 navigation smoke test first
+    $smokePath = Join-Path $LocalRoot "smoke-$arch.json"
+    $smokeProc = Start-Process -FilePath $uiExe `
+        -ArgumentList @("--pipe", $daemonPipe, "--data-dir", $dataDir, "--smoke-test-ms", "8000", "--smoke-report", $smokePath) `
+        -WorkingDirectory $appDir -PassThru
+    if (-not $smokeProc.WaitForExit(30000)) {
+        Stop-Process -Id $smokeProc.Id -Force -ErrorAction SilentlyContinue
+        throw "Smoke test timed out for $arch"
+    }
+    if ($smokeProc.ExitCode -ne 0 -or -not (Test-Path $smokePath)) {
+        throw "Smoke test failed for $arch (exit=$($smokeProc.ExitCode))"
+    }
+    $smokeJson = Get-Content $smokePath -Raw | ConvertFrom-Json
+    if (-not ($smokeJson.ui_ready -and $smokeJson.daemon_connected -and $smokeJson.core_running -and $smokeJson.dom.ok)) {
+        throw "Smoke report assertion failed for ${arch}: $($smokeJson | ConvertTo-Json -Depth 6 -Compress)"
+    }
+    Write-Host "  [OK] Automated WebView2 DOM smoke test passed ($($smokeJson.dom.steps.Count) steps)"
+    Start-Sleep -Milliseconds 600
+    Stop-Process -Name clashfx-ui, clashfx-daemon, mihomo_core -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 400
+
     $uiProc = Start-Process -FilePath $uiExe `
         -ArgumentList @("--pipe", $daemonPipe, "--ui-pipe", $uiPipe, "--data-dir", $dataDir) `
         -WorkingDirectory $appDir -PassThru

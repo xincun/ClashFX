@@ -333,6 +333,15 @@ func (m *Manager) UpdateExternalResource(ctx context.Context, rawURL, destFileNa
 }
 
 func (m *Manager) UpdateExternalResourceViaProxy(ctx context.Context, rawURL, destFileName string, minBytes int, localProxyPort int) error {
+	data, err := m.DownloadExternalResourceViaProxy(ctx, rawURL, destFileName, minBytes, localProxyPort)
+	if err != nil {
+		return err
+	}
+	dst := filepath.Join(m.store.ActiveConfigDir(), destFileName)
+	return profile.WriteFileAtomic(dst, data, 0644)
+}
+
+func (m *Manager) DownloadExternalResourceViaProxy(ctx context.Context, rawURL, destFileName string, minBytes int, localProxyPort int) ([]byte, error) {
 	downloadOnce := func(proxyPort int) ([]byte, error) {
 		client, err := newSubscriptionHTTPClient(proxyPort, 90*time.Second)
 		if err != nil {
@@ -377,10 +386,9 @@ func (m *Manager) UpdateExternalResourceViaProxy(ctx context.Context, rawURL, de
 		}
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
-	dst := filepath.Join(m.store.ActiveConfigDir(), destFileName)
-	return profile.WriteFileAtomic(dst, data, 0644)
+	return data, nil
 }
 
 func (m *Manager) normalizeSubscriptionContent(raw []byte) ([]byte, error) {

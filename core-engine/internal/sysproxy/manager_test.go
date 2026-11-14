@@ -102,6 +102,20 @@ func TestSystemProxyLifecycleCrashRecoveryAILockAndWakeHeal(t *testing.T) {
 		t.Fatalf("expected wake repair to restore 127.0.0.1:7890, got %+v", st)
 	}
 
+	// 2b. Updating custom bypass list must reconcile OS override even when server & enable match
+	repaired, err = mgr.ReconcileIfExpected(true, 7890, "example.com,corp.local")
+	if err != nil || !repaired {
+		t.Fatalf("ReconcileIfExpected bypass change = (%v, %v), want (true, nil)", repaired, err)
+	}
+	st, _ = backend.ReadState()
+	if st.ProxyOverride != FormatBypassForOS("example.com,corp.local") {
+		t.Fatalf("expected updated ProxyOverride %q, got %q", FormatBypassForOS("example.com,corp.local"), st.ProxyOverride)
+	}
+	repaired, err = mgr.ReconcileIfExpected(true, 7890, "example.com,corp.local")
+	if err != nil || repaired {
+		t.Fatalf("ReconcileIfExpected idempotent check = (%v, %v), want (false, nil)", repaired, err)
+	}
+
 	// 3. Simulate AI Proxy Lock fail-closed exit: Shutdown(true) leaves proxy pointing at 127.0.0.1:7890!
 	if err := mgr.Shutdown(true); err != nil {
 		t.Fatal(err)

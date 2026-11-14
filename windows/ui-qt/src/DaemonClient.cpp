@@ -91,6 +91,13 @@ void DaemonClient::start() {
 void DaemonClient::stopReconnect() {
     stopping_ = true;
     reconnectTimer_->stop();
+    const auto stale = queuedCalls_;
+    queuedCalls_.clear();
+    for (const auto& q : stale) {
+        if (q.callback) {
+            q.callback(false, QJsonValue(), QStringLiteral("clashfx-daemon client stopped"), QStringLiteral("NOT_CONNECTED"));
+        }
+    }
 }
 
 bool DaemonClient::isConnected() const {
@@ -156,6 +163,30 @@ void DaemonClient::onConnected() {
             emit stateChanged(snapshot_);
         }
     });
+    const auto queued = queuedCalls_;
+    queuedCalls_.clear();
+    for (const auto& q : queued) {
+        call(q.method, q.params, q.callback);
+    }
+}
+
+void DaemonClient::expireStaleQueuedCalls() {
+    if (queuedCalls_.isEmpty()) {
+        return;
+    }
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    QList<QueuedCall> keep;
+    keep.reserve(queuedCalls_.size());
+    for (const auto& q : queuedCalls_) {
+        if (nowMs - q.queuedEpochMs >= 4500) {
+            if (q.callback) {
+                q.callback(false, QJsonValue(), QStringLiteral("clashfx-daemon is starting up, please retry in a moment."), QStringLiteral("NOT_CONNECTED"));
+            }
+        } else {
+            keep.append(q);
+        }
+    }
+    queuedCalls_ = std::move(keep);
 }
 
 void DaemonClient::onDisconnected() {
@@ -177,6 +208,7 @@ void DaemonClient::onSocketError(QLocalSocket::LocalSocketError /*socketError*/)
         return;
     }
     maybeAutoSpawnDaemon();
+    expireStaleQueuedCalls();
     if (!reconnectTimer_->isActive()) {
         reconnectTimer_->start(650);
     }
@@ -187,8 +219,15 @@ void DaemonClient::call(const QString& method,
                         RpcCallback callback) {
     if (!isConnected()) {
         maybeAutoSpawnDaemon();
-        if (!reconnectTimer_->isActive() && !stopping_) {
-            reconnectTimer_->start(400);
+        if (!stopping_ && queuedCalls_.size() < 32) {
+            queuedCalls_.append(QueuedCall{method, params, std::move(callback), QDateTime::currentMSecsSinceEpoch()});
+            if (!reconnectTimer_->isActive()) {
+                reconnectTimer_->start(250);
+            }
+            if (socket_->state() == QLocalSocket::UnconnectedState) {
+                attemptConnect();
+            }
+            return;
         }
         if (callback) {
             callback(false, QJsonValue(), QStringLiteral("clashfx-daemon is starting up, please retry in a moment."), QStringLiteral("NOT_CONNECTED"));
@@ -214,16 +253,20 @@ void DaemonClient::call(const QString& method,
 
 void DaemonClient::onReadyRead() {
     readBuffer_.append(socket_->readAll());
+    int offset = 0;
     while (true) {
-        const int nl = readBuffer_.indexOf('\n');
+        const int nl = readBuffer_.indexOf('\n', offset);
         if (nl < 0) {
             break;
         }
-        const QByteArray line = readBuffer_.left(nl).trimmed();
-        readBuffer_.remove(0, nl + 1);
+        const QByteArray line = readBuffer_.mid(offset, nl - offset).trimmed();
+        offset = nl + 1;
         if (!line.isEmpty()) {
             processLine(line);
         }
+    }
+    if (offset > 0) {
+        readBuffer_.remove(0, offset);
     }
 }
 

@@ -599,6 +599,11 @@ final class TrayController: NSObject, NSMenuDelegate {
 
             let isLB = gType.caseInsensitiveCompare("LoadBalance") == .orderedSame
                 || gType.caseInsensitiveCompare("load-balance") == .orderedSame
+            let isRelay = gType.caseInsensitiveCompare("Relay") == .orderedSame
+            let isAutoGroup = gType.caseInsensitiveCompare("URLTest") == .orderedSame
+                || gType.caseInsensitiveCompare("url-test") == .orderedSame
+                || gType.caseInsensitiveCompare("Fallback") == .orderedSame
+                || gType.caseInsensitiveCompare("fallback") == .orderedSame
             var gTitle = gName
             if !now.isEmpty {
                 gTitle += "  [\(now)]"
@@ -613,11 +618,6 @@ final class TrayController: NSObject, NSMenuDelegate {
             addItem(to: gSub, title: L("测速本组节点", "Benchmark Group"), enabled: connected && coreRunning) { [weak self] in
                 self?.client.call(method: "benchmark_group", params: ["group": gName], timeoutSeconds: 45)
             }
-            if hasManual && gType.caseInsensitiveCompare("Selector") != .orderedSame && gType.caseInsensitiveCompare("Select") != .orderedSame {
-                addItem(to: gSub, title: L("恢复自动选择", "Restore Auto Selection"), enabled: connected && !aiLocked) { [weak self] in
-                    self?.client.call(method: "restore_auto_selection", params: ["group": gName])
-                }
-            }
             gSub.addItem(.separator())
 
             let nodes = (g["items"] as? [[String: Any]]) ?? []
@@ -630,15 +630,42 @@ final class TrayController: NSObject, NSMenuDelegate {
                 var label = nName
                 if delay > 0 {
                     label += "  (\(delay) ms)"
-                } else if tested {
+                } else if tested && nName != "DIRECT" && nName != "REJECT" {
                     label += L("  (超时)", "  (Timeout)")
                 }
 
-                addItem(to: gSub, title: label, enabled: connected && !isLB && !aiLocked, checked: isSelected) { [weak self] in
-                    self?.client.call(method: "select_proxy", params: ["group": gName, "target": nName]) { ok, _, err, _ in
-                        if !ok {
-                            self?.showAlert(title: "ClashFX", message: I18n.translateBackendText(err), warning: true)
+                if isLB || isRelay {
+                    addItem(to: gSub, title: label, enabled: false, checked: isSelected)
+                } else {
+                    addItem(to: gSub, title: label, enabled: connected, checked: isSelected) { [weak self] in
+                        self?.client.call(method: "select_proxy", params: ["group": gName, "target": nName]) { ok, _, err, _ in
+                            if !ok {
+                                self?.showAlert(title: "ClashFX", message: I18n.translateBackendText(err), warning: true)
+                            }
                         }
+                    }
+                }
+            }
+
+            let showDiag = (!isLB && !now.isEmpty && now != "DIRECT" && now != "REJECT")
+            if isAutoGroup || showDiag {
+                gSub.addItem(.separator())
+                if isAutoGroup {
+                    if hasManual {
+                        addItem(to: gSub, title: L("恢复自动选择", "Restore Automatic Selection"), enabled: connected) { [weak self] in
+                            self?.client.call(method: "restore_auto_selection", params: ["group": gName]) { ok, _, err, _ in
+                                if !ok {
+                                    self?.showAlert(title: "ClashFX", message: I18n.translateBackendText(err), warning: true)
+                                }
+                            }
+                        }
+                    } else {
+                        addItem(to: gSub, title: L("自动测速择优中", "Automatic Selection Active"), enabled: false)
+                    }
+                }
+                if showDiag {
+                    addItem(to: gSub, title: L("诊断当前节点…", "Diagnose Current Node…")) { [weak self] in
+                        self?.openDiagnosticsDialog(preselectNode: now)
                     }
                 }
             }
@@ -649,6 +676,14 @@ final class TrayController: NSObject, NSMenuDelegate {
         }
 
         trayMenu.addItem(.separator())
+
+        if aiLocked {
+            addItem(
+                to: trayMenu,
+                title: L("已由 AI 专用锁定接管代理开关与规则模式", "Proxy & Rule mode managed by AI Proxy Lock"),
+                enabled: false
+            )
+        }
 
         // Core proxy switches
         addItem(to: trayMenu, title: L("设置为系统代理", "Set as System Proxy"), enabled: connected && !aiLocked, checked: sysProxy) { [weak self] in

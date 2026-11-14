@@ -35,6 +35,7 @@ export const store = {
   collapsedGroups,
   proxySearch: '',
   pendingNav: null,
+  preferredRuleProvider: '',
 };
 
 function syncDocumentPlatformFlags() {
@@ -95,6 +96,7 @@ const LONG_RPC_METHODS = new Set([
   'check_updates',
   'set_enhanced_mode',
   'set_ai_lock',
+  'install_service',
   'reload_config',
   'update_settings',
 ]);
@@ -346,8 +348,11 @@ function dispatchIncoming(raw) {
     case 'navigate':
       store.page = Number.isInteger(msg.page) ? msg.page : 0;
       store.subTab = Number.isInteger(msg.subTab) ? msg.subTab : -1;
-      if (msg.diagNode) store.diagNode = msg.diagNode;
+      store.diagNode = msg.diagNode || '';
       notify('navigate', msg);
+      break;
+    case 'run_smoke_test':
+      void runDomSmokeTest(Number(msg.dwellMs) || 45);
       break;
     case 'language':
       store.language = msg.language || 'zh_CN';
@@ -408,6 +413,60 @@ function dispatchIncoming(raw) {
     default:
       break;
   }
+}
+
+async function runDomSmokeTest(dwellMs = 45) {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const report = { steps: [], errors: [], platform: store.platform, ok: true };
+  const sequence = [1, 2, 3, 4, 5, 6, 2];
+  try {
+    for (const pageId of sequence) {
+      const btn = document.querySelector(`#sidebar-nav [data-nav-id="${pageId}"]`);
+      if (!btn) {
+        report.errors.push(`missing nav button ${pageId}`);
+        continue;
+      }
+      btn.click();
+      await wait(dwellMs);
+      const pageEl = document.getElementById('page-content');
+      report.steps.push({
+        page: store.page,
+        activeNav: document.querySelector('#sidebar-nav .nav-item.active')?.getAttribute('data-nav-id') || '',
+        contentLen: pageEl ? pageEl.textContent.trim().length : 0,
+      });
+    }
+    const effTab = document.querySelector('[data-rule-tab="2"]');
+    if (effTab) {
+      effTab.click();
+      await wait(dwellMs);
+      report.steps.push({
+        page: store.page,
+        subTab: 2,
+        hasEffSearch: Boolean(document.getElementById('eff-search')),
+        rows: document.querySelectorAll('#page-content tbody tr[data-eff-row-type]').length,
+      });
+    } else {
+      report.errors.push('missing data-rule-tab="2"');
+    }
+    const homeBtn = document.querySelector('#sidebar-nav [data-nav-id="0"]');
+    if (homeBtn) {
+      homeBtn.click();
+      await wait(dwellMs);
+    }
+    const consoleHost = document.getElementById('console-host');
+    const consoleVisible = Boolean(consoleHost && !consoleHost.classList.contains('is-inactive'));
+    if (!consoleVisible) report.errors.push('console-host still inactive after returning home');
+    report.steps.push({
+      page: store.page,
+      consoleActive: consoleVisible,
+    });
+  } catch (err) {
+    report.ok = false;
+    report.errors.push(err?.message || String(err));
+  }
+  report.ok = report.ok && report.errors.length === 0;
+  postNative({ type: 'smoke_report', dom: report });
+  return report;
 }
 
 export function initBridgeListener() {

@@ -178,6 +178,10 @@ func isCompatibleRelease(rel *githubRelease, targetOS string) bool {
 		if strings.HasSuffix(lower, ".dsym.zip") || strings.HasSuffix(lower, ".dmg") || strings.HasSuffix(lower, ".pkg") {
 			continue
 		}
+		if strings.HasSuffix(lower, ".zip") &&
+			(strings.Contains(lower, "mac") || strings.Contains(lower, "darwin") || strings.Contains(lower, "universal")) {
+			continue
+		}
 		if strings.HasSuffix(lower, ".exe") || strings.HasSuffix(lower, ".msi") ||
 			(strings.HasSuffix(lower, ".zip") && (strings.Contains(lower, "win") || strings.Contains(lower, "portable") || strings.Contains(lower, "amd64") || strings.Contains(lower, "arm64") || strings.Contains(lower, "x64"))) {
 			return true
@@ -222,19 +226,31 @@ func selectReleaseDownloadURL(assets []struct {
 		return genericFallback
 	}
 
+	var zipFallback string
 	for _, asset := range assets {
 		lower := strings.ToLower(strings.TrimSpace(asset.Name))
 		if strings.HasSuffix(lower, ".dsym.zip") || strings.HasSuffix(lower, ".dmg") || strings.HasSuffix(lower, ".pkg") {
 			continue
 		}
-		if !strings.HasSuffix(lower, ".exe") && !strings.HasSuffix(lower, ".msi") && !strings.HasSuffix(lower, ".zip") {
+		if strings.HasSuffix(lower, ".zip") &&
+			(strings.Contains(lower, "mac") || strings.Contains(lower, "darwin") || strings.Contains(lower, "universal")) {
+			continue
+		}
+		isInstaller := strings.HasSuffix(lower, ".exe") || strings.HasSuffix(lower, ".msi")
+		isZip := strings.HasSuffix(lower, ".zip")
+		if !isInstaller && !isZip {
 			continue
 		}
 		if archMatches(lower) {
-			return asset.BrowserDownloadURL
+			if isInstaller {
+				return asset.BrowserDownloadURL
+			}
+			if zipFallback == "" {
+				zipFallback = asset.BrowserDownloadURL
+			}
 		}
 	}
-	return ""
+	return zipFallback
 }
 
 func compareSemver(a, b string) int {

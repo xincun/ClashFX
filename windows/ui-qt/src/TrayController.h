@@ -26,6 +26,7 @@ public:
 
     bool startSingleInstanceServer();
     void handleExternalCommand(const QString& message);
+    ConsoleWindow* consoleWindow() const { return consoleWindow_; }
 
 public slots:
     void openConsole();

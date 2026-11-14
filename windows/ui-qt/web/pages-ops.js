@@ -31,6 +31,7 @@ const diagState = {
   probeReport: null,
   sysInfo: '',
   sysLoading: false,
+  sysAttempted: false,
   connSearch: '',
   connPaused: false,
 };
@@ -40,8 +41,10 @@ const settingsState = {
   dirty: false,
   draft: null,
   updateResult: null,
+  updateUrl: '',
   geoBusy: false,
   updBusy: false,
+  svcBusy: false,
   recordingKey: '',
 };
 
@@ -210,7 +213,10 @@ export function renderAiLockPage(root, handlers) {
     }
   });
 
-  root.querySelector('#ai-edit-rules')?.addEventListener('click', () => handlers.go(2, 2));
+  root.querySelector('#ai-edit-rules')?.addEventListener('click', () => {
+    store.preferredRuleProvider = 'clashfx-ai-lock';
+    handlers.go(2, 2);
+  });
   root.querySelector('#ai-diag-current')?.addEventListener('click', () => {
     const sel = root.querySelector('#ai-target-select')?.value || target;
     if (sel) handlers.go(5, 0, sel);
@@ -342,7 +348,7 @@ export function renderMultiNodePage(root, handlers) {
         <div class="row-flex">
           ${
             ns.direct_port > 0
-              ? `<button type="button" class="btn btn-xs" data-ns-chrome="${ns.direct_port}" title="Launch Direct Chrome">${ICONS.globe}</button>`
+              ? `<button type="button" class="btn btn-xs" data-ns-chrome="${ns.direct_port}" title="${t('启动独立直连浏览器', 'Launch Direct Chrome')}">${ICONS.globe}</button>`
               : ''
           }
           <button type="button" class="btn btn-xs ${ns.is_refreshing ? 'spin' : ''}" id="ns-refresh-direct" ${ns.is_refreshing ? 'disabled' : ''}>${ICONS.refresh}</button>
@@ -523,6 +529,7 @@ export function updateConnectionsTelemetry() {
 
 async function fetchDiagnosticBundle(root, { silent = false } = {}) {
   if (diagState.sysLoading) return;
+  diagState.sysAttempted = true;
   diagState.sysLoading = true;
   if (!silent) renderDiagnosticsPage(root);
   const res = await rpc('get_diagnostic_info', {}, { silent });
@@ -544,7 +551,12 @@ export function renderDiagnosticsPage(root) {
   const snap = store.snapshot || {};
   const settings = snap.settings || {};
   const nodes = collectAllNodeNames(snap);
-  if (!diagState.nodeName && nodes.length) diagState.nodeName = nodes[0];
+  if (!store.connected) diagState.sysAttempted = false;
+  if ((!diagState.nodeName || !nodes.includes(diagState.nodeName)) && nodes.length) {
+    diagState.nodeName = nodes[0];
+  } else if (!nodes.length) {
+    diagState.nodeName = '';
+  }
   if (!diagState.benchmarkUrl) diagState.benchmarkUrl = settings.benchmark_url || 'https://cp.cloudflare.com/generate_204';
 
   postNative({
@@ -678,7 +690,7 @@ export function renderDiagnosticsPage(root) {
     root.querySelector('#diag-fetch-sys')?.addEventListener('click', () => {
       fetchDiagnosticBundle(root, { silent: false });
     });
-    if (!diagState.sysInfo && !diagState.sysLoading && store.connected) {
+    if (!diagState.sysInfo && !diagState.sysAttempted && !diagState.sysLoading && store.connected) {
       fetchDiagnosticBundle(root, { silent: true });
     }
     root.querySelector('#diag-copy-sys')?.addEventListener('click', async () => {
@@ -702,17 +714,62 @@ export function renderDiagnosticsPage(root) {
   }
 }
 
+const CODE_KEY_MAP = {
+  Space: 'Space',
+  Enter: 'Return',
+  NumpadEnter: 'Return',
+  Tab: 'Tab',
+  Backspace: 'Backspace',
+  Delete: 'Delete',
+  Home: 'Home',
+  End: 'End',
+  PageUp: 'PageUp',
+  PageDown: 'PageDown',
+  ArrowUp: 'ArrowUp',
+  ArrowDown: 'ArrowDown',
+  ArrowLeft: 'ArrowLeft',
+  ArrowRight: 'ArrowRight',
+  Minus: '-',
+  Equal: '=',
+  BracketLeft: '[',
+  BracketRight: ']',
+  Backslash: '\\',
+  Semicolon: ';',
+  Quote: "'",
+  Comma: ',',
+  Period: '.',
+  Slash: '/',
+  Backquote: '`',
+};
+
 function formatKeyEventToChord(e) {
+  const code = e.code || '';
+  if (
+    /^(Control|Alt|Shift|Meta)(Left|Right)$/.test(code) ||
+    ['Control', 'Alt', 'Shift', 'Meta', 'OS'].includes(e.key)
+  ) {
+    return null;
+  }
   const mods = [];
   if (e.ctrlKey) mods.push('Ctrl');
   if (e.altKey) mods.push('Alt');
   if (e.shiftKey) mods.push('Shift');
   if (e.metaKey) mods.push(store.platform === 'darwin' ? 'Cmd' : 'Win');
-  const k = e.key;
-  if (['Control', 'Alt', 'Shift', 'Meta'].includes(k)) return null;
   if (!mods.length) return null;
-  let mainKey = k.toUpperCase();
-  if (mainKey === ' ') mainKey = 'Space';
+
+  let mainKey = '';
+  if (/^Key([A-Z])$/.test(code)) {
+    mainKey = code.slice(3);
+  } else if (/^Digit([0-9])$/.test(code)) {
+    mainKey = code.slice(5);
+  } else if (/^F([1-9]|1[0-9]|20)$/.test(code)) {
+    mainKey = code;
+  } else if (CODE_KEY_MAP[code]) {
+    mainKey = CODE_KEY_MAP[code];
+  } else if (e.key) {
+    mainKey = e.key === ' ' ? 'Space' : e.key.length === 1 ? e.key.toUpperCase() : e.key;
+  }
+  if (!mainKey) return null;
   return `${mods.join('+')}+${mainKey}`;
 }
 
@@ -725,10 +782,18 @@ export function renderSettingsPage(root) {
     settingsState.draft = JSON.parse(hash || '{}');
     if (!settingsState.draft.hotkeys) settingsState.draft.hotkeys = {};
     if (!Array.isArray(settingsState.draft.suspend_networks)) settingsState.draft.suspend_networks = [];
+    if (!Array.isArray(settingsState.draft.tun_route_excludes)) settingsState.draft.tun_route_excludes = [];
   }
   const d = settingsState.draft || {};
   const hk = d.hotkeys || {};
   const activeNetNames = snap.active_network?.profile_names || [];
+  const svcInstalled = Boolean(snap.service_installed);
+  const svcActive = Boolean(snap.core_via_service);
+  const svcLabel = svcActive
+    ? t('特权服务运行中', 'Privileged Service Active')
+    : svcInstalled
+    ? t('特权服务已安装', 'Service Installed')
+    : t('未安装特权服务', 'Service Not Installed');
 
   root.innerHTML = `
     <div class="settings-grid">
@@ -771,8 +836,8 @@ export function renderSettingsPage(root) {
       <div class="card">
         <div class="card-head"><div class="card-title">${ICONS.bolt} ${t('内核与代理端口', 'Kernel & Proxy Ports')}</div></div>
         <div class="form-row">
-          <div class="form-label-col"><div class="form-label">${t('混合代理端口 (Mixed Port)', 'Mixed Proxy Port')}</div><div class="form-desc">${t('HTTP + SOCKS5 共用监听端口', 'Shared HTTP & SOCKS5 listener')}</div></div>
-          <div class="form-control"><input type="number" class="input mono" data-set-num="port_override" value="${d.port_override || 7890}" /></div>
+          <div class="form-label-col"><div class="form-label">${t('混合代理端口 (Mixed Port)', 'Mixed Proxy Port')}</div><div class="form-desc">${t('HTTP + SOCKS5 共用监听端口（填 0 表示沿用订阅配置端口）', 'Shared HTTP & SOCKS5 port (0 = follow active profile)')}</div></div>
+          <div class="form-control"><input type="number" class="input mono" data-set-num="port_override" value="${d.port_override ?? 0}" /></div>
         </div>
         <div class="form-row">
           <div class="form-label-col"><div class="form-label">${t('控制面板 API 端口', 'Controller API Port')}</div></div>
@@ -787,11 +852,11 @@ export function renderSettingsPage(root) {
           <label class="switch"><input type="checkbox" data-set-bool="ipv6" ${d.ipv6 ? 'checked' : ''} /><span class="switch-track"></span></label>
         </div>
         <div class="form-row">
-          <div class="form-label-col"><div class="form-label">${t('中国大陆桌面应用自动直连', 'Bypass China Desktop Apps')}</div></div>
+          <div class="form-label-col"><div class="form-label">${t('中国大陆桌面应用自动直连', 'Bypass China Desktop Apps')}</div><div class="form-desc">${t('自动识别微信、钉钉、QQ 等国内桌面进程并放行直连，减少加速分流干扰', 'Automatically bypass common Mainland China desktop apps for direct access')}</div></div>
           <label class="switch"><input type="checkbox" data-set-bool="bypass_cn_apps" ${d.bypass_cn_apps ? 'checked' : ''} /><span class="switch-track"></span></label>
         </div>
         <div class="form-row">
-          <div class="form-label-col"><div class="form-label">${t('原样加载本地配置 (As-Is)', 'Load Custom Config As-Is')}</div></div>
+          <div class="form-label-col"><div class="form-label">${t('原样加载本地配置 (As-Is)', 'Load Custom Config As-Is')}</div><div class="form-desc">${t('不注入 ClashFX 默认覆写与增强规则，按原 YAML 交给内核执行（仅补齐必要控制端口）', 'Run custom profile YAML directly without ClashFX rule/override injections')}</div></div>
           <label class="switch"><input type="checkbox" data-set-bool="custom_config_as_is" ${d.custom_config_as_is ? 'checked' : ''} /><span class="switch-track"></span></label>
         </div>
       </div>
@@ -809,11 +874,15 @@ export function renderSettingsPage(root) {
           </div>
         </div>
         <div class="form-row">
-          <div class="form-label-col"><div class="form-label">${t('TUN 网卡名称 / MTU', 'Interface / MTU')}</div></div>
+          <div class="form-label-col"><div class="form-label">${t('出站物理网卡 / TUN MTU', 'Outbound NIC / TUN MTU')}</div><div class="form-desc">${t('绑定底层出站物理网卡名（留空自动探测），右侧设置 TUN MTU', 'Bind outbound physical interface name (blank = auto-detect) and TUN MTU')}</div></div>
           <div class="form-control">
-            <input type="text" class="input mono" placeholder="${store.platform === 'darwin' ? 'utun0 (auto)' : 'ClashFX-TUN'}" data-set-str="tun_interface_name" value="${esc(d.tun_interface_name || '')}" style="width:125px;" />
-            <input type="number" class="input mono" data-set-num="tun_mtu" value="${d.tun_mtu || 1500}" style="width:78px;" />
+            <input type="text" class="input mono" placeholder="${store.platform === 'darwin' ? 'auto (e.g. en0)' : 'auto (e.g. Wi-Fi)'}" data-set-str="tun_interface_name" value="${esc(d.tun_interface_name || '')}" style="width:130px;" />
+            <input type="number" class="input mono" data-set-num="tun_mtu" value="${d.tun_mtu || 1500}" style="width:74px;" />
           </div>
+        </div>
+        <div class="form-row">
+          <div class="form-label-col"><div class="form-label">${t('TUN 排除路由段 (Route Excludes)', 'TUN Route Excludes')}</div><div class="form-desc">${t('逗号分隔的 CIDR 网段，不经由 TUN 虚拟网卡接管', 'Comma-separated CIDRs excluded from TUN capture')}</div></div>
+          <div class="form-control" style="width:240px;"><input type="text" class="input mono" id="set-tun-excludes" value="${esc((d.tun_route_excludes || []).join(', '))}" placeholder="192.168.0.0/16, 10.0.0.0/8" /></div>
         </div>
         <div class="form-row">
           <div class="form-label-col"><div class="form-label">${t('内核日志级别', 'Core Log Level')}</div></div>
@@ -828,7 +897,7 @@ export function renderSettingsPage(root) {
           <div class="form-control" style="width:240px;"><input type="text" class="input mono" data-set-str="benchmark_url" value="${esc(d.benchmark_url || '')}" /></div>
         </div>
         <div class="form-row">
-          <div class="form-label-col"><div class="form-label">${t('系统代理忽略清单 (Bypass List)', 'System Proxy Bypass')}</div></div>
+          <div class="form-label-col"><div class="form-label">${t('系统代理忽略清单 (Bypass List)', 'System Proxy Bypass')}</div><div class="form-desc">${t('逗号或分号分隔的直连域名、IP 或 CIDR，绕过系统代理直接访问', 'Comma or semicolon-separated domains, IPs, or CIDRs bypassing system proxy')}</div></div>
           <div class="form-control" style="width:240px;"><input type="text" class="input mono" data-set-str="proxy_bypass_list" value="${esc(d.proxy_bypass_list || '')}" /></div>
         </div>
       </div>
@@ -857,7 +926,7 @@ export function renderSettingsPage(root) {
           <div class="form-label-col"><div class="form-label">${t('特定 Wi-Fi / 网络下自动挂起', 'Suspend on Trusted Networks')}</div><div class="form-desc">${t('逗号分隔网络名', 'Comma-separated network names')}</div></div>
           <div class="form-control" style="width:240px;">
             <input type="text" class="input" id="set-suspend-nets" value="${esc((d.suspend_networks || []).join(', '))}" />
-            ${activeNetNames.length ? `<button type="button" class="btn btn-sm" id="set-add-cur-net" title="${esc(activeNetNames[0])}">+当前</button>` : ''}
+            ${activeNetNames.length ? `<button type="button" class="btn btn-sm" id="set-add-cur-net" title="${esc(activeNetNames[0])}">${t('+当前', '+Current')}</button>` : ''}
           </div>
         </div>
       </div>
@@ -866,6 +935,8 @@ export function renderSettingsPage(root) {
         <div class="card-head">
           <div class="card-title">${ICONS.folder} ${t('目录路径、GEO 规则库与维护', 'Directories, GEO Databases & Maintenance')}</div>
           <div class="row-flex">
+            <span class="pill ${svcActive ? 'pill-green' : svcInstalled ? 'pill-blue' : ''}">${esc(svcLabel)}</span>
+            <button type="button" class="btn btn-sm" id="set-install-svc" ${settingsState.svcBusy ? 'disabled' : ''}>${settingsState.svcBusy ? t('安装中…', 'Installing…') : svcInstalled ? t('重装系统服务', 'Reinstall Service') : t('安装系统服务', 'Install Service')}</button>
             <button type="button" class="btn btn-sm" id="set-flush-fakeip">${t('清空 Fake-IP 缓存', 'Flush Fake-IP')}</button>
             <button type="button" class="btn btn-sm" id="set-reload-cfg">${ICONS.refresh} ${t('重载核心配置', 'Reload Config')}</button>
             <button type="button" class="btn btn-sm" id="set-update-geo" ${settingsState.geoBusy ? 'disabled' : ''}>${settingsState.geoBusy ? t('下载中…', 'Updating…') : t('更新 GEO 数据库', 'Update GEO DB')}</button>
@@ -885,24 +956,29 @@ export function renderSettingsPage(root) {
               <option value="stable" ${d.update_channel !== 'lab' ? 'selected' : ''}>Stable</option>
               <option value="lab" ${d.update_channel === 'lab' ? 'selected' : ''}>Lab Preview</option>
             </select>
-            <span class="metric-sub" style="margin-left:auto;">${settingsState.updateResult ? esc(settingsState.updateResult) : `v${esc(snap.version || '--')}`}</span>
+            <div class="row-flex" style="margin-left:auto;">
+              <span class="metric-sub">${settingsState.updateResult ? esc(settingsState.updateResult) : `v${esc(snap.version || '--')}`}</span>
+              ${settingsState.updateUrl ? `<button type="button" class="btn btn-xs btn-primary" id="set-open-upd">${t('前往下载', 'Download')}</button>` : ''}
+            </div>
           </div>
         </div>
       </div>
     </div>
 
-    ${
-      settingsState.dirty
-        ? `<div class="sticky-save-bar">
-             <span>${t('您有尚未保存的偏好设置修改', 'You have unsaved preference changes')}</span>
-             <div class="row-flex">
-               <button type="button" class="btn btn-sm" id="set-discard">${t('放弃修改', 'Discard')}</button>
-               <button type="button" class="btn btn-sm btn-primary" id="set-save">${ICONS.check} ${t('保存并应用设置', 'Save & Apply')}</button>
-             </div>
-           </div>`
-        : ''
-    }
+    <div class="sticky-save-bar" id="set-save-bar" ${settingsState.dirty ? '' : 'hidden'}>
+      <span>${t('您有尚未保存的偏好设置修改', 'You have unsaved preference changes')}</span>
+      <div class="row-flex">
+        <button type="button" class="btn btn-sm" id="set-discard">${t('放弃修改', 'Discard')}</button>
+        <button type="button" class="btn btn-sm btn-primary" id="set-save">${ICONS.check} ${t('保存并应用设置', 'Save & Apply')}</button>
+      </div>
+    </div>
   `;
+
+  const markSettingsDirty = () => {
+    settingsState.dirty = true;
+    const bar = root.querySelector('#set-save-bar');
+    if (bar) bar.hidden = false;
+  };
 
   root.querySelector('#set-theme')?.addEventListener('change', (e) => {
     applyTheme(e.target.value);
@@ -933,11 +1009,7 @@ export function renderSettingsPage(root) {
   root.querySelectorAll('[data-set-num]').forEach((inp) => {
     inp.addEventListener('input', (e) => {
       d[inp.getAttribute('data-set-num')] = Number(e.target.value) || 0;
-      if (!settingsState.dirty) {
-        settingsState.dirty = true;
-        const bar = root.querySelector('.sticky-save-bar');
-        if (!bar) renderSettingsPage(root);
-      }
+      markSettingsDirty();
     });
   });
 
@@ -945,11 +1017,16 @@ export function renderSettingsPage(root) {
     const ev = el.tagName === 'INPUT' ? 'input' : 'change';
     el.addEventListener(ev, (e) => {
       d[el.getAttribute('data-set-str')] = e.target.value;
-      if (!settingsState.dirty) {
-        settingsState.dirty = true;
-        if (el.tagName !== 'INPUT') renderSettingsPage(root);
-      }
+      markSettingsDirty();
     });
+  });
+
+  root.querySelector('#set-tun-excludes')?.addEventListener('input', (e) => {
+    d.tun_route_excludes = e.target.value
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    markSettingsDirty();
   });
 
   root.querySelector('#set-suspend-nets')?.addEventListener('input', (e) => {
@@ -957,7 +1034,7 @@ export function renderSettingsPage(root) {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
-    settingsState.dirty = true;
+    markSettingsDirty();
   });
 
   root.querySelector('#set-add-cur-net')?.addEventListener('click', () => {
@@ -995,6 +1072,8 @@ export function renderSettingsPage(root) {
     inp.addEventListener('blur', () => {
       if (settingsState.recordingKey === field) {
         settingsState.recordingKey = '';
+        inp.classList.remove('recording');
+        inp.value = d.hotkeys?.[field] || '';
       }
     });
   });
@@ -1010,7 +1089,7 @@ export function renderSettingsPage(root) {
 
   root.querySelector('#set-cfg-dir')?.addEventListener('input', (e) => {
     d.custom_config_dir = e.target.value.trim();
-    settingsState.dirty = true;
+    markSettingsDirty();
   });
   root.querySelector('#set-pick-cfg')?.addEventListener('click', async () => {
     const res = await native('pick_directory', {
@@ -1046,6 +1125,18 @@ export function renderSettingsPage(root) {
     renderSettingsPage(root);
   });
 
+  root.querySelector('#set-install-svc')?.addEventListener('click', async () => {
+    settingsState.svcBusy = true;
+    renderSettingsPage(root);
+    const res = await rpc('install_service', {}, { allowUacPrompt: false });
+    settingsState.svcBusy = false;
+    if (res.ok) {
+      showToast(t('系统特权服务安装成功', 'Privileged service installed'), 'ok');
+      await rpc('get_state', {}, { silent: true });
+    }
+    renderSettingsPage(root);
+  });
+
   root.querySelector('#set-check-upd')?.addEventListener('click', async () => {
     settingsState.updBusy = true;
     renderSettingsPage(root);
@@ -1055,8 +1146,13 @@ export function renderSettingsPage(root) {
       settingsState.updateResult = res.data.update_available
         ? `${t('发现新版本', 'Update')}: ${res.data.latest_version}`
         : `${t('已是最新', 'Up to date')} (${res.data.current_version || snap.version})`;
+      settingsState.updateUrl = res.data.update_available ? res.data.download_url || '' : '';
     }
     renderSettingsPage(root);
+  });
+
+  root.querySelector('#set-open-upd')?.addEventListener('click', () => {
+    if (settingsState.updateUrl) native('open_url', { url: settingsState.updateUrl });
   });
 
   root.querySelector('#set-discard')?.addEventListener('click', () => {

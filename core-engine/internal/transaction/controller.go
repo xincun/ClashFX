@@ -26,6 +26,12 @@ var defaultWindowsFakeIPFilter = []any{
 	"*.msftconnecttest.com",
 	"*.msftncsi.com",
 	"dns.msftncsi.com",
+	"captive.apple.com",
+	"time.apple.com",
+	"time-ios.apple.com",
+	"sequoia.apple.com",
+	"seed-sequoia.siri.apple.com",
+	"mesu.apple.com",
 	"time.*.com",
 	"time.*.gov",
 	"ntp.*.com",
@@ -238,7 +244,13 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 	if settings.EnhancedMode && settings.CustomConfigAsIs {
 		state.MixedPort = intFromYAML(root["mixed-port"])
 		state.HTTPPort = intFromYAML(root["port"])
+		if state.HTTPPort <= 0 {
+			state.HTTPPort = state.MixedPort
+		}
 		state.SocksPort = intFromYAML(root["socks-port"])
+		if state.SocksPort <= 0 {
+			state.SocksPort = state.MixedPort
+		}
 		state.APIPort = extractPortFromHostPort(fmt.Sprint(root["external-controller"]), settings.APIPort)
 		if sec, ok := root["secret"].(string); ok {
 			state.APISecret = sec
@@ -449,11 +461,15 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 			}
 		}
 		root["tun"] = tunMap
+		if settings.BypassCNApps && !settings.CustomConfigAsIs && root["find-process-mode"] == nil {
+			root["find-process-mode"] = "always"
+		}
 		// Prevent proxy loops from core/daemon executables under Windows & Darwin TUN via inline rule-set
 		profile.SetInlineClassicalRuleProvider(root, profile.InternalDirectRuleProviderName, []string{
 			"PROCESS-NAME,mihomo_core.exe",
 			"PROCESS-NAME,clashfx-daemon.exe",
 			"PROCESS-NAME,clashfx-service.exe",
+			"PROCESS-NAME,clashfx-ui.exe",
 			"PROCESS-NAME,mihomo_core",
 			"PROCESS-NAME,clashfx-daemon",
 			"PROCESS-NAME,clashfx-service",

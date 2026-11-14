@@ -61,6 +61,7 @@ const rulesState = {
 };
 
 let rulesFetchSeq = 0;
+let mixinConvertSeq = 0;
 let lastRenderedRulesSubTab = -1;
 
 const subDraft = {
@@ -69,6 +70,7 @@ const subDraft = {
   ua: 'clash-verge/v2.0.0',
   busy: false,
   refreshingName: '',
+  refreshAllBusy: false,
 };
 
 export function setRulesSubTab(subTab) {
@@ -134,6 +136,7 @@ export function renderSubscriptionsPage(root) {
     .join('');
 
   const pathSep = store.platform === 'darwin' ? '/' : '\\';
+  const cleanConfigDir = String(snap.config_dir || '').replace(/[\\/]+$/, '');
   const localCardsHtml = localOnlyProfiles
     .map((name) => {
       const isActive = settings.selected_profile === name;
@@ -151,7 +154,7 @@ export function renderSubscriptionsPage(root) {
                 : `<button type="button" class="btn btn-sm btn-primary" data-sub-select="${esc(name)}">${t('切换使用', 'Activate')}</button>`
             }
           </div>
-          <div class="metric-sub mono">${esc(snap.config_dir || '')}${pathSep}${esc(name)}.yaml</div>
+          <div class="metric-sub mono">${esc(cleanConfigDir)}${pathSep}${esc(name)}.yaml</div>
         </div>`;
     })
     .join('');
@@ -162,7 +165,7 @@ export function renderSubscriptionsPage(root) {
         <div class="card-title">${ICONS.plus} ${t('导入或添加订阅 / 配置', 'Import Subscription or Config Link')}</div>
         <div class="row-flex">
           <button type="button" class="btn btn-sm" id="sub-open-dir">${ICONS.folder} ${t('打开配置目录', 'Config Folder')}</button>
-          <button type="button" class="btn btn-sm" id="sub-refresh-all">${ICONS.refresh} ${t('全部刷新', 'Refresh All')}</button>
+          <button type="button" class="btn btn-sm ${subDraft.refreshAllBusy ? 'spin' : ''}" id="sub-refresh-all" ${subDraft.refreshAllBusy ? 'disabled' : ''}>${ICONS.refresh} ${subDraft.refreshAllBusy ? t('刷新中…', 'Refreshing…') : t('全部刷新', 'Refresh All')}</button>
         </div>
       </div>
       <div style="display:grid;grid-template-columns:2.4fr 1.1fr 1.1fr auto;gap:8px;align-items:center;">
@@ -246,13 +249,31 @@ export function renderSubscriptionsPage(root) {
   });
 
   root.querySelector('#sub-refresh-all')?.addEventListener('click', async () => {
-    if (!subs.length) return;
+    if (!subs.length || subDraft.refreshAllBusy) return;
+    subDraft.refreshAllBusy = true;
+    renderSubscriptionsPage(root);
     showToast(t(`正在刷新 ${subs.length} 个订阅…`, `Refreshing ${subs.length} subscriptions…`), 'info');
-    for (const s of subs) {
-      await rpc('refresh_subscription', { name: s.name });
+    let okCount = 0;
+    let failCount = 0;
+    try {
+      for (const s of subs) {
+        const res = await rpc('refresh_subscription', { name: s.name }, { silent: true });
+        if (res.ok) okCount += 1;
+        else failCount += 1;
+      }
+      await rpc('get_state', {}, { silent: true });
+      if (failCount === 0) {
+        showToast(t(`全部 ${okCount} 个订阅已更新`, `Updated all ${okCount} subscriptions`), 'ok');
+      } else {
+        showToast(
+          t(`订阅刷新完成：${okCount} 个成功，${failCount} 个失败`, `Refresh finished: ${okCount} succeeded, ${failCount} failed`),
+          'warn'
+        );
+      }
+    } finally {
+      subDraft.refreshAllBusy = false;
+      renderSubscriptionsPage(root);
     }
-    await rpc('get_state', {}, { silent: true });
-    showToast(t('全部订阅已更新', 'All subscriptions updated'), 'ok');
   });
 
   root.querySelectorAll('[data-sub-select]').forEach((btn) => {
@@ -290,8 +311,8 @@ export function renderSubscriptionsPage(root) {
       const delFile = await showConfirm({
         title: t(`移除订阅「${name}」`, `Remove "${name}"`),
         message: t(
-          '点击「删除」将移除该订阅记录及本地 YAML 配置文件；如仅想保留本地配置，请点击取消。',
-          'Confirm to remove this subscription and delete its local YAML profile file.'
+          '点击「删除订阅及文件」将永久移除该订阅记录与本地 YAML 配置文件；点击「取消」则不做任何改动。',
+          'Confirm to remove this subscription record and delete its local YAML profile file. Cancel leaves files unchanged.'
         ),
         confirmText: t('删除订阅及文件', 'Delete Subscription & File'),
         danger: true,
@@ -311,6 +332,8 @@ function computeEffectiveKey() {
     snap.core_running ? '1' : '0',
     s.selected_profile || '',
     (s.outbound_mode || 'rule').toLowerCase(),
+    s.enhanced_mode ? '1' : '0',
+    s.custom_config_as_is ? '1' : '0',
     s.claudeProxyLockEnabled ? '1' : '0',
     s.claudeProxyLockTarget || '',
     s.bypass_cn_apps ? '1' : '0',
@@ -336,6 +359,14 @@ function applyEffectiveRulesPayload(data, key = computeEffectiveKey()) {
   rulesState.effectiveKey = key;
   rulesState.effective = data;
   const providers = Object.values(data.rule_providers || {}).filter((p) => p && (p.editable || p.raw_text));
+  if (store.preferredRuleProvider && !rulesState.providerDirty) {
+    const preferred = providers.find((p) => p.name === store.preferredRuleProvider);
+    if (preferred) {
+      rulesState.selectedProvider = preferred.name;
+      rulesState.providerDraftText = preferred.raw_text || '';
+      store.preferredRuleProvider = '';
+    }
+  }
   if (providers.length && (!rulesState.selectedProvider || !data.rule_providers?.[rulesState.selectedProvider])) {
     rulesState.selectedProvider = providers[0].name;
     rulesState.providerDraftText = providers[0].raw_text || '';
@@ -472,6 +503,14 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
   const targets = Array.from(new Set(['DIRECT', 'REJECT', rulesState.defaultTarget, ...groups].filter(Boolean)));
   const eff = rulesState.effective || { total_rules: 0, rules: [], rule_providers: {} };
   const providers = Object.values(eff.rule_providers || {}).filter((p) => p && (p.editable || p.raw_text));
+  if (store.preferredRuleProvider && !rulesState.providerDirty) {
+    const preferred = providers.find((p) => p.name === store.preferredRuleProvider);
+    if (preferred) {
+      rulesState.selectedProvider = preferred.name;
+      rulesState.providerDraftText = preferred.raw_text || '';
+      store.preferredRuleProvider = '';
+    }
+  }
   const activeProv = providers.find((p) => p.name === rulesState.selectedProvider) || providers[0] || null;
   if (activeProv && !rulesState.selectedProvider) {
     rulesState.selectedProvider = activeProv.name;
@@ -598,6 +637,9 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
     `;
   } else {
     const allEffRules = Array.isArray(eff.rules) ? eff.rules : [];
+    if (rulesState.effSource === 'subscription') {
+      rulesState.effSource = 'profile';
+    }
     const q = rulesState.effSearch.trim().toLowerCase();
     const filtered = allEffRules.filter((r) => {
       if (rulesState.effSource !== 'all' && String(r.source).toLowerCase() !== rulesState.effSource) return false;
@@ -636,7 +678,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
             return `
             <tr class="${r.disabled ? 'row-disabled' : ''} ${isSetMatch ? 'row-selected' : ''}" data-eff-row-payload="${esc(r.payload || '')}" data-eff-row-type="${esc(r.type || '')}">
               <td style="width:48px;text-align:center;">
-                <input type="checkbox" data-rule-enable="${r.index}" ${r.disabled ? '' : 'checked'} />
+                <input type="checkbox" data-rule-enable="${r.index}" ${r.disabled ? '' : 'checked'} ${String(r.source || '').toLowerCase() === 'system' ? `disabled title="${esc(t('系统守护规则不可禁用', 'System guard rules cannot be disabled'))}"` : ''} />
               </td>
               <td style="width:104px;">${sourceBadge(r.source)}</td>
               <td class="mono" style="width:118px;font-weight:600;">${esc(r.type)}</td>
@@ -664,7 +706,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
               <option value="ai_lock" ${rulesState.effSource === 'ai_lock' ? 'selected' : ''}>${t('AI 锁定', 'AI Lock')}</option>
               <option value="cn_apps" ${rulesState.effSource === 'cn_apps' ? 'selected' : ''}>${t('CN 直连', 'CN Direct')}</option>
               <option value="mixin" ${rulesState.effSource === 'mixin' ? 'selected' : ''}>${t('自定义分流', 'Custom Routing')}</option>
-              <option value="subscription" ${rulesState.effSource === 'subscription' ? 'selected' : ''}>${t('订阅规则', 'Profile')}</option>
+              <option value="profile" ${rulesState.effSource === 'profile' ? 'selected' : ''}>${t('订阅规则', 'Profile')}</option>
             </select>
             <span class="pill">${filtered.length} / ${allEffRules.length}</span>
           </div>
@@ -733,6 +775,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
       renderRulesPage(root, -1, { skipFetch: true });
 
       if (prevTab === 0 && next === 1) {
+        const convertSeq = ++mixinConvertSeq;
         rpc(
           'convert_profile_mixin',
           {
@@ -744,13 +787,14 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
           },
           { silent: true }
         ).then((res) => {
-          if (res.ok && res.data && !rulesState.mixinDirty && store.page === 2 && rulesState.subTab === 1) {
+          if (convertSeq === mixinConvertSeq && res.ok && res.data && store.page === 2 && rulesState.subTab === 1) {
             rulesState.yamlText = res.data.yaml || rulesState.yamlText;
             const ed = root.querySelector('#mixin-yaml-editor');
             if (ed && document.activeElement !== ed) ed.value = rulesState.yamlText;
           }
         });
       } else if (prevTab === 1 && next === 0) {
+        const convertSeq = ++mixinConvertSeq;
         rpc(
           'convert_profile_mixin',
           {
@@ -759,7 +803,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
           },
           { silent: true }
         ).then((res) => {
-          if (res.ok && res.data) {
+          if (convertSeq === mixinConvertSeq && res.ok && res.data) {
             rulesState.bypassCnWeb = Boolean(res.data.bypass_cn_web);
             rulesState.bypassLan = Boolean(res.data.bypass_lan);
             rulesState.rules = Array.isArray(res.data.rules) ? res.data.rules : [];
@@ -966,6 +1010,8 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
           if (res.data) applyEffectiveRulesPayload(res.data);
           renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
           showToast(e.target.checked ? t('规则已启用', 'Rule enabled') : t('规则已禁用', 'Rule disabled'), 'ok');
+        } else {
+          e.target.checked = !e.target.checked;
         }
       });
     });
@@ -992,6 +1038,8 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
     root.querySelector('#prov-editor')?.addEventListener('input', (e) => {
       rulesState.providerDraftText = e.target.value;
       rulesState.providerDirty = true;
+      const dirtyBadge = root.querySelector('#rules-dirty-badge');
+      if (dirtyBadge) dirtyBadge.hidden = false;
       const pill = root.querySelector('#prov-count-pill');
       if (pill) {
         pill.textContent = `${countListLines(e.target.value)} ${t('条规则', 'rules')}`;

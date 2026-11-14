@@ -39,12 +39,14 @@ var DefaultCommonCNAppProcesses = []string{
 
 var DefaultDarwinCNAppProcesses = []string{
 	// IM & Collaboration (macOS)
-	"WeChat", "Weixin", "WeChatAppEx", "QQ", "DingTalk", "Feishu", "Lark", "WXWork", "AliWangWang",
+	"WeChat", "Weixin", "WeChatAppEx", "QQ", "QQ Helper", "DingTalk", "DingTalk Helper", "DingTalk Helper (Networking)",
+	"Feishu", "Feishu Helper", "Feishu Helper (Networking)", "Lark", "Lark Helper", "Lark Helper (Networking)",
+	"WXWork", "AliWangWang",
 	// Cloud Storage & Downloaders (macOS)
-	"baidunetdisk", "aDrive", "QuarkCloudDrive", "Thunder",
+	"baidunetdisk", "BaiduNetdisk_mac", "aDrive", "QuarkCloudDrive", "Thunder",
 	// Media, Office & Remote Desktop (macOS)
-	"NeteaseMusic", "QQMusic", "Douyin", "BiliBili", "QQLive", "TencentVideo", "iQIYI",
-	"wpsoffice", "WPS Office", "ToDesk", "SunloginClient",
+	"NeteaseMusic", "NeteaseMusic Helper", "QQMusic", "Douyin", "BiliBili", "bilibili",
+	"QQLive", "TencentVideo", "iQIYI", "wpsoffice", "WPS Office", "ToDesk", "SunloginClient",
 }
 
 // SetFileClassicalRuleProvider registers a local plain-text classical rule-provider

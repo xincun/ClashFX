@@ -543,6 +543,22 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
 
     func webView(
         _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if navigationAction.targetFrame == nil,
+           let url = navigationAction.request.url {
+            let scheme = url.scheme?.lowercased() ?? ""
+            if scheme == "http" || scheme == "https" {
+                NSWorkspace.shared.open(url)
+            }
+        }
+        return nil
+    }
+
+    func webView(
+        _ webView: WKWebView,
         runJavaScriptAlertPanelWithMessage message: String,
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping () -> Void
@@ -635,8 +651,9 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
             let lang = (msg["language"] as? String) ?? "zh_CN"
             if lang == "zh_CN" || lang == "en_US" {
                 I18n.shared.setLanguage(lang)
-                persistSetting(key: "language", value: lang)
             }
+        case "smoke_report":
+            break
         case "telemetry_subscribe":
             let enabled = (msg["enabled"] as? Bool) ?? false
             let includeConn = (msg["include_connections"] as? Bool) ?? false
@@ -781,7 +798,7 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
         }
 
         let method = ((msg["method"] as? String) ?? "GET").uppercased()
-        var request = URLRequest(url: url, timeoutInterval: 15)
+        var request = URLRequest(url: url, timeoutInterval: 8.0)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if !secret.isEmpty {
@@ -900,7 +917,7 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
                 replyErr(L("未找到 Google Chrome / Edge / Chromium 浏览器。", "Google Chrome / Edge / Chromium not found in /Applications."))
                 return
             }
-            let profileDir = (NSTemporaryDirectory() as NSString).appendingPathComponent("clashfx-chrome-profile")
+            let profileDir = (NSTemporaryDirectory() as NSString).appendingPathComponent("clashfx-chrome-port-\(port)")
             try? FileManager.default.createDirectory(atPath: profileDir, withIntermediateDirectories: true)
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: exe)

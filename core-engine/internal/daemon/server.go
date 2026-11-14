@@ -194,19 +194,38 @@ func (s *Server) serveClient(cc *clientConn) {
 		s.clientsMu.Unlock()
 		_ = cc.conn.Close()
 	}()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	sem := make(chan struct{}, 16)
 
 	scanner := bufio.NewScanner(cc.conn)
 	scanner.Buffer(make([]byte, 0, 32*1024), 4<<20)
 	for scanner.Scan() {
+		raw := append([]byte(nil), scanner.Bytes()...)
 		var req RPCRequest
-		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+		if err := json.Unmarshal(raw, &req); err != nil {
 			_ = cc.writeJSON(RPCResponse{OK: false, Error: "invalid JSON RPC frame"})
 			continue
 		}
-		resp := s.dispatch(cc, req)
-		if err := cc.writeJSON(resp); err != nil {
+		if req.Method == "subscribe" || req.Method == "quit_daemon" || req.Method == "shutdown" {
+			resp := s.dispatch(cc, req)
+			if err := cc.writeJSON(resp); err != nil {
+				return
+			}
+			continue
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-s.quitCh:
 			return
 		}
+		wg.Add(1)
+		go func(r RPCRequest) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			resp := s.dispatch(cc, r)
+			_ = cc.writeJSON(resp)
+		}(req)
 	}
 }
 
@@ -225,7 +244,8 @@ func rpcTimeoutForMethod(method string) time.Duration {
 		"check_updates",
 		"set_enhanced_mode",
 		"set_ai_lock",
-		"reload_config":
+		"reload_config",
+		"install_service":
 		return 120 * time.Second
 	default:
 		return 35 * time.Second
@@ -361,6 +381,11 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		}
 		_ = json.Unmarshal(req.Params, &p)
 		if _, err := s.engine.applyAndSync(ctx, true, p.AllowUAC); err != nil {
+			return errResp(err)
+		}
+		return okResp(s.engine.Snapshot())
+	case "install_service":
+		if err := s.engine.InstallPrivilegedService(); err != nil {
 			return errResp(err)
 		}
 		return okResp(s.engine.Snapshot())

@@ -119,14 +119,20 @@ final class HotkeyManager {
     }
 
     private func parseChord(_ raw: String) -> (keyCode: UInt32, modifiers: UInt32)? {
-        let parts = raw
+        var source = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var forcedPlusKey = false
+        if source.hasSuffix("++") {
+            forcedPlusKey = true
+            source = String(source.dropLast(1))
+        }
+        let parts = source
             .split(separator: "+")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .filter { !$0.isEmpty }
         guard !parts.isEmpty else { return nil }
 
         var mods: UInt32 = 0
-        var keyName = ""
+        var keyName = forcedPlusKey ? "=" : ""
 
         for part in parts {
             switch part {
@@ -163,10 +169,19 @@ final class HotkeyManager {
             "f1": kVK_F1, "f2": kVK_F2, "f3": kVK_F3, "f4": kVK_F4,
             "f5": kVK_F5, "f6": kVK_F6, "f7": kVK_F7, "f8": kVK_F8,
             "f9": kVK_F9, "f10": kVK_F10, "f11": kVK_F11, "f12": kVK_F12,
+            "f13": kVK_F13, "f14": kVK_F14, "f15": kVK_F15, "f16": kVK_F16,
+            "f17": kVK_F17, "f18": kVK_F18, "f19": kVK_F19, "f20": kVK_F20,
             "space": kVK_Space, "return": kVK_Return, "enter": kVK_Return,
             "tab": kVK_Tab, "escape": kVK_Escape, "esc": kVK_Escape,
+            "backspace": kVK_Delete, "delete": kVK_ForwardDelete, "del": kVK_ForwardDelete,
+            "home": kVK_Home, "end": kVK_End,
+            "pageup": kVK_PageUp, "pagedown": kVK_PageDown,
+            "arrowup": kVK_UpArrow, "up": kVK_UpArrow,
+            "arrowdown": kVK_DownArrow, "down": kVK_DownArrow,
+            "arrowleft": kVK_LeftArrow, "left": kVK_LeftArrow,
+            "arrowright": kVK_RightArrow, "right": kVK_RightArrow,
             "minus": kVK_ANSI_Minus, "-": kVK_ANSI_Minus,
-            "equal": kVK_ANSI_Equal, "=": kVK_ANSI_Equal,
+            "equal": kVK_ANSI_Equal, "=": kVK_ANSI_Equal, "+": kVK_ANSI_Equal,
             "[": kVK_ANSI_LeftBracket, "]": kVK_ANSI_RightBracket,
             ";": kVK_ANSI_Semicolon, "'": kVK_ANSI_Quote,
             ",": kVK_ANSI_Comma, ".": kVK_ANSI_Period, "/": kVK_ANSI_Slash,

@@ -4,6 +4,7 @@
 #include <QHash>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QList>
 #include <QLocalSocket>
 #include <QObject>
 #include <QString>
@@ -60,6 +61,15 @@ private:
         RpcCallback callback;
     };
 
+    struct QueuedCall {
+        QString method;
+        QJsonObject params;
+        RpcCallback callback;
+        qint64 queuedEpochMs = 0;
+    };
+
+    void expireStaleQueuedCalls();
+
     QString serverName_;
     QString customPipeArg_;
     QString customDataDir_;
@@ -70,6 +80,7 @@ private:
     qint64 lastSpawnEpochMs_ = 0;
     bool stopping_ = false;
     QHash<qint64, PendingCall> pending_;
+    QList<QueuedCall> queuedCalls_;
     QJsonObject snapshot_;
 };
 

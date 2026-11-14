@@ -147,9 +147,12 @@ function computePageRenderSignature() {
         Boolean(snap.core_running),
         settings.selected_profile || '',
         settings.outbound_mode || 'rule',
+        Boolean(settings.enhanced_mode),
+        Boolean(settings.custom_config_as_is),
         Boolean(settings.claudeProxyLockEnabled),
         settings.claudeProxyLockTarget || '',
         Boolean(settings.bypass_cn_apps),
+        snap.config_dir || '',
         snap.profile_mixin_path || '',
         snap.default_rule_target || '',
         (snap.proxy_groups || []).map((g) => g.name),
@@ -183,6 +186,8 @@ function computePageRenderSignature() {
         snap.version || '',
         snap.config_dir || '',
         snap.active_network || null,
+        Boolean(snap.service_installed),
+        Boolean(snap.core_via_service),
         settings,
       ]);
     default:
@@ -481,7 +486,8 @@ function syncConsoleHost(forceReload = false) {
             if (cur.claudeProxyLockEnabled) {
               const r = await rpc('set_ai_lock', { enabled: false, target: '' }, { allowUacPrompt: false });
               if (!r.ok) return;
-            } else if (cur.enhanced_mode) {
+            }
+            if (cur.enhanced_mode) {
               const r = await rpc('set_enhanced_mode', { enabled: false }, { allowUacPrompt: false });
               if (!r.ok) return;
             }
@@ -504,7 +510,7 @@ function syncConsoleHost(forceReload = false) {
         ? t('核心守护进程未连接', 'Daemon Disconnected')
         : t('Mihomo 内核正在待机或启动中', 'Mihomo Core Standing By');
       const sub = !store.connected
-        ? t('正在尝试重新建立守护进程命名管道连接…', 'Waiting for ClashFX daemon pipe connection…')
+        ? t('正在尝试重新建立核心守护进程连接…', 'Waiting for ClashFX daemon IPC connection…')
         : t('内核启动就绪后将自动加载完整 MetaCubeXD 控制台。', 'MetaCubeXD console will load automatically once the core API is ready.');
       consoleStandby.innerHTML = `
         <div style="font-size:15px;font-weight:700;color:var(--text-primary);">${esc(title)}</div>
@@ -625,6 +631,7 @@ function wireWindowControls() {
     });
     region.addEventListener('dblclick', (e) => {
       if (e.target.closest('button, a, input, select, textarea, [data-no-drag]')) return;
+      if (store.platform === 'darwin' && region.classList.contains('brand-header')) return;
       postNative({ type: 'window_control', action: 'toggle_maximize' });
     });
   });
@@ -636,14 +643,19 @@ function wireWindowControls() {
     });
   });
 
+  let focusOutTimer = null;
   pageRoot?.addEventListener(
     'focusout',
     () => {
-      if (pendingPageRender && !isUserTypingInPage()) {
-        pendingPageRender = false;
-        lastPageSig = `${store.page}:${computePageRenderSignature()}`;
-        renderPageContent();
-      }
+      if (focusOutTimer) clearTimeout(focusOutTimer);
+      focusOutTimer = setTimeout(() => {
+        focusOutTimer = null;
+        if (pendingPageRender && !isUserTypingInPage()) {
+          pendingPageRender = false;
+          lastPageSig = `${store.page}:${computePageRenderSignature()}`;
+          renderPageContent();
+        }
+      }, 180);
     },
     true
   );
@@ -689,7 +701,7 @@ function wireIconsAndBootstrap() {
     if (eventType === 'telemetry') {
       const dockSpd = document.getElementById('dock-speed');
       if (dockSpd) dockSpd.textContent = `↑ ${formatSpeed(store.telemetry.up)} · ↓ ${formatSpeed(store.telemetry.down)}`;
-      if (store.page === 5 && !isUserTypingInPage()) updateConnectionsTelemetry();
+      if (store.page === 5) updateConnectionsTelemetry();
     }
   });
 

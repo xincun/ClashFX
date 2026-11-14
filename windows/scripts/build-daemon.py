@@ -54,7 +54,15 @@ def main() -> int:
         for exe_name, pkg in BINARIES:
             out_path = out_dir / exe_name
             subprocess.check_call(
-                ["go", "build", "-trimpath", "-ldflags=-H=windowsgui -s -w", "-o", str(out_path), pkg],
+                [
+                    "go",
+                    "build",
+                    "-trimpath",
+                    "-ldflags=-H=windowsgui -s -w -X github.com/clashfx/core-engine/internal/daemon.AppVersion=1.19.24",
+                    "-o",
+                    str(out_path),
+                    pkg,
+                ],
                 cwd=str(CORE_ENGINE_DIR),
                 env=env,
             )

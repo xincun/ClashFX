@@ -33,6 +33,7 @@ public:
     ~ConsoleWindow() override;
 
     void setAllowClose(bool allow) { allowClose_ = allow; }
+    void configureSmokeTest(int dwellMs, const QString& reportPath);
     void applySnapshot(bool connected, const QJsonObject& snapshot);
     void navigateTo(ConsolePage page, int subTab = -1, const QString& diagNode = QString());
     ConsolePage currentPage() const { return currentPage_; }
@@ -62,6 +63,8 @@ private:
     void syncTelemetryState();
     void saveWindowGeometry();
     void restoreWindowGeometry();
+    void beginSmokeWalk();
+    void finishSmokeTest(const QJsonObject& dom, const QString& timeoutErr);
     static QString findChromiumExecutable();
 
     DaemonClient* client_ = nullptr;
@@ -83,6 +86,13 @@ private:
     bool connected_ = false;
     bool uiReady_ = false;
     bool telemetryConnections_ = false;
+    int smokeTestMs_ = 0;
+    QString smokeReportPath_;
+    bool smokeStarted_ = false;
+    bool smokeCompleted_ = false;
+    qint64 smokeInitEpochMs_ = 0;
+    QTimer* smokePollTimer_ = nullptr;
+    QTimer* smokeDeadlineTimer_ = nullptr;
     QString theme_ = QStringLiteral("dark");
     ConsolePage currentPage_ = ConsolePage::Dashboard;
     int pendingSubTab_ = -1;

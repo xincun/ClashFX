@@ -381,6 +381,35 @@ func (e *Engine) HandlePowerResume() {
 	e.handleWakeOrNetworkCheck()
 }
 
+func (e *Engine) InstallPrivilegedService() error {
+	if !supportsPrivilegedService() {
+		return nil
+	}
+	e.opMu.Lock()
+	svcExe := serviceExecutablePath(e.cfg.BinDir)
+	err := ElevateAndInstallService(svcExe)
+	e.statusMu.Lock()
+	if err != nil {
+		e.lastApplyErr = err.Error()
+	} else {
+		e.lastApplyErr = ""
+	}
+	e.statusMu.Unlock()
+	enhanced := e.store.Settings().EnhancedMode
+	e.opMu.Unlock()
+
+	if err != nil {
+		e.notifyStateChanged()
+		return err
+	}
+	if enhanced {
+		_, syncErr := e.applyAndSync(context.Background(), true, false)
+		return syncErr
+	}
+	e.notifyStateChanged()
+	return nil
+}
+
 // ApplyRuntimeConfig implements transaction.CoreApplier, transparently routing
 // normal mode through localRunner and Enhanced TUN mode through ClashFXService.
 func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSettings, homeDir, runtimeConfigPath string, apiPort int, secret string) error {
@@ -1657,7 +1686,7 @@ func (e *Engine) ImportURLScheme(ctx context.Context, rawURI string) (subscripti
 		return subscription.ManagedSubscription{}, fmt.Errorf("invalid URL scheme: %w", err)
 	}
 	scheme := strings.ToLower(u.Scheme)
-	if scheme != "clash" && scheme != "clashfx" {
+	if scheme != "clash" && scheme != "clashfx" && scheme != "clash-verge" {
 		return subscription.ManagedSubscription{}, fmt.Errorf("unsupported scheme %q", u.Scheme)
 	}
 	q := u.Query()
@@ -1672,13 +1701,43 @@ func (e *Engine) ImportURLScheme(ctx context.Context, rawURI string) (subscripti
 func (e *Engine) UpdateGeoDatabases(ctx context.Context) error {
 	settings := e.store.Settings()
 	proxyPort := e.activeLocalProxyPort()
-	if err := e.subMgr.UpdateExternalResourceViaProxy(ctx, settings.MMDBDownloadURL, "Country.mmdb", 1024, proxyPort); err != nil {
+	mmdbData, err := e.subMgr.DownloadExternalResourceViaProxy(ctx, settings.MMDBDownloadURL, "Country.mmdb", 1024, proxyPort)
+	if err != nil {
 		return fmt.Errorf("update Country.mmdb: %w", err)
 	}
-	if err := e.subMgr.UpdateExternalResourceViaProxy(ctx, settings.GeoSiteDownloadURL, "geosite.dat", 1024, proxyPort); err != nil {
+	geositeData, err := e.subMgr.DownloadExternalResourceViaProxy(ctx, settings.GeoSiteDownloadURL, "geosite.dat", 1024, proxyPort)
+	if err != nil {
 		return fmt.Errorf("update geosite.dat: %w", err)
 	}
-	if e.IsCoreRunning() {
+
+	cfgDir := e.store.ActiveConfigDir()
+	writeBoth := func() error {
+		if err := profile.WriteFileAtomic(filepath.Join(cfgDir, "Country.mmdb"), mmdbData, 0644); err != nil {
+			return fmt.Errorf("write Country.mmdb: %w", err)
+		}
+		if err := profile.WriteFileAtomic(filepath.Join(cfgDir, "geosite.dat"), geositeData, 0644); err != nil {
+			return fmt.Errorf("write geosite.dat: %w", err)
+		}
+		return nil
+	}
+
+	wasRunning := e.IsCoreRunning()
+	if err := writeBoth(); err != nil {
+		if !wasRunning {
+			return err
+		}
+		// On Windows, mihomo_core.exe holds open file handles on Country.mmdb / geosite.dat.
+		// Stop core briefly while replacing files atomically, then restart cleanly.
+		_ = e.localRunner.Stop()
+		if e.isCoreViaService() {
+			_, _ = callService(6*time.Second, service.Request{Action: "stop_core"})
+		}
+		if retryErr := writeBoth(); retryErr != nil {
+			_, _ = e.applyAndSync(ctx, true, false)
+			return retryErr
+		}
+	}
+	if wasRunning {
 		_, err := e.applyAndSync(ctx, true, false)
 		return err
 	}

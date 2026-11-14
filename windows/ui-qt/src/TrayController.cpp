@@ -538,6 +538,9 @@ void TrayController::rebuildMenuContents() {
         } else if (!now.isEmpty()) {
             groupMenuTitle = QStringLiteral("%1  (%2)").arg(gName, now);
         }
+        if (hasManual) {
+            groupMenuTitle += L(" [固定]", " [Pinned]");
+        }
         QMenu* gMenu = trayMenu_->addMenu(groupMenuTitle);
 
         QAction* benchGrpAct = gMenu->addAction(L("测试本组延迟", "Test Group Latency"));
@@ -704,10 +707,11 @@ void TrayController::rebuildMenuContents() {
     }
     cfgMenu->addSeparator();
     cfgMenu->addAction(L("重载当前配置", "Reload Config"), this, [this]() {
-        client_->call(QStringLiteral("reload_config"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        const QJsonObject p{{QStringLiteral("allow_uac"), true}};
+        client_->call(QStringLiteral("reload_config"), p, [this, p](bool ok, const QJsonValue&, const QString& err, const QString&) {
             handleConfigMutationResult(
                 L("重载当前配置", "Reload Config"),
-                [this]() { client_->call(QStringLiteral("reload_config")); },
+                [this, p]() { client_->call(QStringLiteral("reload_config"), p); },
                 ok,
                 err);
         });
@@ -885,6 +889,7 @@ void TrayController::importSchemeUri(const QString& uri) {
         trayIcon_->showMessage(QStringLiteral("ClashFX"),
                                L("已成功导入并激活配置: ", "Imported and activated profile: ") + name);
         client_->call(QStringLiteral("get_state"));
+        openSubscriptionsDialog();
     });
 }
 
@@ -934,7 +939,7 @@ void TrayController::checkForUpdates() {
 }
 
 void TrayController::showAboutBox() {
-    const QString ver = snapshot_.value(QStringLiteral("version")).toString(QStringLiteral("1.19.24-win.1"));
+    const QString ver = snapshot_.value(QStringLiteral("version")).toString(QStringLiteral("1.19.24"));
     const QString arch = snapshot_.value(QStringLiteral("arch")).toString();
     QMessageBox::about(
         modalDialogParent(),

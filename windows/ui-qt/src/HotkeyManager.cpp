@@ -65,7 +65,9 @@ bool HotkeyManager::parseChord(const QString& text, unsigned int& outModifiers, 
             outModifiers |= MOD_ALT;
         } else if (p == QStringLiteral("SHIFT")) {
             outModifiers |= MOD_SHIFT;
-        } else if (p == QStringLiteral("WIN") || p == QStringLiteral("META")) {
+        } else if (p == QStringLiteral("WIN") || p == QStringLiteral("META") ||
+                   p == QStringLiteral("CMD") || p == QStringLiteral("COMMAND") ||
+                   p == QStringLiteral("SUPER")) {
             outModifiers |= MOD_WIN;
         } else if (p.size() == 1 && p[0].unicode() >= 'A' && p[0].unicode() <= 'Z') {
             outVk = static_cast<unsigned int>(p[0].unicode());
@@ -99,13 +101,13 @@ bool HotkeyManager::parseChord(const QString& text, unsigned int& outModifiers, 
             outVk = VK_PRIOR;
         } else if (p == QStringLiteral("PGDOWN") || p == QStringLiteral("PAGEDOWN")) {
             outVk = VK_NEXT;
-        } else if (p == QStringLiteral("LEFT")) {
+        } else if (p == QStringLiteral("LEFT") || p == QStringLiteral("ARROWLEFT")) {
             outVk = VK_LEFT;
-        } else if (p == QStringLiteral("RIGHT")) {
+        } else if (p == QStringLiteral("RIGHT") || p == QStringLiteral("ARROWRIGHT")) {
             outVk = VK_RIGHT;
-        } else if (p == QStringLiteral("UP")) {
+        } else if (p == QStringLiteral("UP") || p == QStringLiteral("ARROWUP")) {
             outVk = VK_UP;
-        } else if (p == QStringLiteral("DOWN")) {
+        } else if (p == QStringLiteral("DOWN") || p == QStringLiteral("ARROWDOWN")) {
             outVk = VK_DOWN;
         } else if (p == QStringLiteral("-") || p == QStringLiteral("MINUS")) {
             outVk = VK_OEM_MINUS;

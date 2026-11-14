@@ -263,7 +263,11 @@ func (m *Manager) ReconcileIfExpected(expectedEnabled bool, port int, customBypa
 		return false, err
 	}
 	wantServer := fmt.Sprintf("127.0.0.1:%d", port)
-	if cur.ProxyEnable == 1 && strings.EqualFold(strings.TrimSpace(cur.ProxyServer), wantServer) && !cur.HasAutoConfigURL {
+	wantOverride := FormatBypassForOS(customBypass)
+	if cur.ProxyEnable == 1 &&
+		strings.EqualFold(strings.TrimSpace(cur.ProxyServer), wantServer) &&
+		strings.EqualFold(strings.TrimSpace(cur.ProxyOverride), strings.TrimSpace(wantOverride)) &&
+		!cur.HasAutoConfigURL {
 		return false, nil
 	}
 	if err := m.Apply(port, customBypass); err != nil {

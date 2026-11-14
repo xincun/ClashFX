@@ -1,6 +1,7 @@
 #include "WebView2Widget.h"
 
 #include <QCoreApplication>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -12,6 +13,7 @@
 #include <QShowEvent>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QUrl>
 #include <QWindow>
 
 #include <atomic>
@@ -129,6 +131,18 @@ WebView2Widget::~WebView2Widget() {
         token.value = static_cast<__int64>(webMessageTokenValue_);
         webview_->remove_WebMessageReceived(token);
         webMessageTokenValue_ = 0;
+    }
+    if (webview_ && newWindowTokenValue_ != 0) {
+        EventRegistrationToken token{};
+        token.value = static_cast<__int64>(newWindowTokenValue_);
+        webview_->remove_NewWindowRequested(token);
+        newWindowTokenValue_ = 0;
+    }
+    if (webview_ && navStartingTokenValue_ != 0) {
+        EventRegistrationToken token{};
+        token.value = static_cast<__int64>(navStartingTokenValue_);
+        webview_->remove_NavigationStarting(token);
+        navStartingTokenValue_ = 0;
     }
     if (controller_) {
         controller_->Close();
@@ -377,6 +391,66 @@ void WebView2Widget::ensureInitialized() {
                                 self->webMessageTokenValue_ = static_cast<unsigned long long>(token.value);
                             }
                             msgHandler->Release();
+
+                            auto isExternalBrowserUrl = [](const QUrl& url) {
+                                if (!url.isValid()) return false;
+                                const QString scheme = url.scheme().toLower();
+                                if (scheme != QLatin1String("http") && scheme != QLatin1String("https")) return false;
+                                const QString host = url.host().toLower();
+                                return host != QLatin1String("app.clashfx.local") &&
+                                       host != QLatin1String("127.0.0.1") &&
+                                       host != QLatin1String("localhost");
+                            };
+
+                            EventRegistrationToken newWinToken{};
+                            auto* newWinHandler = makeComEventHandler<
+                                ICoreWebView2NewWindowRequestedEventHandler,
+                                ICoreWebView2*,
+                                ICoreWebView2NewWindowRequestedEventArgs*>(
+                                [self, isExternalBrowserUrl](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
+                                    if (!self || !args) return S_OK;
+                                    LPWSTR rawUri = nullptr;
+                                    if (SUCCEEDED(args->get_Uri(&rawUri)) && rawUri) {
+                                        const QUrl url(QString::fromWCharArray(rawUri));
+                                        CoTaskMemFree(rawUri);
+                                        if (isExternalBrowserUrl(url)) {
+                                            args->put_Handled(TRUE);
+                                            QMetaObject::invokeMethod(self, [url]() {
+                                                QDesktopServices::openUrl(url);
+                                            }, Qt::QueuedConnection);
+                                        }
+                                    }
+                                    return S_OK;
+                                });
+                            if (SUCCEEDED(self->webview_->add_NewWindowRequested(newWinHandler, &newWinToken))) {
+                                self->newWindowTokenValue_ = static_cast<unsigned long long>(newWinToken.value);
+                            }
+                            newWinHandler->Release();
+
+                            EventRegistrationToken navToken{};
+                            auto* navHandler = makeComEventHandler<
+                                ICoreWebView2NavigationStartingEventHandler,
+                                ICoreWebView2*,
+                                ICoreWebView2NavigationStartingEventArgs*>(
+                                [self, isExternalBrowserUrl](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                                    if (!self || !args) return S_OK;
+                                    LPWSTR rawUri = nullptr;
+                                    if (SUCCEEDED(args->get_Uri(&rawUri)) && rawUri) {
+                                        const QUrl url(QString::fromWCharArray(rawUri));
+                                        CoTaskMemFree(rawUri);
+                                        if (isExternalBrowserUrl(url)) {
+                                            args->put_Cancel(TRUE);
+                                            QMetaObject::invokeMethod(self, [url]() {
+                                                QDesktopServices::openUrl(url);
+                                            }, Qt::QueuedConnection);
+                                        }
+                                    }
+                                    return S_OK;
+                                });
+                            if (SUCCEEDED(self->webview_->add_NavigationStarting(navHandler, &navToken))) {
+                                self->navStartingTokenValue_ = static_cast<unsigned long long>(navToken.value);
+                            }
+                            navHandler->Release();
                         }
 
                         self->syncBounds();
