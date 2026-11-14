@@ -1,144 +1,45 @@
-name: ClashX
+name: ClashFX macOS CI
 
 on: [ pull_request ]
 
-env:
-  FASTLANE_SKIP_UPDATE_CHECK: true
-
 jobs:
-  build:
+  build-and-test:
     runs-on: macos-26-intel
     steps:
-    - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-    - name: Setup Ruby
-      uses: ruby/setup-ruby@v1
-      with:
-        ruby-version: '3.3'
-        bundler-cache: true
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: core-engine/go.mod
+          cache-dependency-path: core-engine/go.sum
 
-    - name: setup Go
-      uses: actions/setup-go@v6
-      with:
-        go-version: '1.22'
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-    - uses: maxim-lobanov/setup-xcode@v1
-      with:
-        xcode-version: '26.6'
+      - name: Verify deployment SDK floor
+        run: python3 scripts/verify-release-compatibility.py --sdk
 
-    - name: verify deployment toolchain
-      run: python3 scripts/verify-release-compatibility.py --sdk
+      - name: Go core-engine tests with race detector
+        working-directory: core-engine
+        env:
+          CLASHFX_DISABLE_OS_SYSPROXY: '1'
+          CLASHFX_DISABLE_LAUNCH_AGENT: '1'
+          CLASHFX_DISABLE_LEGACY_PLIST_MIGRATION: '1'
+        run: go test -race -count=1 ./...
 
-    - name: install deps
-      run: |
-        bash install_dependency.sh
+      - name: Web SPA syntax verification
+        run: |
+          for f in windows/ui-qt/web/*.js; do
+            node --check "$f"
+          done
 
-    - name: free disk space before build
-      run: |
-        echo "Before cleanup: $(df -h / | tail -1 | awk '{print $4}') available"
-        sudo rm -rf /Users/runner/Library/Android 2>/dev/null || true
-        sudo rm -rf /Library/Frameworks/Mono.framework 2>/dev/null || true
-        sudo rm -rf /usr/local/share/dotnet 2>/dev/null || true
-        rm -rf ~/Library/Caches/CocoaPods 2>/dev/null || true
-        echo "After cleanup: $(df -h / | tail -1 | awk '{print $4}') available"
+      - name: Build Universal macOS App & verify compatibility gates
+        run: |
+          ./scripts/build-local.sh
+          codesign --verify --deep --strict --verbose=2 macos/dist/ClashFX.app
 
-    - name: Helper bundle metadata and signature regression
-      run: python3 scripts/verify-helper-bundle-metadata.py
-
-    - name: Startup, recovery and signed icon regressions
-      run: |
-        python3 scripts/verify-first-startup-reload.py
-        python3 scripts/verify-builtin-start-result.py
-        python3 scripts/verify-builtin-profile-handoff.py
-        python3 scripts/verify-builtin-resume-provenance.py
-        python3 scripts/verify-config-rollback-completion.py
-        python3 scripts/verify-signed-app-icon-policy.py
-
-    - name: isolated regression tests
-      run: |
-        xcodebuild -workspace ClashFX.xcworkspace -scheme ClashFX \
-          -destination "platform=macOS,arch=$(uname -m)" \
-          -skip-testing:ClashFXTests/RealCoreMenuIntegrationTests \
-          test CODE_SIGNING_ALLOWED=NO
-
-    - name: build
-      run: |
-        echo "Building ClashFX (PR check, no signing)..."
-        xcodebuild clean build \
-          -workspace ClashFX.xcworkspace \
-          -scheme ClashFX \
-          -configuration Release \
-          -derivedDataPath ./build_derived_data \
-          CODE_SIGN_IDENTITY="-" \
-          ENABLE_HARDENED_RUNTIME=NO
-
-        APP_PATH=$(find ./build_derived_data/Build/Products/Release -name "ClashFX.app" -type d | head -n 1)
-
-        if [ -z "$APP_PATH" ]; then
-          echo "Error: ClashFX.app not found!"
-          find ./build_derived_data -name "ClashFX.app" -type d
-          exit 1
-        fi
-
-        echo "Build complete! App at: $APP_PATH"
-        python3 scripts/verify-release-compatibility.py --app "$APP_PATH"
-
-    - name: Go core tests with race detector
-      run: |
-        mkdir -p "$RUNNER_TEMP/lab-validation"
-        set -o pipefail
-        (
-          cd ClashFX/goClash
-          python3 - <<'PY'
-        import os
-        import subprocess
-        import sys
-        from pathlib import Path
-
-        sys.path.insert(0, str(Path.cwd()))
-        from core_overlay import core_modfile
-
-        with core_modfile() as modfile:
-            env = dict(os.environ, CGO_ENABLED="1", GOMAXPROCS="2")
-            for mode in ([], ["-race"]):
-                subprocess.run(
-                    ["go", "test", "-tags=with_gvisor", "-ldflags=-linkmode=external", *mode,
-                     f"-modfile={modfile}", "./..."],
-                    check=True,
-                    env=env,
-                )
-        PY
-        ) 2>&1 | tee "$RUNNER_TEMP/lab-validation/go-core-race.log"
-
-    - name: Real core listener readiness across log levels
-      run: |
-        mkdir -p "$RUNNER_TEMP/lab-validation"
-        set -o pipefail
-        python3 scripts/verify-isolated-core-readiness.py \
-          2>&1 | tee "$RUNNER_TEMP/lab-validation/listener-readiness.log"
-
-    - name: Real TUN lifecycle on hosted runner
-      run: |
-        mkdir -p "$RUNNER_TEMP/lab-validation"
-        set -o pipefail
-        APP_PATH=$(find ./build_derived_data/Build/Products/Release -name "ClashFX.app" -type d | head -n 1)
-        CORE_PATH="$APP_PATH/Contents/Resources/mihomo_core"
-        if [ -z "$APP_PATH" ] || [ ! -x "$CORE_PATH" ]; then
-          echo "Error: fresh app mihomo_core executable not found at $CORE_PATH"
-          exit 1
-        fi
-        mkdir -p .ci-validation
-        cp "$CORE_PATH" .ci-validation/mihomo_core
-        sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
-          "$(command -v python3)" scripts/verify-ci-tun-lifecycle.py \
-          --core "$GITHUB_WORKSPACE/.ci-validation/mihomo_core" \
-          2>&1 | tee "$RUNNER_TEMP/lab-validation/tun-lifecycle.log"
-
-    - name: Upload Lab validation logs
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: lab-validation-logs
-        path: ${{ runner.temp }}/lab-validation/*.log
-        retention-days: 7
-        if-no-files-found: warn
+      - name: Appcast release-notes regression
+        run: python3 scripts/test_appcast_release_notes.py

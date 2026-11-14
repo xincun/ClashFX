@@ -1,27 +1,16 @@
-Pods/
 Country.mmdb
 Carthage
-ClashFX.a
-ClashFX.h
 ClashFX.app
 *.dmg
 **/xcuserdata/
 .idea
 *.pyc
-ClashFX/clash/
+__pycache__/
 .DS_Store
 .vscode
-ClashFX/goClash/goClash.h
-ClashFX/goClash/goClash.a
-ClashFX/goClash/mihomo_core
-ClashFX/goClash/.mihomo_core
-ClashFX/goClash/.clashfx-core-workaround/
-fastlane/report.xml
-ClashFX/Resources/Country.mmdb.gz
 .bundle/config
 *.app/**
 ClashFX.app.dSYM.zip
-build_derived_data
 gitupdate.bat
 
 # Claude Code local settings
@@ -34,15 +23,12 @@ gitupdate.bat
 # Backup files
 *.bak
 
-# Ensure Gemfile.lock is tracked (overrides any global *.lock ignore)
-!Gemfile.lock
-
-# Swift Package Manager
-ClashFX.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
-build_output/
-
 # Windows build outputs & caches
 windows/build/
 windows/dist/
 windows/ui-qt/build*/
+
+# macOS build outputs & caches
+macos/build/
+macos/dist/
 

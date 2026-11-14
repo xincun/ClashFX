@@ -8,11 +8,13 @@ on:
     paths:
       - 'core-engine/**'
       - 'windows/**'
+      - 'macos/resources/**'
       - '.github/workflows/windows-ci.yml'
   pull_request:
     paths:
       - 'core-engine/**'
       - 'windows/**'
+      - 'macos/resources/**'
       - '.github/workflows/windows-ci.yml'
 
 jobs:
