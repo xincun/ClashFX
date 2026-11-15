@@ -229,4 +229,8 @@ func VerifyPipePeer(conn net.Conn, trustedDir string) error {
 	return nil
 }
 
+func prepareUpgradedCoreFile(_ string) {}
+
+func refreshCorePlatformPostInstall(_ string) {}
+
 func repairUserHomeOwnership(_ string) {}

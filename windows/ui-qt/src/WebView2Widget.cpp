@@ -596,6 +596,45 @@ void WebView2Widget::installMetaCubeXDSubframeScripts() {
   var rulePayloadByIndex = {};
   var aiLockIndices = [];
   var originalFetch = window.fetch;
+  var pendingParentRpc = {};
+  var nextParentRpcId = 1;
+
+  function resolveParentTargetOrigin() {
+    try {
+      if (location.ancestorOrigins && location.ancestorOrigins.length > 0 && location.ancestorOrigins[0]) {
+        return location.ancestorOrigins[0];
+      }
+    } catch (_) {}
+    return 'http://app.clashfx.local';
+  }
+  function callParentIframeRpc(method, params, timeoutMs) {
+    return new Promise(function(resolve) {
+      if (!window.parent || window.parent === window) {
+        resolve({ ok: false, error: 'Parent bridge unavailable' });
+        return;
+      }
+      var id = nextParentRpcId++;
+      var timer = setTimeout(function() {
+        if (Object.prototype.hasOwnProperty.call(pendingParentRpc, id)) {
+          delete pendingParentRpc[id];
+          resolve({ ok: false, error: isEnLang() ? 'Request timed out' : '请求超时' });
+        }
+      }, timeoutMs || 125000);
+      pendingParentRpc[id] = { resolve: resolve, timer: timer };
+      try {
+        window.parent.postMessage({
+          type: 'clashfx_iframe_rpc',
+          id: id,
+          method: method,
+          params: params || {}
+        }, resolveParentTargetOrigin());
+      } catch (err) {
+        clearTimeout(timer);
+        delete pendingParentRpc[id];
+        resolve({ ok: false, error: String(err || 'postMessage failed') });
+      }
+    });
+  }
 
   function isEnLang() {
     try {
@@ -605,15 +644,19 @@ void WebView2Widget::installMetaCubeXDSubframeScripts() {
       return false;
     }
   }
-  function showGuardNotice(text) {
+  function showInfoNotice(text, isErr) {
     var existing = document.getElementById(NOTICE_ID);
     if (existing) existing.remove();
     var toast = document.createElement('div');
     toast.id = NOTICE_ID;
     toast.textContent = text;
-    toast.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;padding:8px 14px;border-radius:8px;background:rgba(185,28,28,0.95);color:#fff;font:600 12px Segoe UI,sans-serif;box-shadow:0 4px 12px rgba(0,0,0,0.35);pointer-events:none;';
+    var bg = isErr ? 'rgba(185,28,28,0.95)' : 'rgba(37,99,235,0.95)';
+    toast.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;padding:8px 14px;border-radius:8px;background:' + bg + ';color:#fff;font:600 12px Segoe UI,sans-serif;box-shadow:0 4px 12px rgba(0,0,0,0.35);pointer-events:none;';
     (document.body || document.documentElement).appendChild(toast);
-    setTimeout(function() { if (toast.parentNode) toast.remove(); }, 2800);
+    setTimeout(function() { if (toast.parentNode) toast.remove(); }, 3400);
+  }
+  function showGuardNotice(text) {
+    showInfoNotice(text, true);
   }
   function showStaleBanner() {
     if (document.getElementById(BANNER_ID)) return;
@@ -679,14 +722,49 @@ void WebView2Widget::installMetaCubeXDSubframeScripts() {
   }
 
   window.fetch = function(input, init) {
+    try {
+      var rawFetchUrl = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
+      if (rawFetchUrl && rawFetchUrl.indexOf('api.github.com/repos/MetaCubeX/metacubexd/releases/latest') !== -1) {
+        var uiVer = String((window.__NUXT__ && window.__NUXT__.config && window.__NUXT__.config.public && window.__NUXT__.config.public.appVersion) || '1.266.1').replace(/^v/i, '');
+        return Promise.resolve(new Response(JSON.stringify({ tag_name: 'v' + uiVer }), {
+          status: 200, headers: {'Content-Type': 'application/json'}
+        }));
+      }
+    } catch (_) {}
+
     var reqInfo = parseBackendRequest(input, init);
     if (!reqInfo) return originalFetch.apply(this, arguments);
 
+    if (reqInfo.pathname === '/upgrade/ui' &&
+        (reqInfo.method === 'POST' || reqInfo.method === 'PUT' || reqInfo.method === 'PATCH')) {
+      showInfoNotice(isEnLang()
+        ? 'Console UI is bundled with ClashFX; update ClashFX to upgrade it'
+        : '控制台面板随 ClashFX 安装包内置分发，请随客户端版本更新', false);
+      return Promise.resolve(new Response(JSON.stringify({status: 'ok'}), {
+        status: 200, headers: {'Content-Type': 'application/json'}
+      }));
+    }
+
     if ((reqInfo.pathname === '/upgrade' || reqInfo.pathname === '/restart') &&
         (reqInfo.method === 'POST' || reqInfo.method === 'PUT' || reqInfo.method === 'PATCH')) {
-      return Promise.resolve(new Response(JSON.stringify({message: 'Managed by ClashFX'}), {
-        status: 403, headers: {'Content-Type': 'application/json'}
-      }));
+      var isUpgrade = reqInfo.pathname === '/upgrade';
+      var rpcMethod = isUpgrade ? 'upgrade_core' : 'restart_core';
+      var timeoutMs = isUpgrade ? 125000 : 45000;
+      showInfoNotice(isUpgrade
+        ? (isEnLang() ? 'Checking and upgrading Mihomo core…' : '正在检查并更新核心…')
+        : (isEnLang() ? 'Restarting Mihomo core…' : '正在重启核心…'), false);
+      return callParentIframeRpc(rpcMethod, {}, timeoutMs).then(function(res) {
+        if (res && res.ok) {
+          return new Response(JSON.stringify({status: 'ok', data: res.data || {}}), {
+            status: 200, headers: {'Content-Type': 'application/json'}
+          });
+        }
+        var errMsg = (res && res.error) || (isEnLang() ? 'Operation failed' : '操作失败');
+        showInfoNotice(errMsg, true);
+        return new Response(JSON.stringify({message: errMsg}), {
+          status: 500, headers: {'Content-Type': 'application/json'}
+        });
+      });
     }
 
     if (reqInfo.method === 'PATCH' && reqInfo.pathname === '/configs' && window.__CLASHFX_AI_LOCKED__) {
@@ -779,26 +857,50 @@ void WebView2Widget::installMetaCubeXDSubframeScripts() {
 
   var origXhrOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url) {
-    this._cfxBlocked = false;
+    this._cfxAction = '';
     try {
       var u = new URL(String(url || ''), window.location.href);
       var pn = u.pathname.replace(/\/+$/, '') || '/';
       if (u.origin === location.origin &&
-          (pn === '/upgrade' || pn === '/restart') &&
+          (pn === '/upgrade' || pn === '/restart' || pn === '/upgrade/ui') &&
           /^(POST|PUT|PATCH)$/i.test(String(method || ''))) {
-        this._cfxBlocked = true;
+        this._cfxAction = pn;
       }
     } catch (_) {}
     return origXhrOpen.apply(this, arguments);
   };
   var origXhrSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.send = function() {
-    if (this._cfxBlocked) {
-      Object.defineProperty(this, 'readyState', {get: function() { return 4; }});
-      Object.defineProperty(this, 'status', {get: function() { return 403; }});
-      Object.defineProperty(this, 'responseText', {get: function() { return '{"message":"Managed by ClashFX"}'; }});
-      if (typeof this.onreadystatechange === 'function') this.onreadystatechange();
-      if (typeof this.onload === 'function') this.onload();
+    if (this._cfxAction) {
+      var self = this;
+      var action = this._cfxAction;
+      var finishXhr = function(code, payload) {
+        Object.defineProperty(self, 'readyState', {configurable: true, get: function() { return 4; }});
+        Object.defineProperty(self, 'status', {configurable: true, get: function() { return code; }});
+        Object.defineProperty(self, 'responseText', {configurable: true, get: function() { return JSON.stringify(payload); }});
+        if (typeof self.onreadystatechange === 'function') self.onreadystatechange();
+        if (typeof self.onload === 'function') self.onload();
+      };
+      if (action === '/upgrade/ui') {
+        showInfoNotice(isEnLang()
+          ? 'Console UI is bundled with ClashFX; update ClashFX to upgrade it'
+          : '控制台面板随 ClashFX 安装包内置分发，请随客户端版本更新', false);
+        finishXhr(200, {status: 'ok'});
+        return;
+      }
+      var isUpgrade = action === '/upgrade';
+      showInfoNotice(isUpgrade
+        ? (isEnLang() ? 'Checking and upgrading Mihomo core…' : '正在检查并更新核心…')
+        : (isEnLang() ? 'Restarting Mihomo core…' : '正在重启核心…'), false);
+      callParentIframeRpc(isUpgrade ? 'upgrade_core' : 'restart_core', {}, isUpgrade ? 125000 : 45000).then(function(res) {
+        if (res && res.ok) {
+          finishXhr(200, {status: 'ok', data: res.data || {}});
+        } else {
+          var errMsg = (res && res.error) || (isEnLang() ? 'Operation failed' : '操作失败');
+          showInfoNotice(errMsg, true);
+          finishXhr(500, {message: errMsg});
+        }
+      });
       return;
     }
     return origXhrSend.apply(this, arguments);
@@ -807,6 +909,15 @@ void WebView2Widget::installMetaCubeXDSubframeScripts() {
   window.addEventListener('message', function(ev) {
     if (ev.origin !== 'http://app.clashfx.local' && ev.origin !== 'https://app.clashfx.local') return;
     var d = ev.data;
+    if (d && d.type === 'clashfx_iframe_rpc_result') {
+      var entry = pendingParentRpc[d.id];
+      if (entry) {
+        clearTimeout(entry.timer);
+        delete pendingParentRpc[d.id];
+        entry.resolve(d);
+      }
+      return;
+    }
     if (!d || d.type !== 'clashfx_sync') return;
     window.__CLASHFX_AI_LOCKED__ = Boolean(d.aiLocked);
     try {

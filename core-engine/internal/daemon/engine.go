@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -90,6 +91,7 @@ type EffectiveRulesView struct {
 
 type DaemonSnapshot struct {
 	Version                string                             `json:"version"`
+	CoreVersion            string                             `json:"core_version,omitempty"`
 	Platform               string                             `json:"platform"`
 	Arch                   string                             `json:"arch"`
 	CoreRunning            bool                               `json:"core_running"`
@@ -126,9 +128,11 @@ type Engine struct {
 	coreHelper   subscription.BinaryCoreHelper
 
 	opMu              sync.Mutex
+	upgradeMu         sync.Mutex
 	allowPromptUAC    bool
 	statusMu          sync.RWMutex
 	coreViaService    bool
+	coreVersion       string
 	suspendedByNet    string
 	lastApplyErr      string
 	cachedNetSig      features.ActiveNetworkSignature
@@ -237,6 +241,7 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 		eng.notifyStateChanged,
 	)
 
+	eng.syncCoreBinarySelection()
 	return eng, nil
 }
 
@@ -361,7 +366,10 @@ func callService(timeout time.Duration, req service.Request) (service.Response, 
 
 // ValidateConfig implements transaction.CoreApplier.
 func (e *Engine) ValidateConfig(homeDir, configPath string) error {
-	return e.coreHelper.ValidateConfig(homeDir, configPath)
+	e.statusMu.RLock()
+	helper := e.coreHelper
+	e.statusMu.RUnlock()
+	return helper.ValidateConfig(homeDir, configPath)
 }
 
 func supportsPrivilegedService() bool {
@@ -949,6 +957,7 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 	e.statusMu.RLock()
 	suspended := e.suspendedByNet
 	viaSvc := e.coreViaService
+	coreVer := e.coreVersion
 	lastErr := e.lastApplyErr
 	logsDir := e.logsDir
 	e.statusMu.RUnlock()
@@ -962,6 +971,7 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 
 	return DaemonSnapshot{
 		Version:                AppVersion,
+		CoreVersion:            coreVer,
 		Platform:               runtime.GOOS,
 		Arch:                   runtime.GOARCH,
 		CoreRunning:            coreRunning,
@@ -1021,9 +1031,17 @@ func (e *Engine) refreshLiveCoreMetadata(ctx context.Context) {
 
 	var groups []ProxyGroupView
 	var provInfo *subscription.UserInfo
+	var liveVer string
 	if rt.APIPort > 0 && e.IsCoreRunning() {
 		groups = fetchProxyGroupsFromCore(ctx, rt.APIPort, rt.APISecret, rawRoot, e.store.RecoverySelectionsForProfile(settings.SelectedProfile))
 		provInfo = fetchProviderSubscriptionInfo(ctx, rt.APIPort, rt.APISecret)
+		liveVer = fetchCoreVersionFromCore(ctx, rt.APIPort, rt.APISecret)
+	}
+
+	if liveVer != "" {
+		e.statusMu.Lock()
+		e.coreVersion = liveVer
+		e.statusMu.Unlock()
 	}
 
 	e.proxyGroupsMu.Lock()
@@ -2500,6 +2518,331 @@ func (e *Engine) CheckUpdates(ctx context.Context) (features.UpdateCheckResult, 
 	ch := e.store.Settings().UpdateChannel
 	apiURL := os.Getenv("CLASHFX_UPDATE_API_URL")
 	return features.CheckForUpdatesWithProxy(ctx, "v"+AppVersion, ch, apiURL, e.activeLocalProxyPort())
+}
+
+func fetchCoreVersionFromCore(ctx context.Context, apiPort int, secret string) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/version", apiPort), nil)
+	if err != nil {
+		return ""
+	}
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var payload struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Version)
+}
+
+func coreExecutableName() string {
+	if runtime.GOOS == "windows" {
+		return "mihomo_core.exe"
+	}
+	return "mihomo_core"
+}
+
+func allowHostPrivilegedCoreLookup() bool {
+	if strings.TrimSpace(os.Getenv("CLASHFX_DISABLE_PRIVILEGED_SERVICE")) == "1" {
+		return false
+	}
+	return flag.Lookup("test.v") == nil || strings.TrimSpace(os.Getenv("CLASHFX_TEST_REAL_SERVICE")) == "1"
+}
+
+type coreBinaryCandidate struct {
+	dir     string
+	path    string
+	ver     string
+	modTime time.Time
+}
+
+func isPreferredCoreCandidate(c, best coreBinaryCandidate, isLab bool) bool {
+	if isLab {
+		cAlpha := strings.HasPrefix(c.ver, "alpha-")
+		bAlpha := strings.HasPrefix(best.ver, "alpha-")
+		if cAlpha != bAlpha {
+			return cAlpha
+		}
+		if cAlpha && bAlpha {
+			return !c.modTime.Before(best.modTime)
+		}
+	}
+	cmp := service.CompareCoreVersions(c.ver, best.ver)
+	if cmp != 0 {
+		return cmp > 0
+	}
+	return runtime.GOOS == "darwin" && c.dir == service.DarwinPrivilegedBinDir
+}
+
+func (e *Engine) syncCoreBinarySelection() {
+	exeName := coreExecutableName()
+	var dirs []string
+	seen := make(map[string]struct{})
+	addDir := func(d string) {
+		trimmed := strings.TrimSpace(d)
+		if trimmed == "" {
+			return
+		}
+		cleaned := filepath.Clean(trimmed)
+		if _, ok := seen[cleaned]; ok {
+			return
+		}
+		seen[cleaned] = struct{}{}
+		dirs = append(dirs, cleaned)
+	}
+	addDir(e.cfg.BinDir)
+	addDir(filepath.Join(e.store.AppDataDir(), "bin"))
+	if runtime.GOOS == "darwin" && allowHostPrivilegedCoreLookup() {
+		addDir(service.DarwinPrivilegedBinDir)
+	}
+
+	var candidates []coreBinaryCandidate
+	for _, dir := range dirs {
+		candPath := filepath.Join(dir, exeName)
+		info, err := os.Stat(candPath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		ver := service.ProbeCoreVersion(candPath)
+		if ver == "" {
+			continue
+		}
+		candidates = append(candidates, coreBinaryCandidate{
+			dir:     dir,
+			path:    candPath,
+			ver:     ver,
+			modTime: info.ModTime(),
+		})
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	isLab := strings.EqualFold(strings.TrimSpace(e.store.Settings().UpdateChannel), "lab")
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if isPreferredCoreCandidate(c, best, isLab) {
+			best = c
+		}
+	}
+
+	e.statusMu.Lock()
+	e.coreHelper.CoreBinaryPath = best.path
+	if best.ver != "" {
+		e.coreVersion = best.ver
+	}
+	helper := e.coreHelper
+	e.statusMu.Unlock()
+
+	if e.localRunner != nil {
+		e.localRunner.SetTrustedDir(best.dir)
+	}
+	if e.subMgr != nil {
+		e.subMgr.SetCoreHelper(helper)
+	}
+}
+
+func isDirWritable(dir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return false
+	}
+	f, err := os.CreateTemp(dir, ".cfx-write-check-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return true
+}
+
+func copyExecutableFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	return out.Close()
+}
+
+func (e *Engine) prepareWritableLocalCoreDir() error {
+	curDir := ""
+	if e.localRunner != nil {
+		curDir = e.localRunner.TrustedDir()
+	}
+	if isDirWritable(curDir) {
+		return nil
+	}
+
+	fallbackDir := filepath.Join(e.store.AppDataDir(), "bin")
+	if err := os.MkdirAll(fallbackDir, 0755); err != nil {
+		return fmt.Errorf("create local core directory: %w", err)
+	}
+	exeName := coreExecutableName()
+	dstPath := filepath.Join(fallbackDir, exeName)
+	if _, err := os.Stat(dstPath); os.IsNotExist(err) {
+		var seedDirs []string
+		if curDir != "" {
+			seedDirs = append(seedDirs, curDir)
+		}
+		if strings.TrimSpace(e.cfg.BinDir) != "" {
+			seedDirs = append(seedDirs, filepath.Clean(e.cfg.BinDir))
+		}
+		if runtime.GOOS == "darwin" && allowHostPrivilegedCoreLookup() {
+			seedDirs = append(seedDirs, service.DarwinPrivilegedBinDir)
+		}
+		for _, sd := range seedDirs {
+			srcPath := filepath.Join(sd, exeName)
+			if info, statErr := os.Stat(srcPath); statErr == nil && !info.IsDir() {
+				_ = copyExecutableFile(srcPath, dstPath)
+				break
+			}
+		}
+	}
+
+	e.statusMu.Lock()
+	e.coreHelper.CoreBinaryPath = dstPath
+	helper := e.coreHelper
+	e.statusMu.Unlock()
+
+	if e.localRunner != nil {
+		e.localRunner.SetTrustedDir(fallbackDir)
+	}
+	if e.subMgr != nil {
+		e.subMgr.SetCoreHelper(helper)
+	}
+	return nil
+}
+
+// RestartCore cleanly restarts the active Mihomo core process (either ClashFXService
+// or localRunner) and re-applies the active runtime configuration.
+func (e *Engine) RestartCore(ctx context.Context, allowUAC bool) error {
+	e.opMu.Lock()
+	if e.isCoreViaService() || (supportsPrivilegedService() && IsPrivilegedServiceInstalled(service.ServiceName)) {
+		_, _ = callService(8*time.Second, service.Request{Action: "stop_core"})
+	}
+	_ = e.localRunner.Stop()
+	e.ctrl.ResetActiveState()
+	e.opMu.Unlock()
+
+	_, err := e.applyAndSync(ctx, true, allowUAC)
+	return err
+}
+
+// UpgradeCore checks upstream MetaCubeX/mihomo releases on the active channel and
+// atomically upgrades the active core binary via ClashFXService (when installed) or
+// a writable local directory, rolling back automatically on startup failure.
+func (e *Engine) UpgradeCore(ctx context.Context) (service.CoreUpgradeInfo, error) {
+	e.upgradeMu.Lock()
+	defer e.upgradeMu.Unlock()
+
+	ch := e.store.Settings().UpdateChannel
+	proxyPort := e.activeLocalProxyPort()
+	useSvc := supportsPrivilegedService() && (e.isCoreViaService() || IsPrivilegedServiceInstalled(service.ServiceName))
+
+	if useSvc {
+		wasLocalRunning := !e.isCoreViaService() && e.localRunner.Status().Running
+		stoppedLocalForSwap := false
+		if wasLocalRunning && runtime.GOOS == "windows" {
+			// On Windows, running local mihomo_core.exe in Program Files locks against rename.
+			e.opMu.Lock()
+			_ = e.localRunner.Stop()
+			e.ctrl.ResetActiveState()
+			e.opMu.Unlock()
+			stoppedLocalForSwap = true
+		}
+
+		callCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+		resp, err := service.Call(callCtx, service.Request{
+			Action:    "upgrade_core",
+			Channel:   ch,
+			ProxyPort: proxyPort,
+		})
+		cancel()
+
+		var info service.CoreUpgradeInfo
+		if resp.Upgrade != nil {
+			info = *resp.Upgrade
+		}
+		if err != nil {
+			if stoppedLocalForSwap {
+				_, _ = e.applyAndSync(ctx, true, false)
+			}
+			return info, err
+		}
+		if !resp.OK {
+			if stoppedLocalForSwap {
+				_, _ = e.applyAndSync(ctx, true, false)
+			}
+			return info, errors.New(resp.Message)
+		}
+
+		e.syncCoreBinarySelection()
+		if info.CurrentVersion != "" {
+			e.statusMu.Lock()
+			e.coreVersion = info.CurrentVersion
+			e.statusMu.Unlock()
+		}
+
+		if info.Updated {
+			if e.isCoreViaService() {
+				_, _ = e.applyAndSync(ctx, true, false)
+			} else if wasLocalRunning {
+				e.opMu.Lock()
+				_ = e.localRunner.Stop()
+				e.ctrl.ResetActiveState()
+				e.opMu.Unlock()
+				_, _ = e.applyAndSync(ctx, true, false)
+			} else {
+				e.notifyStateChanged()
+			}
+		} else if stoppedLocalForSwap {
+			_, _ = e.applyAndSync(ctx, true, false)
+		} else {
+			e.notifyStateChanged()
+		}
+		return info, nil
+	}
+
+	if err := e.prepareWritableLocalCoreDir(); err != nil {
+		return service.CoreUpgradeInfo{}, err
+	}
+	info, _, err := e.localRunner.UpgradeCore(ctx, ch, proxyPort)
+	if err != nil {
+		return info, err
+	}
+	e.syncCoreBinarySelection()
+	if info.CurrentVersion != "" {
+		e.statusMu.Lock()
+		e.coreVersion = info.CurrentVersion
+		e.statusMu.Unlock()
+	}
+	if info.Updated && e.IsCoreRunning() {
+		_, _ = e.applyAndSync(ctx, true, false)
+	} else {
+		e.notifyStateChanged()
+	}
+	return info, nil
 }
 
 func (e *Engine) notifyStateChanged() {

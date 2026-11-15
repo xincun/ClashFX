@@ -1,9 +1,13 @@
 package daemon
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -11,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -21,6 +26,7 @@ import (
 	"github.com/clashfx/core-engine/internal/ailock"
 	"github.com/clashfx/core-engine/internal/features"
 	"github.com/clashfx/core-engine/internal/profile"
+	"github.com/clashfx/core-engine/internal/service"
 	"github.com/clashfx/core-engine/internal/subscription"
 	"github.com/clashfx/core-engine/internal/transaction"
 )
@@ -1251,5 +1257,317 @@ rules:
 	}
 	if len(eng.subMgr.List()) != 0 {
 		t.Fatalf("expected failed first-time import to clean up subscriptions.json, got %+v", eng.subMgr.List())
+	}
+}
+
+const fakeDaemonCoreSource = `package main
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
+)
+
+var coreVersion = "v1.19.24"
+
+func main() {
+	var configFile string
+	testOnly := false
+	for i := 1; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "-v":
+			fmt.Printf("Mihomo Meta %s %s %s with go1.26.3\n", coreVersion, runtime.GOOS, runtime.GOARCH)
+			return
+		case "-t":
+			testOnly = true
+		case "-f":
+			if i+1 < len(os.Args) {
+				configFile = os.Args[i+1]
+				i++
+			}
+		case "-d", "-ext-ui":
+			if i+1 < len(os.Args) {
+				i++
+			}
+		}
+	}
+	if testOnly {
+		return
+	}
+	ctrlAddr := ""
+	mixedPort := 0
+	if configFile != "" {
+		if raw, err := os.ReadFile(configFile); err == nil {
+			for _, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "external-controller:") {
+					ctrlAddr = strings.TrimSpace(strings.TrimPrefix(trimmed, "external-controller:"))
+					ctrlAddr = strings.Trim(ctrlAddr, "'\"")
+				} else if strings.HasPrefix(trimmed, "mixed-port:") {
+					val := strings.TrimSpace(strings.TrimPrefix(trimmed, "mixed-port:"))
+					if p, pErr := strconv.Atoi(val); pErr == nil && p > 0 {
+						mixedPort = p
+					}
+				}
+			}
+		}
+	}
+	if mixedPort > 0 {
+		mpLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", mixedPort))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "listen mixed-port %d: %v\n", mixedPort, err)
+			os.Exit(1)
+		}
+		defer mpLn.Close()
+		go func() {
+			for {
+				c, accErr := mpLn.Accept()
+				if accErr != nil {
+					return
+				}
+				_ = c.Close()
+			}
+		}()
+	}
+	if ctrlAddr != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/version", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, "{\"meta\":true,\"version\":%q}", coreVersion)
+		})
+		mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("{}"))
+		})
+		ln, err := net.Listen("tcp", ctrlAddr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "listen %s: %v\n", ctrlAddr, err)
+			os.Exit(1)
+		}
+		defer ln.Close()
+		go func() { _ = (&http.Server{Handler: mux}).Serve(ln) }()
+	}
+	fmt.Printf("RESTful API listening at: %s\n", ctrlAddr)
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+}
+`
+
+func compileFakeDaemonCore(t *testing.T, outPath, version string) []byte {
+	t.Helper()
+	srcDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(srcDir, "go.mod"), []byte("module fake_daemon_core\n\ngo 1.21\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "main.go"), []byte(fakeDaemonCoreSource), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "build", "-ldflags=-s -w -X main.coreVersion="+version, "-o", outPath, ".")
+	cmd.Dir = srcDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("compile fake daemon core (%s): %v\n%s", version, err, string(out))
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func platformTestCoreAssetName(ver string) string {
+	ext := ".gz"
+	if runtime.GOOS == "windows" {
+		ext = ".zip"
+	}
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		arch = "amd64-v1"
+	}
+	return fmt.Sprintf("mihomo-%s-%s-%s%s", runtime.GOOS, arch, ver, ext)
+}
+
+func archiveTestCoreBytes(t *testing.T, assetName string, payload []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if strings.HasSuffix(assetName, ".zip") {
+		zw := zip.NewWriter(&buf)
+		fw, err := zw.Create("mihomo_core.exe")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fw.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestEngineRestartAndUpgradeCoreRPC(t *testing.T) {
+	t.Setenv("CLASHFX_DISABLE_LEGACY_PLIST_MIGRATION", "1")
+	t.Setenv("CLASHFX_DISABLE_LAUNCH_AGENT", "1")
+	t.Setenv("CLASHFX_DISABLE_OS_SYSPROXY", "1")
+	t.Setenv("CLASHFX_DISABLE_PRIVILEGED_SERVICE", "1")
+
+	appData := t.TempDir()
+	binDir := t.TempDir()
+	exeName := coreExecutableName()
+	compileFakeDaemonCore(t, filepath.Join(binDir, exeName), "v1.19.24")
+
+	v2Bytes := compileFakeDaemonCore(t, filepath.Join(t.TempDir(), exeName), "v1.19.34")
+	assetName := platformTestCoreAssetName("v1.19.34")
+	archiveBytes := archiveTestCoreBytes(t, assetName, v2Bytes)
+	sum := sha256.Sum256(archiveBytes)
+	shaHex := hex.EncodeToString(sum[:])
+
+	var dlSrv *httptest.Server
+	dlSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/release":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "v1.19.34",
+				"assets": []map[string]any{{
+					"name":                 assetName,
+					"browser_download_url": dlSrv.URL + "/dl/" + assetName,
+					"digest":               "sha256:" + shaHex,
+				}},
+			})
+		case "/dl/" + assetName:
+			_, _ = w.Write(archiveBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer dlSrv.Close()
+
+	srv, err := NewServer("", Config{
+		AppDataDir: appData,
+		BinDir:     binDir,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	eng := srv.Engine()
+	defer eng.Shutdown()
+
+	if snap0 := eng.Snapshot(); snap0.CoreVersion != "v1.19.24" {
+		t.Fatalf("expected initial Snapshot.CoreVersion v1.19.24, got %q", snap0.CoreVersion)
+	}
+
+	eng.localRunner.SetUpgradeEndpointsForTest(dlSrv.URL+"/release", dlSrv.URL+"/dl/")
+
+	if _, err := eng.store.UpdateSettings(func(s *profile.AppSettings) error {
+		lnAPI, lErr := net.Listen("tcp", "127.0.0.1:0")
+		if lErr != nil {
+			return lErr
+		}
+		freeAPIPort := lnAPI.Addr().(*net.TCPAddr).Port
+		_ = lnAPI.Close()
+
+		lnMix, mErr := net.Listen("tcp", "127.0.0.1:0")
+		if mErr != nil {
+			return mErr
+		}
+		freeMixedPort := lnMix.Addr().(*net.TCPAddr).Port
+		_ = lnMix.Close()
+
+		s.APIPort = freeAPIPort
+		s.PortOverride = freeMixedPort
+		s.EnhancedMode = false
+		s.SystemProxyEnabled = false
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Start(context.Background()); err != nil {
+		t.Fatalf("eng.Start failed: %v", err)
+	}
+
+	subYAML := `mixed-port: 17899
+proxies:
+  - name: "Node-A"
+    type: socks5
+    server: 198.51.100.30
+    port: 1080
+proxy-groups:
+  - name: "Proxy"
+    type: select
+    proxies: ["Node-A", "DIRECT"]
+rules:
+  - MATCH,Proxy
+`
+	subSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(subYAML))
+	}))
+	defer subSrv.Close()
+
+	if _, err := eng.UpsertSubscription(context.Background(), "UpgradeSub", subSrv.URL, "", true); err != nil {
+		t.Fatalf("UpsertSubscription failed: %v", err)
+	}
+	if !eng.IsCoreRunning() {
+		t.Fatal("expected local core running after subscription import")
+	}
+
+	// 1. restart_core RPC restarts the running core process cleanly with a new PID.
+	pidBefore := eng.localRunner.Status().PID
+	restartResp := srv.dispatch(&clientConn{}, RPCRequest{ID: 1, Method: "restart_core"})
+	if !restartResp.OK {
+		t.Fatalf("restart_core RPC failed: %+v", restartResp)
+	}
+	if !eng.IsCoreRunning() {
+		t.Fatal("expected core running after restart_core")
+	}
+	if pidAfter := eng.localRunner.Status().PID; pidBefore > 0 && pidAfter == pidBefore {
+		t.Fatalf("expected restart_core to launch a new process PID (still %d)", pidAfter)
+	}
+
+	// 2. upgrade_core RPC upgrades v1.19.24 -> v1.19.34 while running and updates Snapshot.CoreVersion.
+	upgResp := srv.dispatch(&clientConn{}, RPCRequest{ID: 2, Method: "upgrade_core"})
+	if !upgResp.OK {
+		t.Fatalf("upgrade_core RPC failed: %+v", upgResp)
+	}
+	info, ok := upgResp.Data.(service.CoreUpgradeInfo)
+	if !ok || !info.Updated || info.PreviousVersion != "v1.19.24" || info.CurrentVersion != "v1.19.34" {
+		t.Fatalf("unexpected upgrade_core result: %#v", upgResp.Data)
+	}
+
+	snapAfter := eng.Snapshot()
+	if snapAfter.CoreVersion != "v1.19.34" {
+		t.Fatalf("expected Snapshot.CoreVersion v1.19.34 after upgrade, got %q", snapAfter.CoreVersion)
+	}
+	if !snapAfter.CoreRunning || snapAfter.Runtime.APIPort <= 0 {
+		t.Fatalf("expected running core with APIPort after upgrade, got %+v", snapAfter.Runtime)
+	}
+	verResp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/version", snapAfter.Runtime.APIPort))
+	if err != nil {
+		t.Fatalf("GET live /version failed: %v", err)
+	}
+	defer verResp.Body.Close()
+	var verPayload struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(verResp.Body).Decode(&verPayload); err != nil {
+		t.Fatal(err)
+	}
+	if verPayload.Version != "v1.19.34" {
+		t.Fatalf("expected live core /version v1.19.34, got %q", verPayload.Version)
 	}
 }

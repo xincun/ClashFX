@@ -42,6 +42,9 @@ func acceptLoop(ln net.Listener, runner *service.Runner) {
 				_ = json.NewEncoder(c).Encode(service.Response{OK: false, Message: err.Error()})
 				return
 			}
+			if req.Action == "upgrade_core" {
+				_ = c.SetDeadline(time.Now().Add(125 * time.Second))
+			}
 			resp := runner.Handle(req)
 			_ = json.NewEncoder(c).Encode(resp)
 		}(conn)

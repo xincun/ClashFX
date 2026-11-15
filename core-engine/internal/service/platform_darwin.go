@@ -21,7 +21,6 @@ import (
 const (
 	DarwinLaunchDaemonLabel  = "com.clashfx.service"
 	DarwinLaunchDaemonPlist  = "/Library/LaunchDaemons/com.clashfx.service.plist"
-	DarwinPrivilegedBinDir   = "/Library/Application Support/ClashFX/bin"
 	DefaultDarwinServiceSock = "/var/run/clashfx-service.sock"
 )
 
@@ -192,6 +191,31 @@ func consoleOwnerUID() (uint32, bool) {
 		return 0, false
 	}
 	return st.Uid, true
+}
+
+func prepareUpgradedCoreFile(path string) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	if os.Geteuid() == 0 {
+		_ = os.Chown(path, 0, 0)
+	}
+	_ = exec.Command("/usr/bin/xattr", "-d", "com.apple.quarantine", path).Run()
+}
+
+func refreshCorePlatformPostInstall(corePath string) {
+	if os.Geteuid() != 0 || strings.TrimSpace(corePath) == "" {
+		return
+	}
+	const fw = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+	if _, err := os.Stat(fw); err != nil {
+		return
+	}
+	for _, arg := range []string{"--add", "--unblockapp"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		_ = exec.CommandContext(ctx, fw, arg, corePath).Run()
+		cancel()
+	}
 }
 
 // repairUserHomeOwnership restores user ownership on runtime directories/files created

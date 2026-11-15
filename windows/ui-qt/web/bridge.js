@@ -94,6 +94,8 @@ const LONG_RPC_METHODS = new Set([
   'node_check_connectivity',
   'node_speed_test_start',
   'check_updates',
+  'upgrade_core',
+  'restart_core',
   'set_enhanced_mode',
   'set_ai_lock',
   'install_service',

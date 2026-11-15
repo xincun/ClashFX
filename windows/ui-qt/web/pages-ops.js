@@ -44,6 +44,7 @@ const settingsState = {
   updateUrl: '',
   geoBusy: false,
   updBusy: false,
+  coreUpdBusy: false,
   svcBusy: false,
   recordingKey: '',
 };
@@ -944,6 +945,7 @@ export function renderSettingsPage(root) {
             <button type="button" class="btn btn-sm" id="set-flush-fakeip">${t('清空 Fake-IP 缓存', 'Flush Fake-IP')}</button>
             <button type="button" class="btn btn-sm" id="set-reload-cfg">${ICONS.refresh} ${t('重载核心配置', 'Reload Config')}</button>
             <button type="button" class="btn btn-sm" id="set-update-geo" ${settingsState.geoBusy ? 'disabled' : ''}>${settingsState.geoBusy ? t('下载中…', 'Updating…') : t('更新 GEO 数据库', 'Update GEO DB')}</button>
+            <button type="button" class="btn btn-sm" id="set-upgrade-core" ${settingsState.coreUpdBusy ? 'disabled' : ''}>${settingsState.coreUpdBusy ? t('更新核心中…', 'Upgrading Core…') : t('更新核心', 'Update Core')}</button>
             <button type="button" class="btn btn-sm btn-primary" id="set-check-upd" ${settingsState.updBusy ? 'disabled' : ''}>${settingsState.updBusy ? t('检查中…', 'Checking…') : t('检查版本更新', 'Check Updates')}</button>
           </div>
         </div>
@@ -961,7 +963,7 @@ export function renderSettingsPage(root) {
               <option value="lab" ${d.update_channel === 'lab' ? 'selected' : ''}>Lab Preview</option>
             </select>
             <div class="row-flex" style="margin-left:auto;">
-              <span class="metric-sub">${settingsState.updateResult ? esc(settingsState.updateResult) : `v${esc(snap.version || '--')}`}</span>
+              <span class="metric-sub">${settingsState.updateResult ? esc(settingsState.updateResult) : esc(snap.core_version || (snap.version ? `v${String(snap.version).replace(/^v/i, '')}` : '--'))}</span>
               ${settingsState.updateUrl ? `<button type="button" class="btn btn-xs btn-primary" id="set-open-upd">${t('前往下载', 'Download')}</button>` : ''}
             </div>
           </div>
@@ -1146,6 +1148,25 @@ export function renderSettingsPage(root) {
     const res = await rpc('update_geo_databases', {});
     settingsState.geoBusy = false;
     if (res.ok) showToast(t('GEO 数据库已更新', 'GEO databases updated'), 'ok');
+    renderSettingsPage(root);
+  });
+
+  root.querySelector('#set-upgrade-core')?.addEventListener('click', async () => {
+    settingsState.coreUpdBusy = true;
+    renderSettingsPage(root);
+    const res = await rpc('upgrade_core', {});
+    settingsState.coreUpdBusy = false;
+    if (res.ok) {
+      const info = res.data || {};
+      if (info.already_latest) {
+        const ver = info.current_version || snap.core_version || '';
+        showToast(t(`当前核心已是最新版本 (${ver})`, `Core is already up to date (${ver})`), 'ok');
+      } else {
+        const ver = info.current_version || '';
+        showToast(t(`核心已更新至 ${ver} 并重启`, `Core upgraded to ${ver} and restarted`), 'ok');
+        await rpc('get_state', {}, { silent: true });
+      }
+    }
     renderSettingsPage(root);
   });
 

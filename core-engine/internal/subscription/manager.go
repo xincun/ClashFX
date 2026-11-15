@@ -123,6 +123,18 @@ func NewManager(store *profile.Store, helper CoreHelper) (*Manager, error) {
 	return m, nil
 }
 
+func (m *Manager) SetCoreHelper(helper CoreHelper) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.coreHelper = helper
+}
+
+func (m *Manager) getCoreHelper() CoreHelper {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.coreHelper
+}
+
 func (m *Manager) List() []ManagedSubscription {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -284,8 +296,8 @@ func (m *Manager) Refresh(ctx context.Context, name string, directProxyPort int)
 	if err := os.WriteFile(tmpPath, yamlBytes, 0600); err != nil {
 		return ManagedSubscription{}, err
 	}
-	if m.coreHelper != nil {
-		if err := m.coreHelper.ValidateConfig(cfgDir, tmpPath); err != nil {
+	if helper := m.getCoreHelper(); helper != nil {
+		if err := helper.ValidateConfig(cfgDir, tmpPath); err != nil {
 			return ManagedSubscription{}, err
 		}
 	}
@@ -398,8 +410,8 @@ func (m *Manager) normalizeSubscriptionContent(raw []byte) ([]byte, error) {
 	}
 	// Check if raw is share links or base64-encoded share links
 	if looksLikeShareLinksOrBase64(raw) {
-		if m.coreHelper != nil {
-			return m.coreHelper.ConvertShareLinks(raw)
+		if helper := m.getCoreHelper(); helper != nil {
+			return helper.ConvertShareLinks(raw)
 		}
 		return ConvertShareLinksPayload(raw)
 	}

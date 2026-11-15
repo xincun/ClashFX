@@ -20,15 +20,18 @@ import (
 )
 
 const (
-	ServiceName     = "ClashFXService"
-	ServicePipeName = `\\.\pipe\ClashFXService`
+	ServiceName            = "ClashFXService"
+	ServicePipeName        = `\\.\pipe\ClashFXService`
+	DarwinPrivilegedBinDir = "/Library/Application Support/ClashFX/bin"
 )
 
 type Request struct {
-	Action     string `json:"action"` // "start_core", "stop_core", "status"
+	Action     string `json:"action"` // "start_core", "stop_core", "status", "upgrade_core"
 	HomeDir    string `json:"home_dir,omitempty"`
 	ConfigFile string `json:"config_file,omitempty"`
 	ExtUI      string `json:"ext_ui,omitempty"`
+	Channel    string `json:"channel,omitempty"`
+	ProxyPort  int    `json:"proxy_port,omitempty"`
 }
 
 type Status struct {
@@ -39,10 +42,19 @@ type Status struct {
 	RecentLogs []string `json:"recent_logs,omitempty"`
 }
 
+type CoreUpgradeInfo struct {
+	Updated         bool   `json:"updated"`
+	AlreadyLatest   bool   `json:"already_latest,omitempty"`
+	PreviousVersion string `json:"previous_version,omitempty"`
+	CurrentVersion  string `json:"current_version,omitempty"`
+	LatestVersion   string `json:"latest_version,omitempty"`
+}
+
 type Response struct {
-	OK      bool    `json:"ok"`
-	Message string  `json:"message,omitempty"`
-	Status  *Status `json:"status,omitempty"`
+	OK      bool             `json:"ok"`
+	Message string           `json:"message,omitempty"`
+	Status  *Status          `json:"status,omitempty"`
+	Upgrade *CoreUpgradeInfo `json:"upgrade,omitempty"`
 }
 
 // Runner supervises a single stock upstream mihomo_core binary located strictly inside
@@ -51,16 +63,21 @@ type Response struct {
 // Mihomo release (or in-place online core upgrade) runs natively.
 type Runner struct {
 	mu           sync.Mutex
+	upgradeMu    sync.Mutex
 	trustedDir   string
 	coreExeName  string
 	readyTimeout time.Duration
 	stopTimeout  time.Duration
+
+	testReleaseAPIURL   string
+	testDownloadBaseURL string
 
 	cmd        *exec.Cmd
 	guard      *childGuard
 	doneCh     chan error
 	homeDir    string
 	configFile string
+	extUI      string
 
 	logMu      sync.Mutex
 	recentLogs []string
@@ -85,6 +102,16 @@ func (r *Runner) TrustedDir() string {
 	return r.trustedDir
 }
 
+func (r *Runner) SetTrustedDir(dir string) {
+	cleaned := strings.TrimSpace(dir)
+	if cleaned == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.trustedDir = filepath.Clean(cleaned)
+}
+
 func (r *Runner) SetCoreBinaryForTest(exeName string, readyTimeout, stopTimeout time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -95,6 +122,13 @@ func (r *Runner) SetCoreBinaryForTest(exeName string, readyTimeout, stopTimeout 
 	if stopTimeout > 0 {
 		r.stopTimeout = stopTimeout
 	}
+}
+
+func (r *Runner) SetUpgradeEndpointsForTest(releaseAPIURL, downloadBaseURL string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.testReleaseAPIURL = strings.TrimSpace(releaseAPIURL)
+	r.testDownloadBaseURL = strings.TrimSpace(downloadBaseURL)
 }
 
 func (r *Runner) Handle(req Request) Response {
@@ -115,6 +149,12 @@ func (r *Runner) Handle(req Request) Response {
 		}
 		st := r.Status()
 		return Response{OK: true, Status: &st}
+	case "upgrade_core":
+		info, st, err := r.UpgradeCore(context.Background(), req.Channel, req.ProxyPort)
+		if err != nil {
+			return Response{OK: false, Message: err.Error(), Status: &st, Upgrade: &info}
+		}
+		return Response{OK: true, Status: &st, Upgrade: &info}
 	default:
 		return Response{OK: false, Message: fmt.Sprintf("unknown service action %q", req.Action)}
 	}
@@ -285,7 +325,10 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.startLocked(cleanHome, cleanConfig, cleanUI)
+}
 
+func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI string) (Status, error) {
 	if err := r.stopLocked(); err != nil {
 		return r.statusLocked(), fmt.Errorf("stop previous core: %w", err)
 	}
@@ -374,6 +417,7 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 	r.doneCh = doneCh
 	r.homeDir = cleanHome
 	r.configFile = cleanConfig
+	r.extUI = cleanUI
 
 	select {
 	case <-readyCh:

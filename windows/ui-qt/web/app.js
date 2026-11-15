@@ -184,6 +184,7 @@ function computePageRenderSignature() {
         store.language,
         store.theme,
         snap.version || '',
+        snap.core_version || '',
         snap.config_dir || '',
         snap.active_network || null,
         Boolean(snap.service_installed),
@@ -232,7 +233,8 @@ function renderChrome() {
   // Brand status line
   const verEl = document.getElementById('brand-version');
   const subEl = document.getElementById('brand-status-line');
-  if (verEl) verEl.textContent = snap.version ? `v${snap.version}` : '--';
+  const rawCoreVer = snap.core_version || (snap.version ? `v${String(snap.version).replace(/^v/i, '')}` : '');
+  if (verEl) verEl.textContent = rawCoreVer || '--';
   if (subEl) {
     if (!store.connected) {
       subEl.className = 'brand-sub err';
@@ -623,6 +625,78 @@ function wireWindowControls() {
 
   consoleFrame?.addEventListener('load', () => {
     postSyncToConsoleFrame();
+  });
+
+  const inFlightIframeRpc = {};
+  window.addEventListener('message', (ev) => {
+    const d = ev.data;
+    if (!d || d.type !== 'clashfx_iframe_rpc') return;
+    if (!consoleFrame || ev.source !== consoleFrame.contentWindow) return;
+    if (!/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(String(ev.origin || ''))) return;
+
+    const method = String(d.method || '');
+    const replyOrigin = ev.origin;
+    const replyToFrame = (res) => {
+      try {
+        consoleFrame?.contentWindow?.postMessage(
+          {
+            type: 'clashfx_iframe_rpc_result',
+            id: d.id,
+            ok: Boolean(res?.ok),
+            data: res?.data ?? null,
+            error: res?.error || '',
+          },
+          replyOrigin
+        );
+      } catch (_) {}
+    };
+
+    if (method !== 'upgrade_core' && method !== 'restart_core') {
+      replyToFrame({ ok: false, error: `Unsupported iframe RPC: ${method}` });
+      return;
+    }
+
+    if (inFlightIframeRpc[method]) {
+      inFlightIframeRpc[method].then(replyToFrame);
+      return;
+    }
+
+    showToast(
+      method === 'upgrade_core'
+        ? t('正在检查并更新 Mihomo 核心…', 'Checking and upgrading Mihomo core…')
+        : t('正在重启 Mihomo 核心…', 'Restarting Mihomo core…'),
+      'info'
+    );
+
+    const reqPromise = rpc(method, d.params && typeof d.params === 'object' ? d.params : {}, { silent: true })
+      .then((res) => {
+        if (method === 'upgrade_core') {
+          if (!res.ok) {
+            showToast(`${t('更新核心失败', 'Core upgrade failed')}: ${res.error || ''}`, 'err');
+          } else if (res.data?.already_latest) {
+            const ver = res.data.current_version || store.snapshot?.core_version || '';
+            showToast(t(`当前已是最新核心 (${ver})`, `Core is already up to date (${ver})`), 'ok');
+          } else {
+            const ver = res.data?.current_version || '';
+            showToast(t(`核心已更新至 ${ver} 并自动重启`, `Core upgraded to ${ver} and restarted`), 'ok');
+            syncConsoleHost(true);
+          }
+        } else {
+          if (!res.ok) {
+            showToast(`${t('重启核心失败', 'Core restart failed')}: ${res.error || ''}`, 'err');
+          } else {
+            showToast(t('Mihomo 核心已重启', 'Mihomo core restarted'), 'ok');
+            syncConsoleHost(true);
+          }
+        }
+        return res;
+      })
+      .finally(() => {
+        delete inFlightIframeRpc[method];
+      });
+
+    inFlightIframeRpc[method] = reqPromise;
+    reqPromise.then(replyToFrame);
   });
 
   document.getElementById('btn-reload-core')?.addEventListener('click', async () => {

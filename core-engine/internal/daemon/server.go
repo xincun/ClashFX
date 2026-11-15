@@ -242,6 +242,8 @@ func rpcTimeoutForMethod(method string) time.Duration {
 		"node_check_connectivity",
 		"node_speed_test_start",
 		"check_updates",
+		"upgrade_core",
+		"restart_core",
 		"set_enhanced_mode",
 		"set_ai_lock",
 		"reload_config",
@@ -577,6 +579,21 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			return errResp(err)
 		}
 		return okResp(res)
+	case "restart_core":
+		var p struct {
+			AllowUAC bool `json:"allow_uac"`
+		}
+		_ = json.Unmarshal(req.Params, &p)
+		if err := s.engine.RestartCore(ctx, p.AllowUAC); err != nil {
+			return errResp(err)
+		}
+		return okResp(map[string]bool{"restarted": true})
+	case "upgrade_core":
+		info, err := s.engine.UpgradeCore(ctx)
+		if err != nil {
+			return errResp(err)
+		}
+		return okResp(info)
 	case "quit_daemon":
 		var p struct {
 			ForceRestoreProxy bool `json:"force_restore_proxy"`

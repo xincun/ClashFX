@@ -72,4 +72,8 @@ func VerifyPipePeer(_ net.Conn, _ string) error {
 	return nil
 }
 
+func prepareUpgradedCoreFile(_ string) {}
+
+func refreshCorePlatformPostInstall(_ string) {}
+
 func repairUserHomeOwnership(_ string) {}
