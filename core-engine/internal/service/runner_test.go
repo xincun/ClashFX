@@ -3,21 +3,27 @@ package service
 import (
 	"fmt"
 	"net"
-	"net/http"
 	"os"
-	"os/signal"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
 
-func TestRunnerHelperProcess(t *testing.T) {
-	mode := os.Getenv("CLASHFX_TEST_CORE_MODE")
-	if mode == "" {
-		return
-	}
+const fakeRunnerCoreSource = `package main
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+)
+
+func main() {
 	// Strictly reject any non-standard flags (such as -watch-stdin) just like stock upstream mihomo!
 	for _, arg := range os.Args[1:] {
 		if arg == "-watch-stdin" || arg == "-convert-share-links" || arg == "--features" {
@@ -25,9 +31,9 @@ func TestRunnerHelperProcess(t *testing.T) {
 			os.Exit(2)
 		}
 	}
-	switch mode {
+	switch os.Getenv("CLASHFX_TEST_CORE_MODE") {
 	case "ok":
-		if sp := os.Getenv("SAFE_PATHS"); sp == "" {
+		if os.Getenv("SAFE_PATHS") == "" {
 			fmt.Fprintln(os.Stderr, "SAFE_PATHS was not injected into child process")
 			os.Exit(3)
 		}
@@ -36,7 +42,7 @@ func TestRunnerHelperProcess(t *testing.T) {
 			mux := http.NewServeMux()
 			mux.HandleFunc("/version", func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"meta":true,"version":"v1.19.34"}`))
+				_, _ = w.Write([]byte("{\"meta\":true,\"version\":\"v1.19.34\"}"))
 			})
 			ln, err := net.Listen("tcp", ctrlAddr)
 			if err != nil {
@@ -48,13 +54,29 @@ func TestRunnerHelperProcess(t *testing.T) {
 			go func() { _ = srv.Serve(ln) }()
 		}
 		fmt.Printf("time=\"now\" level=info msg=\"RESTful API listening at: %s\"\n", ctrlAddr)
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		sigCh := make(chan os.Signal, 2)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
-		os.Exit(0)
 	case "fail":
 		fmt.Fprintln(os.Stderr, "Parse config error: invalid yaml")
 		os.Exit(1)
+	}
+}
+`
+
+func buildFakeRunnerBinary(t *testing.T, outPath string) {
+	t.Helper()
+	srcDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(srcDir, "go.mod"), []byte("module fake_runner\n\ngo 1.21\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "main.go"), []byte(fakeRunnerCoreSource), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "build", "-ldflags=-s -w", "-o", outPath, ".")
+	cmd.Dir = srcDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("compile fake runner binary: %v\n%s", err, string(out))
 	}
 }
 
@@ -76,18 +98,15 @@ func TestRunnerLifecycleAndValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	selfExe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
+	fakeExeName := "fake_core"
+	if runtime.GOOS == "windows" {
+		fakeExeName += ".exe"
 	}
-	wrapperPath := filepath.Join(trustedDir, "fake_core.sh")
-	script := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=^TestRunnerHelperProcess$ -- \"$@\"\n", selfExe)
-	if err := os.WriteFile(wrapperPath, []byte(script), 0755); err != nil {
-		t.Fatal(err)
-	}
+	wrapperPath := filepath.Join(trustedDir, fakeExeName)
+	buildFakeRunnerBinary(t, wrapperPath)
 
 	runner := NewRunner(trustedDir)
-	runner.SetCoreBinaryForTest("fake_core.sh", 10*time.Second, 5*time.Second)
+	runner.SetCoreBinaryForTest(fakeExeName, 10*time.Second, 5*time.Second)
 
 	// Reject relative or UNC paths
 	if resp := runner.Handle(Request{Action: "start_core", HomeDir: "relative", ConfigFile: cfgPath}); resp.OK {

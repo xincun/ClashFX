@@ -256,7 +256,6 @@ jobs:
           host: ${{ matrix.qt_host }}
           target: desktop
           arch: ${{ matrix.qt_arch }}
-          modules: qtsvg
           cache: true
 
       - name: Build mihomo_core, daemon, service & fetch WebView2 SDK
