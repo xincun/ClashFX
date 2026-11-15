@@ -1035,10 +1035,11 @@ final class TrayController: NSObject, NSMenuDelegate {
 
     private func showAboutBox() {
         let ver = (snapshot["version"] as? String) ?? "1.19.24"
+        let coreVer = (snapshot["core_version"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "v1.19.24"
         let arch = (snapshot["arch"] as? String) ?? ""
         showAlert(
             title: L("关于 ClashFX", "About ClashFX"),
-            message: "ClashFX for macOS\nVersion: \(ver) (\(arch))\nAppKit + WKWebView + Mihomo Core v1.19.24\nFeatures: AI Proxy Lock, Multi-Node Fixed Ports & 204 Recovery, Privileged TUN Daemon.",
+            message: "ClashFX for macOS\nVersion: \(ver) (\(arch))\nAppKit + WKWebView + Mihomo Core \(coreVer)\nFeatures: AI Proxy Lock, Multi-Node Fixed Ports & 204 Recovery, Privileged TUN Daemon.",
             warning: false
         )
     }

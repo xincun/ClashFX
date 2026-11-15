@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build dual-arch (arm64 & amd64) clashfx-service.exe and clashfx-daemon.exe."""
 
+import argparse
 import os
 import pathlib
 import shutil
@@ -44,7 +45,21 @@ def verify_pe_machine(path: pathlib.Path, expected_machine: int) -> None:
 
 
 def main() -> int:
-    for arch, expected_machine in TARGETS:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", default="1.19.24", help="ClashFX AppVersion to embed")
+    parser.add_argument(
+        "--arch",
+        choices=["all", "arm64", "amd64"],
+        default="all",
+        help="target Windows architecture(s) to build",
+    )
+    args = parser.parse_args()
+
+    app_version = args.version.strip().lstrip("vV") or "1.19.24"
+    targets = TARGETS if args.arch == "all" else [t for t in TARGETS if t[0] == args.arch]
+    ldflags = f"-ldflags=-H=windowsgui -s -w -X github.com/clashfx/core-engine/internal/daemon.AppVersion={app_version}"
+
+    for arch, expected_machine in targets:
         out_dir = BIN_ROOT / arch
         out_dir.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
@@ -58,7 +73,7 @@ def main() -> int:
                     "go",
                     "build",
                     "-trimpath",
-                    "-ldflags=-H=windowsgui -s -w -X github.com/clashfx/core-engine/internal/daemon.AppVersion=1.19.24",
+                    ldflags,
                     "-o",
                     str(out_path),
                     pkg,

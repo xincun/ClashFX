@@ -1,0 +1,328 @@
+name: Build & Release ClashFX
+
+on:
+  push:
+    branches:
+      - release
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]*'
+      - '[0-9]+.[0-9]+.[0-9]*'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Release channel (stable or lab)'
+        required: false
+        default: 'stable'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clashfx-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Compute Release Version & Channel
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.meta.outputs.should_build }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      build_number: ${{ steps.meta.outputs.build_number }}
+      channel: ${{ steps.meta.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine release metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+        run: |
+          python3 - << 'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          def parse_ver(raw: str):
+              m = re.match(r'^[vV]?(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?$', raw.strip())
+              if not m:
+                  return None
+              return (
+                  int(m.group(1)),
+                  int(m.group(2)),
+                  int(m.group(3)),
+                  int(m.group(4)) if m.group(4) is not None else 0,
+                  m.group(4) is not None,
+                  m.group(5) or "",
+              )
+
+          engine_go = Path("core-engine/internal/daemon/engine.go").read_text(encoding="utf-8")
+          m_base = re.search(r'var\s+AppVersion\s*=\s*"([^"]+)"', engine_go)
+          base_str = (m_base.group(1) if m_base else "1.19.24").strip().lstrip("vV")
+          base_parsed = parse_ver(base_str) or (1, 19, 24, 0, False, "")
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          github_ref = os.environ["GITHUB_REF"]
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          input_channel = (os.environ.get("INPUT_CHANNEL") or "").strip().lower()
+
+          should_build = True
+          should_release = True
+
+          if github_ref.startswith("refs/tags/"):
+              raw_tag = github_ref[len("refs/tags/"):]
+              parsed = parse_ver(raw_tag)
+              if not parsed:
+                  raise SystemExit(f"Unsupported release tag format: {raw_tag}")
+              version = raw_tag.lstrip("vV")
+              tag = f"v{version}"
+              channel = "lab" if (parsed[4] or bool(parsed[5])) else "stable"
+
+              for check_tag in dict.fromkeys([raw_tag, tag, version]):
+                  proc = subprocess.run(
+                      ["gh", "api", f"repos/{repo}/releases/tags/{check_tag}"],
+                      capture_output=True,
+                      text=True,
+                  )
+                  if proc.returncode == 0:
+                      rel = json.loads(proc.stdout)
+                      if not rel.get("draft", False):
+                          print(f"Release already exists for {check_tag}; skipping duplicate build.")
+                          should_build = False
+                          should_release = False
+                          break
+          else:
+              candidates = [(base_parsed[0], base_parsed[1], base_parsed[2])]
+
+              tags_out = subprocess.check_output(["git", "tag", "-l"], text=True)
+              for line in tags_out.splitlines():
+                  p = parse_ver(line)
+                  if p:
+                      candidates.append((p[0], p[1], p[2]))
+
+              rels_proc = subprocess.run(
+                  ["gh", "api", "--paginate", f"repos/{repo}/releases?per_page=100"],
+                  capture_output=True,
+                  text=True,
+              )
+              if rels_proc.returncode == 0 and rels_proc.stdout.strip():
+                  try:
+                      rels = json.loads(rels_proc.stdout)
+                  except json.JSONDecodeError:
+                      rels = []
+                  if isinstance(rels, list):
+                      for rel in rels:
+                          p = parse_ver(str(rel.get("tag_name") or ""))
+                          if p:
+                              candidates.append((p[0], p[1], p[2]))
+
+              highest = max(candidates)
+              version = f"{highest[0]}.{highest[1]}.{highest[2] + 1}"
+              tag = f"v{version}"
+              channel = "lab" if (event_name == "workflow_dispatch" and input_channel == "lab") else "stable"
+
+          p_out = parse_ver(version) or (1, 19, 25, 0, False, "")
+          build_number = f"{p_out[0]}{p_out[1]:03d}{p_out[2]:03d}{p_out[3]:03d}"
+
+          print(f"should_build={should_build} should_release={should_release} version={version} tag={tag} build_number={build_number} channel={channel}")
+          out_path = Path(os.environ["GITHUB_OUTPUT"])
+          with out_path.open("a", encoding="utf-8") as f:
+              f.write(f"should_build={'true' if should_build else 'false'}\n")
+              f.write(f"should_release={'true' if should_release else 'false'}\n")
+              f.write(f"version={version}\n")
+              f.write(f"tag={tag}\n")
+              f.write(f"build_number={build_number}\n")
+              f.write(f"channel={channel}\n")
+          PY
+
+  build-macos:
+    name: Build Universal macOS (DMG & PKG)
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: core-engine/go.mod
+          cache-dependency-path: core-engine/go.sum
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Web SPA syntax verification
+        run: |
+          for f in windows/ui-qt/web/*.js; do
+            node --check "$f"
+          done
+
+      - name: Verify deployment SDK floor
+        run: python3 scripts/verify-release-compatibility.py --sdk
+
+      - name: Go core-engine tests with race detector
+        working-directory: core-engine
+        env:
+          CLASHFX_DISABLE_OS_SYSPROXY: '1'
+          CLASHFX_DISABLE_LAUNCH_AGENT: '1'
+          CLASHFX_DISABLE_LEGACY_PLIST_MIGRATION: '1'
+          CLASHFX_DISABLE_PRIVILEGED_SERVICE: '1'
+        run: go test -race -count=1 ./...
+
+      - name: Build Universal macOS App, PKG & DMG
+        run: |
+          python3 macos/scripts/build-core.py
+          python3 macos/scripts/build-daemon.py --version "${{ needs.prepare.outputs.version }}"
+          python3 macos/scripts/build-ui.py
+          python3 macos/scripts/stage-app.py --version "${{ needs.prepare.outputs.version }}" --build-number "${{ needs.prepare.outputs.build_number }}"
+          python3 scripts/verify-release-compatibility.py --app macos/dist/ClashFX.app
+          bash scripts/verify-dashboard-compatibility-bundle.sh macos/dist/ClashFX.app
+          codesign --verify --deep --strict --verbose=2 macos/dist/ClashFX.app
+          python3 macos/scripts/package-pkg.py --version "${{ needs.prepare.outputs.version }}"
+          python3 macos/scripts/package-dmg.py
+
+      - name: Verify mounted DMG & expanded PKG contents
+        run: |
+          DMG_VERIFY_DIR=$(mktemp -d /tmp/clashfx-dmg-verify.XXXXXX)
+          DMG_MOUNT_POINT="$DMG_VERIFY_DIR/mount"
+          mkdir -p "$DMG_MOUNT_POINT"
+          cleanup_dmg() {
+            hdiutil detach "$DMG_MOUNT_POINT" -quiet 2>/dev/null || true
+            rm -rf "$DMG_VERIFY_DIR" 2>/dev/null || true
+          }
+          trap cleanup_dmg EXIT
+          hdiutil attach macos/dist/ClashFX.dmg -nobrowse -readonly -mountpoint "$DMG_MOUNT_POINT"
+          test -f "$DMG_MOUNT_POINT/ClashFX.pkg"
+          pkgutil --expand-full "$DMG_MOUNT_POINT/ClashFX.pkg" "$DMG_VERIFY_DIR/expanded"
+          EXPANDED_APP="$DMG_VERIFY_DIR/expanded/ClashFX-component.pkg/Payload/Applications/ClashFX.app"
+          python3 scripts/verify-release-compatibility.py --app "$EXPANDED_APP"
+          bash scripts/verify-dashboard-compatibility-bundle.sh "$EXPANDED_APP"
+
+      - name: Upload macOS release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: |
+            macos/dist/ClashFX.dmg
+            macos/dist/ClashFX.pkg
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+            qt_host: windows
+            qt_arch: win64_msvc2022_64
+          - arch: arm64
+            runner: windows-11-arm
+            qt_host: windows_arm64
+            qt_arch: win64_msvc2022_arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: core-engine/go.mod
+          cache-dependency-path: core-engine/go.sum
+
+      - name: Run native Windows core-engine tests
+        working-directory: core-engine
+        run: go test -count=1 ./...
+
+      - name: Install Qt 6.8.3 (${{ matrix.qt_arch }})
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: ${{ matrix.qt_host }}
+          target: desktop
+          arch: ${{ matrix.qt_arch }}
+          modules: qtsvg
+          cache: true
+
+      - name: Build mihomo_core, daemon, service & fetch WebView2 SDK
+        run: |
+          python windows/scripts/build-core.py --arch ${{ matrix.arch }}
+          python windows/scripts/build-daemon.py --arch ${{ matrix.arch }} --version "${{ needs.prepare.outputs.version }}"
+          python windows/scripts/fetch-webview2-sdk.py
+
+      - name: Build clashfx-ui & package installers (${{ matrix.arch }})
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/build-ui.ps1 -TargetArch ${{ matrix.arch }} -QtArm64Root "$env:QT_ROOT_DIR" -QtX64Root "$env:QT_ROOT_DIR"
+          powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/package-release.ps1 -TargetArch ${{ matrix.arch }} -AppVersion "${{ needs.prepare.outputs.version }}"
+
+      - name: Upload Windows ${{ matrix.arch }} release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: |
+            windows/dist/ClashFX-Setup-${{ matrix.arch }}.exe
+            windows/dist/ClashFX-Portable-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Unified GitHub Release
+    needs: [prepare, build-macos, build-windows]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          merge-multiple: true
+
+      - name: Verify all platform artifacts & generate SHA256SUMS
+        run: |
+          cd dist-all
+          for f in \
+            ClashFX.dmg \
+            ClashFX.pkg \
+            ClashFX-Setup-amd64.exe \
+            ClashFX-Setup-arm64.exe \
+            ClashFX-Portable-amd64.zip \
+            ClashFX-Portable-arm64.zip; do
+            test -s "$f" || { echo "Missing release asset: $f" >&2; exit 1; }
+          done
+          sha256sum ClashFX* > SHA256SUMS.txt
+          ls -lh
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release ${{ needs.prepare.outputs.tag }}
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ClashFX ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: ${{ needs.prepare.outputs.channel == 'lab' }}
+          generate_release_notes: true
+          files: |
+            dist-all/ClashFX.dmg
+            dist-all/ClashFX.pkg
+            dist-all/ClashFX-Setup-amd64.exe
+            dist-all/ClashFX-Setup-arm64.exe
+            dist-all/ClashFX-Portable-amd64.zip
+            dist-all/ClashFX-Portable-arm64.zip
+            dist-all/SHA256SUMS.txt

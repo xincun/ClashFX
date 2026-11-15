@@ -26,7 +26,7 @@
 
 ## 📥 インストール
 
-[Releases](https://github.com/Clash-FX/ClashFX/releases) ページからダウンロードしてください。
+[Releases](https://github.com/xincun/ClashFX/releases) ページからダウンロードしてください。
 
 ### 🧪 アップデートチャンネル: 安定版と Lab 版
 

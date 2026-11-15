@@ -962,15 +962,19 @@ void TrayController::checkForUpdates() {
 
 void TrayController::showAboutBox() {
     const QString ver = snapshot_.value(QStringLiteral("version")).toString(QStringLiteral("1.19.24"));
+    QString coreVer = snapshot_.value(QStringLiteral("core_version")).toString().trimmed();
+    if (coreVer.isEmpty()) {
+        coreVer = QStringLiteral("v1.19.24");
+    }
     const QString arch = snapshot_.value(QStringLiteral("arch")).toString();
     QMessageBox::about(
         modalDialogParent(),
         L("关于 ClashFX", "About ClashFX"),
         QStringLiteral("<h3>ClashFX for Windows</h3>"
                        "<p>Version: <b>%1</b> (%2)</p>"
-                       "<p>Qt %3 + Microsoft Edge WebView2 + Mihomo Core v1.19.24</p>"
+                       "<p>Qt %3 + Microsoft Edge WebView2 + Mihomo Core %4</p>"
                        "<p>Features: AI Proxy Lock, Multi-Node Fixed Ports &amp; 204 Recovery, Wintun Service.</p>")
-            .arg(ver, arch, QString::fromLatin1(qVersion())));
+            .arg(ver, arch, QString::fromLatin1(qVersion()), coreVer));
 }
 
 void TrayController::openConsole() {

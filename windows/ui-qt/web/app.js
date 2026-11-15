@@ -15,6 +15,8 @@ import {
 } from './bridge.js';
 import { renderRulesPage, renderSubscriptionsPage, setRulesSubTab } from './pages-core.js';
 import {
+  applyAppUpdateCheck,
+  getAvailableAppUpdate,
   isDiagConnectionsActive,
   renderAiLockPage,
   renderDiagnosticsPage,
@@ -48,6 +50,7 @@ let sidebarNavBuilt = false;
 let sidebarDockBuilt = false;
 let dockProfileSig = '';
 let lastPageSig = '';
+let startupUpdateChecked = false;
 
 function ensureSidebarNavBuilt(navEl) {
   if (!navEl || sidebarNavBuilt) return;
@@ -297,6 +300,11 @@ function renderChrome() {
           trailingEl.className = 'nav-trailing nav-count';
           trailingEl.textContent = String(nsCount);
           trailingEl.title = '';
+        } else if (p.id === 6 && getAvailableAppUpdate()) {
+          trailingEl.hidden = false;
+          trailingEl.className = 'nav-trailing nav-count';
+          trailingEl.textContent = 'NEW';
+          trailingEl.title = getAvailableAppUpdate().version;
         } else {
           trailingEl.hidden = true;
           trailingEl.className = 'nav-trailing';
@@ -749,6 +757,31 @@ function wireWindowControls() {
   );
 }
 
+function scheduleStartupUpdateCheck() {
+  if (startupUpdateChecked || window.__CLASHFX_SMOKE__) return;
+  startupUpdateChecked = true;
+  setTimeout(async () => {
+    try {
+      const res = await rpc('check_updates', {}, { silent: true });
+      if (res.ok && res.data) {
+        const avail = applyAppUpdateCheck(res.data, store.snapshot?.version || '');
+        if (avail) {
+          renderAll(false);
+          showToast(
+            t(
+              `发现新版本 ${res.data.latest_version}，可在「偏好设置」下载升级`,
+              `New ClashFX ${res.data.latest_version} available in Preferences`
+            ),
+            'info'
+          );
+        }
+      }
+    } catch {
+      // ignore offline startup update check failure
+    }
+  }, 4000);
+}
+
 function wireIconsAndBootstrap() {
   document.getElementById('win-min').innerHTML = ICONS.minimize;
   document.getElementById('win-max').innerHTML = ICONS.maximize;
@@ -758,6 +791,7 @@ function wireIconsAndBootstrap() {
 
   subscribe((eventType) => {
     if (eventType === 'init' || eventType === 'navigate') {
+      if (eventType === 'init') scheduleStartupUpdateCheck();
       if (store.page === 2 && store.subTab >= 0) setRulesSubTab(store.subTab);
       if (store.page === 5) setDiagSubTab(store.subTab >= 0 ? store.subTab : 0, store.diagNode);
       postNative({

@@ -184,9 +184,63 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 	if err != nil || !stableMac.UpdateAvailable || stableMac.LatestVersion != "v9.9.9" || stableMac.DownloadURL != "https://example.com/ClashFX.dmg" {
 		t.Fatalf("unexpected macOS stable update result: %+v (%v)", stableMac, err)
 	}
+	if DefaultGitHubReleasesURL != "https://api.github.com/repos/xincun/ClashFX/releases" {
+		t.Fatalf("DefaultGitHubReleasesURL = %q, want xincun/ClashFX", DefaultGitHubReleasesURL)
+	}
+
 	macZipWin, err := CheckForUpdatesForPlatform(context.Background(), "v1.9.8", "stable", relSrv.URL, 0, "windows", "arm64")
 	if err != nil || macZipWin.LatestVersion != "v2.0.0" || macZipWin.DownloadURL != "https://example.com/arm64.exe" {
 		t.Fatalf("Windows should prefer .exe over .zip and skip macOS zip releases, got %+v (%v)", macZipWin, err)
+	}
+
+	// Unified multi-platform release (macOS DMG/PKG + Windows Dual-Arch Setup/Portable)
+	unifiedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"tag_name":   "v1.19.25",
+				"prerelease": false,
+				"html_url":   "https://github.com/xincun/ClashFX/releases/tag/v1.19.25",
+				"assets": []map[string]string{
+					{"name": "ClashFX.dmg", "browser_download_url": "https://github.com/xincun/ClashFX/releases/download/v1.19.25/ClashFX.dmg"},
+					{"name": "ClashFX.pkg", "browser_download_url": "https://github.com/xincun/ClashFX/releases/download/v1.19.25/ClashFX.pkg"},
+					{"name": "ClashFX-Setup-amd64.exe", "browser_download_url": "https://github.com/xincun/ClashFX/releases/download/v1.19.25/ClashFX-Setup-amd64.exe"},
+					{"name": "ClashFX-Setup-arm64.exe", "browser_download_url": "https://github.com/xincun/ClashFX/releases/download/v1.19.25/ClashFX-Setup-arm64.exe"},
+					{"name": "ClashFX-Portable-amd64.zip", "browser_download_url": "https://github.com/xincun/ClashFX/releases/download/v1.19.25/ClashFX-Portable-amd64.zip"},
+					{"name": "ClashFX-Portable-arm64.zip", "browser_download_url": "https://github.com/xincun/ClashFX/releases/download/v1.19.25/ClashFX-Portable-arm64.zip"},
+				},
+			},
+			{
+				"tag_name":   "v1.19.25.1",
+				"prerelease": true,
+				"html_url":   "https://github.com/xincun/ClashFX/releases/tag/v1.19.25.1",
+				"assets": []map[string]string{
+					{"name": "ClashFX.dmg", "browser_download_url": "https://github.com/xincun/ClashFX/releases/download/v1.19.25.1/ClashFX.dmg"},
+					{"name": "ClashFX-Setup-arm64.exe", "browser_download_url": "https://github.com/xincun/ClashFX/releases/download/v1.19.25.1/ClashFX-Setup-arm64.exe"},
+				},
+			},
+		})
+	}))
+	defer unifiedSrv.Close()
+
+	for _, tc := range []struct {
+		goos, arch, wantURL string
+	}{
+		{"darwin", "arm64", "https://github.com/xincun/ClashFX/releases/download/v1.19.25/ClashFX.dmg"},
+		{"darwin", "amd64", "https://github.com/xincun/ClashFX/releases/download/v1.19.25/ClashFX.dmg"},
+		{"windows", "arm64", "https://github.com/xincun/ClashFX/releases/download/v1.19.25/ClashFX-Setup-arm64.exe"},
+		{"windows", "amd64", "https://github.com/xincun/ClashFX/releases/download/v1.19.25/ClashFX-Setup-amd64.exe"},
+	} {
+		got, gErr := CheckForUpdatesForPlatform(context.Background(), "vv1.19.24", "stable", unifiedSrv.URL, 0, tc.goos, tc.arch)
+		if gErr != nil || !got.UpdateAvailable || got.LatestVersion != "v1.19.25" || got.DownloadURL != tc.wantURL {
+			t.Fatalf("unified release %s/%s: got %+v (%v), want url %s", tc.goos, tc.arch, got, gErr, tc.wantURL)
+		}
+	}
+
+	if compareSemver("v1.19.25.1", "v1.19.25") <= 0 {
+		t.Fatalf("expected 4-segment v1.19.25.1 > v1.19.25")
+	}
+	if compareSemver("vv1.19.24", "v1.19.24") != 0 {
+		t.Fatalf("expected normalized vv1.19.24 == v1.19.24")
 	}
 }
 

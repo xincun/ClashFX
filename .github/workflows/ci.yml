@@ -1,0 +1,120 @@
+name: ClashFX CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - release
+    tags-ignore:
+      - '*'
+
+jobs:
+  core-engine-and-js:
+    name: Go Core Engine (-race & Dual-Arch Cross Build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: core-engine/go.mod
+          cache-dependency-path: core-engine/go.sum
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Web SPA syntax verification
+        run: |
+          for f in windows/ui-qt/web/*.js; do
+            node --check "$f"
+          done
+
+      - name: Run core-engine tests with race detector
+        working-directory: core-engine
+        run: go test -race -count=1 ./...
+
+      - name: Verify dual-arch Windows daemon & service cross-build
+        run: python3 windows/scripts/build-daemon.py
+
+  macos-build:
+    name: macOS Universal Build & Gate Verification
+    runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: core-engine/go.mod
+          cache-dependency-path: core-engine/go.sum
+
+      - name: Verify deployment SDK floor
+        run: python3 scripts/verify-release-compatibility.py --sdk
+
+      - name: Go core-engine tests with race detector
+        working-directory: core-engine
+        env:
+          CLASHFX_DISABLE_OS_SYSPROXY: '1'
+          CLASHFX_DISABLE_LAUNCH_AGENT: '1'
+          CLASHFX_DISABLE_LEGACY_PLIST_MIGRATION: '1'
+          CLASHFX_DISABLE_PRIVILEGED_SERVICE: '1'
+        run: go test -race -count=1 ./...
+
+      - name: Build Universal macOS App & verify compatibility gates
+        run: |
+          ./scripts/build-local.sh
+          codesign --verify --deep --strict --verbose=2 macos/dist/ClashFX.app
+
+  windows-build:
+    name: Windows (${{ matrix.arch }}) Go Tests & Qt6 Build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+            qt_host: windows
+            qt_arch: win64_msvc2022_64
+          - arch: arm64
+            runner: windows-11-arm
+            qt_host: windows_arm64
+            qt_arch: win64_msvc2022_arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: core-engine/go.mod
+          cache-dependency-path: core-engine/go.sum
+
+      - name: Run native Windows core-engine tests
+        working-directory: core-engine
+        run: go test -count=1 ./...
+
+      - name: Install Qt 6.8.3 (${{ matrix.qt_arch }})
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: ${{ matrix.qt_host }}
+          target: desktop
+          arch: ${{ matrix.qt_arch }}
+          modules: qtsvg
+          cache: true
+
+      - name: Build core, daemon & fetch WebView2 SDK
+        run: |
+          python windows/scripts/build-core.py --arch ${{ matrix.arch }}
+          python windows/scripts/build-daemon.py --arch ${{ matrix.arch }}
+          python windows/scripts/fetch-webview2-sdk.py
+
+      - name: Configure & Build clashfx-ui (${{ matrix.arch }})
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/build-ui.ps1 -TargetArch ${{ matrix.arch }} -QtArm64Root "$env:QT_ROOT_DIR" -QtX64Root "$env:QT_ROOT_DIR"

@@ -1,7 +1,8 @@
 param(
     [string]$RepoRoot = "",
     [string]$QtArm64Root = "C:\workspace\github\qt_out\qt6.8.3_arm64",
-    [string]$QtX64Root = "C:\workspace\github\qt_out\qt6.8.3_x64"
+    [string]$QtX64Root = "C:\workspace\github\qt_out\qt6.8.3_x64",
+    [ValidateSet("all", "arm64", "amd64")][string]$TargetArch = "all"
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,6 +18,9 @@ if (-not (Test-Path $VsWhere)) {
 $VsPath = (& $VsWhere -latest -products * -property installationPath).Trim()
 $VcVarsAll = Join-Path $VsPath "VC\Auxiliary\Build\vcvarsall.bat"
 $NinjaExe = Join-Path $VsPath "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+if (-not (Test-Path $NinjaExe)) {
+    $NinjaExe = (Get-Command ninja -ErrorAction Stop).Source
+}
 $CMakeExe = Join-Path $VsPath "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 if (-not (Test-Path $CMakeExe)) {
     $CMakeExe = (Get-Command cmake -ErrorAction Stop).Source
@@ -58,11 +62,12 @@ if (Test-Path $LocalWv2) { Remove-Item -Recurse -Force $LocalWv2 }
 Copy-Item -Recurse -Force (Join-Path $RepoRoot "windows\ui-qt") $LocalSrc
 Copy-Item -Recurse -Force $WebView2SdkDir $LocalWv2
 
+$isArmHost = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64")
 $Targets = @(
     @{
         Arch          = "arm64"
         DistName      = "windows-arm64"
-        VcVarsArg     = "arm64"
+        VcVarsArg     = if ($isArmHost) { "arm64" } else { "amd64_arm64" }
         WebView2Arch  = "arm64"
         QtRoot        = $QtArm64Root
         PeMachine     = [uint16]0xAA64
@@ -70,16 +75,22 @@ $Targets = @(
     @{
         Arch          = "amd64"
         DistName      = "windows-amd64"
-        VcVarsArg     = "arm64_x64"
+        VcVarsArg     = if ($isArmHost) { "arm64_x64" } else { "x64" }
         WebView2Arch  = "x64"
         QtRoot        = $QtX64Root
         PeMachine     = [uint16]0x8664
     }
 )
+if ($TargetArch -ne "all") {
+    $Targets = @($Targets | Where-Object { $_.Arch -eq $TargetArch })
+}
 
 foreach ($t in $Targets) {
     $arch = $t.Arch
     $qtRoot = $t.QtRoot
+    if (-not (Test-Path $qtRoot) -and -not [string]::IsNullOrWhiteSpace($env:QT_ROOT_DIR) -and (Test-Path $env:QT_ROOT_DIR)) {
+        $qtRoot = $env:QT_ROOT_DIR
+    }
     if (-not (Test-Path $qtRoot)) {
         throw "Qt root missing for ${arch}: $qtRoot"
     }
@@ -136,14 +147,19 @@ if errorlevel 1 exit /b 1
             Where-Object { $_.Name -match '^\d+\.\d+' } |
             Sort-Object { [version]$_.Name } -Descending
         foreach ($vd in $verDirs) {
-            $archDir = Join-Path $vd.FullName $t.WebView2Arch
-            if (Test-Path $archDir) {
-                $candidateCrt = Get-ChildItem -Path $archDir -Directory -Filter "Microsoft.VC*.CRT" | Select-Object -First 1
-                if ($candidateCrt) {
-                    $crtDir = $candidateCrt.FullName
-                    break
+            foreach ($archDir in @(
+                (Join-Path $vd.FullName $t.WebView2Arch),
+                (Join-Path $vd.FullName ("onecore\" + $t.WebView2Arch))
+            )) {
+                if (Test-Path $archDir) {
+                    $candidateCrt = Get-ChildItem -Path $archDir -Directory -Filter "Microsoft.VC*.CRT" | Select-Object -First 1
+                    if ($candidateCrt) {
+                        $crtDir = $candidateCrt.FullName
+                        break
+                    }
                 }
             }
+            if ($crtDir) { break }
         }
     }
     if (-not $crtDir) {

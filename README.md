@@ -26,7 +26,7 @@
 
 ## 📥 Installation
 
-Download from the [Releases](https://github.com/Clash-FX/ClashFX/releases) page.
+Download from the [Releases](https://github.com/xincun/ClashFX/releases) page.
 
 ### 🧪 Update Channels: Stable & Lab
 

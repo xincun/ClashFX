@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const DefaultGitHubReleasesURL = "https://api.github.com/repos/Clash-FX/ClashFX/releases"
+const DefaultGitHubReleasesURL = "https://api.github.com/repos/xincun/ClashFX/releases"
 
 type UpdateCheckResult struct {
 	CurrentVersion  string `json:"current_version"`
@@ -256,7 +256,7 @@ func selectReleaseDownloadURL(assets []struct {
 func compareSemver(a, b string) int {
 	pa, preA := splitSemver(a)
 	pb, preB := splitSemver(b)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		if pa[i] != pb[i] {
 			if pa[i] > pb[i] {
 				return 1
@@ -267,7 +267,7 @@ func compareSemver(a, b string) int {
 	if preA == preB {
 		return 0
 	}
-	// Release > prerelease for identical major.minor.patch
+	// Release > prerelease for identical numeric version segments
 	if preA == "" && preB != "" {
 		return 1
 	}
@@ -277,17 +277,15 @@ func compareSemver(a, b string) int {
 	return strings.Compare(preA, preB)
 }
 
-func splitSemver(raw string) ([3]int, string) {
-	s := strings.TrimPrefix(strings.TrimSpace(raw), "v")
-	s = strings.TrimPrefix(s, "V")
+func splitSemver(raw string) ([4]int, string) {
+	s := strings.TrimLeft(strings.TrimSpace(raw), "vV")
 	var pre string
 	if idx := strings.IndexByte(s, '-'); idx >= 0 {
-		pre = s[:idx]
-		pre, s = s[idx+1:], pre
+		pre, s = s[idx+1:], s[:idx]
 	}
 	parts := strings.Split(s, ".")
-	var nums [3]int
-	for i := 0; i < len(parts) && i < 3; i++ {
+	var nums [4]int
+	for i := 0; i < len(parts) && i < 4; i++ {
 		nums[i], _ = strconv.Atoi(parts[i])
 	}
 	return nums, pre

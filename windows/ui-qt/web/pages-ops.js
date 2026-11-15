@@ -41,6 +41,7 @@ const settingsState = {
   dirty: false,
   draft: null,
   updateResult: null,
+  updateVersion: '',
   updateUrl: '',
   geoBusy: false,
   updBusy: false,
@@ -48,6 +49,23 @@ const settingsState = {
   svcBusy: false,
   recordingKey: '',
 };
+
+export function applyAppUpdateCheck(data, fallbackVer = '') {
+  if (!data) return false;
+  const avail = Boolean(data.update_available);
+  settingsState.updateVersion = avail ? String(data.latest_version || '') : '';
+  settingsState.updateResult = avail
+    ? `${t('发现新版本', 'Update')}: ${data.latest_version}`
+    : `${t('已是最新', 'Up to date')} (${data.current_version || fallbackVer})`;
+  settingsState.updateUrl = avail ? data.download_url || data.release_url || '' : '';
+  return avail;
+}
+
+export function getAvailableAppUpdate() {
+  return settingsState.updateVersion
+    ? { version: settingsState.updateVersion, url: settingsState.updateUrl }
+    : null;
+}
 
 export function setDiagSubTab(subTab, nodeName = '') {
   if (subTab === 0 || subTab === 1) diagState.subTab = subTab;
@@ -963,7 +981,7 @@ export function renderSettingsPage(root) {
               <option value="lab" ${d.update_channel === 'lab' ? 'selected' : ''}>Lab Preview</option>
             </select>
             <div class="row-flex" style="margin-left:auto;">
-              <span class="metric-sub">${settingsState.updateResult ? esc(settingsState.updateResult) : esc(snap.core_version || (snap.version ? `v${String(snap.version).replace(/^v/i, '')}` : '--'))}</span>
+              <span class="metric-sub">${settingsState.updateResult ? esc(settingsState.updateResult) : `${t('客户端', 'App')} v${esc(String(snap.version || '').replace(/^v/i, '') || '--')}`}</span>
               ${settingsState.updateUrl ? `<button type="button" class="btn btn-xs btn-primary" id="set-open-upd">${t('前往下载', 'Download')}</button>` : ''}
             </div>
           </div>
@@ -1188,10 +1206,7 @@ export function renderSettingsPage(root) {
     const res = await rpc('check_updates', {});
     settingsState.updBusy = false;
     if (res.ok && res.data) {
-      settingsState.updateResult = res.data.update_available
-        ? `${t('发现新版本', 'Update')}: ${res.data.latest_version}`
-        : `${t('已是最新', 'Up to date')} (${res.data.current_version || snap.version})`;
-      settingsState.updateUrl = res.data.update_available ? res.data.download_url || '' : '';
+      applyAppUpdateCheck(res.data, snap.version);
     }
     renderSettingsPage(root);
   });

@@ -1,9 +1,14 @@
 param(
     [string]$RepoRoot = "",
-    [string]$AppVersion = "1.19.24"
+    [string]$AppVersion = "1.19.24",
+    [ValidateSet("all", "arm64", "amd64")][string]$TargetArch = "all"
 )
 
 $ErrorActionPreference = "Stop"
+$AppVersion = $AppVersion.Trim().TrimStart('v', 'V')
+if ([string]::IsNullOrWhiteSpace($AppVersion)) {
+    $AppVersion = "1.19.24"
+}
 
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -76,7 +81,8 @@ New-Item -ItemType Directory -Force -Path "$PackWork\out" | Out-Null
 Copy-Item -Force (Join-Path $InstallerDir "*") $PackWork
 Copy-Item -Force $Wv2Bootstrapper (Join-Path $PackWork "MicrosoftEdgeWebView2Setup.exe")
 
-foreach ($arch in @("arm64", "amd64")) {
+$arches = if ($TargetArch -eq "all") { @("arm64", "amd64") } else { @($TargetArch) }
+foreach ($arch in $arches) {
     $srcDist = Join-Path $DistDir "windows-$arch"
     if (-not (Test-Path (Join-Path $srcDist "clashfx-ui.exe"))) {
         throw "Missing staged distribution at $srcDist. Run build-ui.ps1 first."

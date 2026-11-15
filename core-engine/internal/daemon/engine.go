@@ -2517,7 +2517,8 @@ func (e *Engine) DiagnosticInfo() string {
 func (e *Engine) CheckUpdates(ctx context.Context) (features.UpdateCheckResult, error) {
 	ch := e.store.Settings().UpdateChannel
 	apiURL := os.Getenv("CLASHFX_UPDATE_API_URL")
-	return features.CheckForUpdatesWithProxy(ctx, "v"+AppVersion, ch, apiURL, e.activeLocalProxyPort())
+	curVer := "v" + strings.TrimLeft(strings.TrimSpace(AppVersion), "vV")
+	return features.CheckForUpdatesWithProxy(ctx, curVer, ch, apiURL, e.activeLocalProxyPort())
 }
 
 func fetchCoreVersionFromCore(ctx context.Context, apiPort int, secret string) string {
