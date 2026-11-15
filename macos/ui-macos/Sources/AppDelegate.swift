@@ -17,6 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var instanceLockFd: Int32 = -1
     private var controlListenFd: Int32 = -1
     private var controlSocketPath = ""
+    private var isTerminating = false
+    private var terminationCompleted = false
 
     override init() {
         super.init()
@@ -34,6 +36,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if !acquireSingleInstanceOrForward() {
+            exit(0)
+        }
+        if startupCmd == "--quit" || startupCmd == "--quit-uninstall" {
+            let tempClient = DaemonClient(config: config)
+            _ = tempClient.sendQuitDaemonSync(forceRestoreProxy: startupCmd == "--quit-uninstall", timeoutSeconds: 2)
+            stopControlSocket()
+            if instanceLockFd >= 0 {
+                Darwin.close(instanceLockFd)
+                instanceLockFd = -1
+            }
             exit(0)
         }
         installStandardMenus()
@@ -77,6 +89,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             trayController?.openConsole()
         }
         return true
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if terminationCompleted {
+            return .terminateNow
+        }
+        consoleWindow?.setAllowClose(true)
+        guard let client = daemonClient else {
+            terminationCompleted = true
+            return .terminateNow
+        }
+        if isTerminating {
+            return .terminateLater
+        }
+        isTerminating = true
+        client.stopReconnect()
+
+        var params: [String: Any] = [:]
+        if trayController?.forceRestoreProxyOnQuit == true {
+            params["force_restore_proxy"] = true
+        }
+
+        var replied = false
+        let finishTermination: () -> Void = { [weak self] in
+            guard !replied else { return }
+            replied = true
+            self?.terminationCompleted = true
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+
+        client.call(method: "quit_daemon", params: params, timeoutSeconds: 2) { _, _, _, _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                finishTermination()
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            finishTermination()
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {

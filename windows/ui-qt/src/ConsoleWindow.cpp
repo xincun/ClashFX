@@ -209,7 +209,13 @@ void ConsoleWindow::hideEvent(QHideEvent* event) {
 
 void ConsoleWindow::closeEvent(QCloseEvent* event) {
     saveWindowGeometry();
-    if (allowClose_) {
+    bool sessionEnding = false;
+#ifndef QT_NO_SESSIONMANAGER
+    if (auto* guiApp = qobject_cast<QGuiApplication*>(QCoreApplication::instance())) {
+        sessionEnding = guiApp->isSavingSession();
+    }
+#endif
+    if (allowClose_ || sessionEnding) {
         stopTrafficStream();
         event->accept();
         return;
@@ -229,6 +235,9 @@ bool ConsoleWindow::nativeEvent(const QByteArray& eventType, void* message, qint
 #ifdef Q_OS_WIN
     if (eventType == "windows_generic_MSG" || eventType == "windows_dispatcher_MSG") {
         MSG* msg = static_cast<MSG*>(message);
+        if (msg->message == WM_QUERYENDSESSION || msg->message == WM_ENDSESSION) {
+            allowClose_ = true;
+        }
         if (msg->message == WM_NCCALCSIZE && msg->wParam == TRUE) {
             auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(msg->lParam);
             if (IsZoomed(msg->hwnd)) {

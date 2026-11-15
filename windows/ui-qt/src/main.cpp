@@ -213,6 +213,8 @@ int main(int argc, char* argv[]) {
     }
     if (startupCmd == QStringLiteral("CMD:--quit") ||
         startupCmd == QStringLiteral("CMD:--quit-uninstall")) {
+        clashfx::DaemonClient tempClient(customDaemonPipe, customDataDir);
+        tempClient.sendQuitDaemonSync(startupCmd == QStringLiteral("CMD:--quit-uninstall"), 600);
         return 0;
     }
 

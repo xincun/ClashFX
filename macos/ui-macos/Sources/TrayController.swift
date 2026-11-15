@@ -16,6 +16,7 @@ final class TrayController: NSObject, NSMenuDelegate {
     private var lastTooltip = ""
     private var lastMenuSig = ""
     private var i18nObserverID: UUID?
+    private(set) var forceRestoreProxyOnQuit = false
 
     private var nextTag = 100
     private var actionMap: [Int: () -> Void] = [:]
@@ -203,25 +204,11 @@ final class TrayController: NSObject, NSMenuDelegate {
     }
 
     func quitAll(forceRestoreProxy: Bool) {
-        consoleWindow.setAllowClose(true)
-        if client.isConnected {
-            client.stopReconnect()
-            var params: [String: Any] = [:]
-            if forceRestoreProxy {
-                params["force_restore_proxy"] = true
-            }
-            client.call(method: "quit_daemon", params: params, timeoutSeconds: 3) { _, _, _, _ in
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                    NSApp.terminate(nil)
-                }
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                NSApp.terminate(nil)
-            }
-        } else {
-            client.stopReconnect()
-            NSApp.terminate(nil)
+        if forceRestoreProxy {
+            forceRestoreProxyOnQuit = true
         }
+        consoleWindow.setAllowClose(true)
+        NSApp.terminate(nil)
     }
 
     // MARK: - Hotkeys

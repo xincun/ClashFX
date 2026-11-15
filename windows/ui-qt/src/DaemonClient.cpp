@@ -100,6 +100,33 @@ void DaemonClient::stopReconnect() {
     }
 }
 
+bool DaemonClient::sendQuitDaemonSync(bool forceRestoreProxy, int timeoutMs) {
+    stopReconnect();
+    QLocalSocket sock;
+    sock.connectToServer(serverName_);
+    if (!sock.waitForConnected(250)) {
+        return false;
+    }
+    QJsonObject params;
+    if (forceRestoreProxy) {
+        params.insert(QStringLiteral("force_restore_proxy"), true);
+    }
+    QJsonObject frame;
+    frame.insert(QStringLiteral("id"), 999999);
+    frame.insert(QStringLiteral("method"), QStringLiteral("quit_daemon"));
+    if (!params.isEmpty()) {
+        frame.insert(QStringLiteral("params"), params);
+    }
+    QByteArray raw = QJsonDocument(frame).toJson(QJsonDocument::Compact);
+    raw.append('\n');
+    sock.write(raw);
+    sock.flush();
+    sock.waitForBytesWritten(250);
+    sock.waitForReadyRead(qMax(100, timeoutMs));
+    sock.disconnectFromServer();
+    return true;
+}
+
 bool DaemonClient::isConnected() const {
     return socket_ && socket_->state() == QLocalSocket::ConnectedState;
 }
@@ -218,16 +245,18 @@ void DaemonClient::call(const QString& method,
                         const QJsonObject& params,
                         RpcCallback callback) {
     if (!isConnected()) {
-        maybeAutoSpawnDaemon();
-        if (!stopping_ && queuedCalls_.size() < 32) {
-            queuedCalls_.append(QueuedCall{method, params, std::move(callback), QDateTime::currentMSecsSinceEpoch()});
-            if (!reconnectTimer_->isActive()) {
-                reconnectTimer_->start(250);
+        if (!stopping_ && method != QStringLiteral("quit_daemon")) {
+            maybeAutoSpawnDaemon();
+            if (queuedCalls_.size() < 32) {
+                queuedCalls_.append(QueuedCall{method, params, std::move(callback), QDateTime::currentMSecsSinceEpoch()});
+                if (!reconnectTimer_->isActive()) {
+                    reconnectTimer_->start(250);
+                }
+                if (socket_->state() == QLocalSocket::UnconnectedState) {
+                    attemptConnect();
+                }
+                return;
             }
-            if (socket_->state() == QLocalSocket::UnconnectedState) {
-                attemptConnect();
-            }
-            return;
         }
         if (callback) {
             callback(false, QJsonValue(), QStringLiteral("clashfx-daemon is starting up, please retry in a moment."), QStringLiteral("NOT_CONNECTED"));

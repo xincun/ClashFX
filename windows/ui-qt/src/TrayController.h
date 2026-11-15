@@ -73,6 +73,8 @@ private:
 
     bool connected_ = false;
     bool menuDirty_ = true;
+    bool daemonQuitSent_ = false;
+    bool forceRestoreOnQuit_ = false;
     QString lastIconKey_;
     QString lastTooltip_;
     QByteArray lastMenuSig_;

@@ -145,6 +145,16 @@ TrayController::TrayController(DaemonClient* client,
         connect(client_, &DaemonClient::stateChanged, this, &TrayController::onStateChanged);
     }
 
+    connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() {
+        if (consoleWindow_) {
+            consoleWindow_->setAllowClose(true);
+        }
+        if (!daemonQuitSent_ && client_) {
+            daemonQuitSent_ = true;
+            client_->sendQuitDaemonSync(forceRestoreOnQuit_, 500);
+        }
+    });
+
     rebuildTrayVisualsAndMenu(true);
 
     if (showConsoleInitially) {
@@ -1016,14 +1026,18 @@ void TrayController::openSettingsDialog() {
 }
 
 void TrayController::quitAll(bool forceRestoreProxy) {
+    if (forceRestoreProxy) {
+        forceRestoreOnQuit_ = true;
+    }
     if (consoleWindow_) {
         consoleWindow_->setAllowClose(true);
         consoleWindow_->close();
     }
     if (client_ && client_->isConnected()) {
+        daemonQuitSent_ = true;
         client_->stopReconnect();
         QJsonObject params;
-        if (forceRestoreProxy) {
+        if (forceRestoreOnQuit_) {
             params.insert(QStringLiteral("force_restore_proxy"), true);
         }
         client_->call(QStringLiteral("quit_daemon"), params, [](bool, const QJsonValue&, const QString&, const QString&) {
@@ -1031,7 +1045,10 @@ void TrayController::quitAll(bool forceRestoreProxy) {
         });
         QTimer::singleShot(800, qApp, &QCoreApplication::quit);
     } else {
-        if (client_) client_->stopReconnect();
+        if (client_) {
+            daemonQuitSent_ = true;
+            client_->sendQuitDaemonSync(forceRestoreOnQuit_, 500);
+        }
         QCoreApplication::quit();
     }
 }

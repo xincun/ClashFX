@@ -106,6 +106,17 @@ final class DaemonClient {
         }
     }
 
+    @discardableResult
+    func sendQuitDaemonSync(forceRestoreProxy: Bool = false, timeoutSeconds: Int = 2) -> Bool {
+        stopReconnect()
+        var params: [String: Any] = [:]
+        if forceRestoreProxy {
+            params["force_restore_proxy"] = true
+        }
+        let res = performBlockingRPC(method: "quit_daemon", params: params, timeoutSeconds: timeoutSeconds)
+        return res.ok
+    }
+
     // MARK: - Private Networking
 
     private func resolvedSocketPath() -> String {
@@ -263,11 +274,16 @@ final class DaemonClient {
     ) -> (ok: Bool, data: Any?, error: String, errorCode: String) {
         var fd = dialSocket(receiveTimeoutSec: timeoutSeconds)
         if fd < 0 {
-            spawnDaemonIfNeeded()
-            for _ in 0..<8 {
-                Thread.sleep(forTimeInterval: 0.15)
-                fd = dialSocket(receiveTimeoutSec: timeoutSeconds)
-                if fd >= 0 { break }
+            stateLock.lock()
+            let allowSpawn = shouldReconnect && method != "quit_daemon"
+            stateLock.unlock()
+            if allowSpawn {
+                spawnDaemonIfNeeded()
+                for _ in 0..<8 {
+                    Thread.sleep(forTimeInterval: 0.15)
+                    fd = dialSocket(receiveTimeoutSec: timeoutSeconds)
+                    if fd >= 0 { break }
+                }
             }
         }
         guard fd >= 0 else {

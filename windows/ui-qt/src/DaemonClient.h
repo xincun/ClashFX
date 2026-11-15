@@ -32,6 +32,7 @@ public:
 
     void start();
     void stopReconnect();
+    bool sendQuitDaemonSync(bool forceRestoreProxy = false, int timeoutMs = 600);
 
     bool isConnected() const;
     QJsonObject snapshot() const { return snapshot_; }
