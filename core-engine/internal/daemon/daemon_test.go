@@ -977,3 +977,110 @@ func TestUpdateSettingsFrontendPayloadAndLaunchAtLogin(t *testing.T) {
 		}
 	}
 }
+
+func TestEngineSnapshotProfilesOnlyManagedSubscriptions(t *testing.T) {
+	t.Setenv("CLASHFX_DISABLE_LEGACY_PLIST_MIGRATION", "1")
+	t.Setenv("CLASHFX_DISABLE_LAUNCH_AGENT", "1")
+
+	appData := t.TempDir()
+	legacySampleConfig := `#---------------------------------------------------#
+## Legacy sample config
+mode: rule
+log-level: info
+proxies:
+proxy-groups:
+rules:
+  - DOMAIN-SUFFIX,ad.com,REJECT
+  - GEOIP,CN,DIRECT
+  - MATCH,DIRECT
+`
+	if err := os.WriteFile(filepath.Join(appData, "config.yaml"), []byte(legacySampleConfig), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appData, "stray-local.yaml"), []byte("mixed-port: 7890\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := NewEngine(Config{AppDataDir: appData}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := eng.Snapshot()
+	if snap.Profiles == nil || len(snap.Profiles) != 0 {
+		eng.Shutdown()
+		t.Fatalf("expected empty non-nil Profiles when no managed subscriptions exist, got %#v", snap.Profiles)
+	}
+	rawSnap, err := json.Marshal(snap)
+	if err != nil {
+		eng.Shutdown()
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawSnap), `"profiles":[]`) {
+		eng.Shutdown()
+		t.Fatalf("expected profiles marshaled as [], got %s", string(rawSnap))
+	}
+	eng.Shutdown()
+
+	jmsYAML := `mixed-port: 17890
+proxies:
+  - name: "JMS-Node-01"
+    type: socks5
+    server: 198.51.100.20
+    port: 1080
+proxy-groups:
+  - name: "Proxy"
+    type: select
+    proxies: ["JMS-Node-01", "DIRECT"]
+rules:
+  - MATCH,Proxy
+`
+	if err := os.WriteFile(filepath.Join(appData, "JMS.yaml"), []byte(jmsYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appData, "subscriptions.json"), []byte(`[{"name":"JMS","url":"https://example.invalid/sub"}]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	eng2, err := NewEngine(Config{AppDataDir: appData}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Shutdown()
+
+	eng2.ctrl = transaction.NewController(eng2.store, noopApplier{}, "")
+	eng2.ctrl.SetProfileSourceResolver(eng2.resolveFallbackProfileBytes)
+
+	if err := eng2.Start(context.Background()); err != nil {
+		t.Fatalf("eng2.Start failed: %v", err)
+	}
+
+	if gotSel := eng2.store.Settings().SelectedProfile; gotSel != "JMS" {
+		t.Fatalf("expected SelectedProfile auto-healed to JMS, got %q", gotSel)
+	}
+	snap2 := eng2.Snapshot()
+	if len(snap2.Profiles) != 1 || snap2.Profiles[0] != "JMS" {
+		t.Fatalf("expected Snapshot.Profiles == [JMS], got %#v", snap2.Profiles)
+	}
+
+	if err := eng2.RemoveSubscription(context.Background(), "JMS", true); err != nil {
+		t.Fatalf("RemoveSubscription failed: %v", err)
+	}
+	snap3 := eng2.Snapshot()
+	if len(snap3.Profiles) != 0 {
+		t.Fatalf("expected Snapshot.Profiles empty after removing JMS, got %#v", snap3.Profiles)
+	}
+	if gotSel := eng2.store.Settings().SelectedProfile; gotSel != "config" {
+		t.Fatalf("expected SelectedProfile fallback to config, got %q", gotSel)
+	}
+	rawRuntime, err := os.ReadFile(eng2.ctrl.RuntimeConfigPath())
+	if err != nil {
+		t.Fatalf("read .runtime-config.yaml failed: %v", err)
+	}
+	rtText := string(rawRuntime)
+	if strings.Contains(rtText, "ad.com") {
+		t.Fatalf("expected .runtime-config.yaml synthesized from DefaultStarterConfigYAML, not untracked legacy config.yaml:\n%s", rtText)
+	}
+	if !strings.Contains(rtText, "MATCH,Proxy") {
+		t.Fatalf("expected .runtime-config.yaml to include DefaultStarterConfigYAML rules, got:\n%s", rtText)
+	}
+}

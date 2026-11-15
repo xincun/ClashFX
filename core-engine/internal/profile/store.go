@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -471,53 +470,6 @@ func (s *Store) ReadProfileMixinBytes() ([]byte, error) {
 	return nil, nil
 }
 
-// IsDefaultStarterConfigFile reports whether the given file still matches the
-// auto-generated starter config.yaml template byte-for-byte (ignoring CRLF/whitespace).
-func IsDefaultStarterConfigFile(path string) bool {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	normalize := func(s string) string {
-		return strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n"))
-	}
-	return normalize(string(raw)) == normalize(DefaultStarterConfigYAML)
-}
-
-func (s *Store) ListProfiles() ([]string, error) {
-	dir := s.ActiveConfigDir()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	selected := s.Settings().SelectedProfile
-	var names []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		fn := entry.Name()
-		if strings.HasPrefix(fn, ".") || !strings.HasSuffix(strings.ToLower(fn), ".yaml") {
-			continue
-		}
-		if IsProfileMixinFileName(fn) {
-			continue
-		}
-		stem := strings.TrimSuffix(fn, filepath.Ext(fn))
-		// Hide the auto-generated unmodified starter config.yaml when another
-		// profile is active so empty fallback templates don't clutter UI lists.
-		if strings.EqualFold(stem, "config") && !strings.EqualFold(selected, "config") && IsDefaultStarterConfigFile(filepath.Join(dir, fn)) {
-			continue
-		}
-		names = append(names, stem)
-	}
-	sort.Strings(names)
-	if len(names) == 0 {
-		return []string{"config"}, nil
-	}
-	return names, nil
-}
-
 func (s *Store) EnsureWorkspaceReady() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -527,13 +479,6 @@ func (s *Store) EnsureWorkspaceReady() error {
 func (s *Store) ensureDirResourcesLocked(dir string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
-	}
-	defaultCfg := filepath.Join(dir, "config.yaml")
-	if _, err := os.Stat(defaultCfg); os.IsNotExist(err) {
-		s.MarkInternalWrite(defaultCfg)
-		if err := WriteFileAtomic(defaultCfg, []byte(DefaultStarterConfigYAML), 0600); err != nil {
-			return err
-		}
 	}
 	if err := EnsureBuiltinRulesetFiles(dir); err != nil {
 		fmt.Fprintf(os.Stderr, "[clashfx-daemon] warning: workspace ruleset init in %s: %v\n", dir, err)

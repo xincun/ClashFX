@@ -68,14 +68,15 @@ type AppliedRuntimeState struct {
 // Controller serializes runtime configuration generation, preflight validation,
 // port reservation checks, and live reload with automatic rollback on failure.
 type Controller struct {
-	applyMu     sync.Mutex
-	stateMu     sync.RWMutex
-	store       *profile.Store
-	applier     CoreApplier
-	dashboardUI string
-	hooks       []TransformHook
-	probePort   func(port int, checkUDP bool) (bool, bool)
-	lastState   AppliedRuntimeState
+	applyMu        sync.Mutex
+	stateMu        sync.RWMutex
+	store          *profile.Store
+	applier        CoreApplier
+	dashboardUI    string
+	hooks          []TransformHook
+	probePort      func(port int, checkUDP bool) (bool, bool)
+	sourceResolver func(profileName string) ([]byte, bool)
+	lastState      AppliedRuntimeState
 }
 
 func NewController(store *profile.Store, applier CoreApplier, dashboardUI string, hooks ...TransformHook) *Controller {
@@ -86,6 +87,13 @@ func NewController(store *profile.Store, applier CoreApplier, dashboardUI string
 		hooks:       hooks,
 		probePort:   portprobe.ProbeLoopbackPort,
 	}
+}
+
+// SetProfileSourceResolver overrides disk lookup when synthesizing runtime config bytes.
+func (c *Controller) SetProfileSourceResolver(fn func(profileName string) ([]byte, bool)) {
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+	c.sourceResolver = fn
 }
 
 func (c *Controller) SetPortProbeForTest(fn func(port int, checkUDP bool) (bool, bool)) {
@@ -127,11 +135,24 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 	prevState := c.LastState()
 	settings := c.store.Settings()
 	cfgDir := c.store.ActiveConfigDir()
-	srcPath := c.store.ProfilePath(settings.SelectedProfile)
 
-	srcBytes, err := os.ReadFile(srcPath)
-	if err != nil {
-		return prevState, fmt.Errorf("read profile %q: %w", settings.SelectedProfile, err)
+	var srcBytes []byte
+	var err error
+	if c.sourceResolver != nil {
+		if raw, ok := c.sourceResolver(settings.SelectedProfile); ok {
+			srcBytes = raw
+		}
+	}
+	if srcBytes == nil {
+		srcPath := c.store.ProfilePath(settings.SelectedProfile)
+		srcBytes, err = os.ReadFile(srcPath)
+		if err != nil {
+			if os.IsNotExist(err) && (strings.TrimSpace(settings.SelectedProfile) == "" || strings.EqualFold(strings.TrimSpace(settings.SelectedProfile), "config")) {
+				srcBytes = []byte(profile.DefaultStarterConfigYAML)
+			} else {
+				return prevState, fmt.Errorf("read profile %q: %w", settings.SelectedProfile, err)
+			}
+		}
 	}
 	root, err := profile.UnmarshalYAMLMap(srcBytes)
 	if err != nil {

@@ -330,13 +330,15 @@ function renderChrome() {
     if (refBtn) refBtn.title = t('更新当前订阅 / 配置', 'Refresh active profile');
 
     if (selectEl && document.activeElement !== selectEl) {
-      const nextProfSig = JSON.stringify([activeProf, profiles]);
+      const emptyLabel = t('未导入订阅', 'No Subscription');
+      const nextProfSig = JSON.stringify([activeProf, profiles, emptyLabel]);
       if (nextProfSig !== dockProfileSig) {
         dockProfileSig = nextProfSig;
+        selectEl.disabled = profiles.length === 0;
         selectEl.innerHTML = profiles.length
           ? profiles.map((p) => `<option value="${esc(p)}" ${p === activeProf ? 'selected' : ''}>${esc(p)}</option>`).join('')
-          : `<option value="${esc(activeProf)}">${esc(activeProf)}</option>`;
-        selectEl.value = activeProf;
+          : `<option value="">${esc(emptyLabel)}</option>`;
+        selectEl.value = profiles.includes(activeProf) ? activeProf : (profiles[0] || '');
       }
     }
   }

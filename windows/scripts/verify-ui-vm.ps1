@@ -114,7 +114,12 @@ proxy-groups:
 rules:
   - MATCH,Proxy
 "@
-    [System.IO.File]::WriteAllText((Join-Path $dataDir "config.yaml"), $cfgYaml, (New-Object System.Text.UTF8Encoding($false)))
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText((Join-Path $dataDir "VerifySub.yaml"), $cfgYaml, $utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $dataDir "subscriptions.json"), '[{"name":"VerifySub","url":"https://example.invalid/sub.yaml"}]', $utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $dataDir "settings.json"), '{"selected_profile":"VerifySub"}', $utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $dataDir "config.yaml"), "mode: rule`nproxies:`nrules:`n  - MATCH,DIRECT`n", $utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $dataDir "stray-local.yaml"), $cfgYaml, $utf8NoBom)
 
     $daemonPipe = "ClashFXDaemon-Verify-$arch"
     $uiPipe = "ClashFXUI-Verify-$arch"
@@ -163,7 +168,11 @@ rules:
     if ($snap.arch -ne $arch) {
         throw "Daemon arch mismatch: got $($snap.arch), expected $arch"
     }
-    Write-Host "  [OK] Daemon + Core running ($($snap.arch)), MixedPort=$($snap.runtime.mixed_port), APIPort=$($snap.runtime.api_port)"
+    $profs = @($snap.profiles)
+    if ($profs.Count -ne 1 -or $profs[0] -ne "VerifySub") {
+        throw "Expected profiles == [VerifySub] ignoring untracked config.yaml/stray-local.yaml, got: $($profs -join ', ')"
+    }
+    Write-Host "  [OK] Daemon + Core running ($($snap.arch)), Profiles=[$($profs -join ', ')], MixedPort=$($snap.runtime.mixed_port), APIPort=$($snap.runtime.api_port)"
 
     # Verify MetaCubeXD dashboard HTTP 200 on /ui/
     $uiHttp = Invoke-WebRequest -Uri "http://127.0.0.1:$($snap.runtime.api_port)/ui/" -UseBasicParsing -TimeoutSec 5

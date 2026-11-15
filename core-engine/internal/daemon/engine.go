@@ -211,6 +211,9 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 		features.TransformHookForCNApps(),
 		nodeStore.TransformHookForControllerWithProviderProxies(eng.IsCoreRunning, eng.loadProviderProxiesForNodeServices),
 	)
+	eng.ctrl.SetProfileSourceResolver(func(profileName string) ([]byte, bool) {
+		return eng.resolveFallbackProfileBytes(profileName)
+	})
 
 	eng.nodeCoord = nodeservices.NewCoordinator(
 		nodeStore,
@@ -265,6 +268,18 @@ func (e *Engine) Start(ctx context.Context) error {
 			s.EnhancedMode = false
 			return nil
 		})
+		settings = e.store.Settings()
+	}
+
+	if subs := e.subMgr.List(); len(subs) > 0 {
+		if _, ok := e.subMgr.FindByName(settings.SelectedProfile); !ok {
+			if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
+				s.SelectedProfile = subs[0].Name
+				return nil
+			}); err == nil {
+				settings = e.store.Settings()
+			}
+		}
 	}
 
 	if _, err := e.applyAndSync(ctx, true, false); err != nil {
@@ -272,9 +287,7 @@ func (e *Engine) Start(ctx context.Context) error {
 		fmt.Fprintf(os.Stderr, "[clashfx-daemon] initial core apply warning: %v\n", err)
 	}
 
-	_ = e.store.WatchActiveConfigDir(func(_ string) {
-		_, _ = e.applyAndSync(context.Background(), false, false)
-	})
+	e.watchActiveConfigDir()
 	e.stopPower = StartPowerResumeMonitor(func() {
 		time.Sleep(1200 * time.Millisecond)
 		e.handleWakeOrNetworkCheck()
@@ -693,7 +706,7 @@ func (e *Engine) syncFromLiveCore(ctx context.Context) {
 
 	// 2. Reconcile live proxy group selections & delays from WebView / auto-URLTest
 	var rawRoot map[string]any
-	if data, err := os.ReadFile(e.store.ProfilePath(settings.SelectedProfile)); err == nil {
+	if data, err := e.readSelectedProfileBytes(settings.SelectedProfile); err == nil {
 		rawRoot, _ = profile.UnmarshalYAMLMap(data)
 	}
 	e.proxyGroupsMu.RLock()
@@ -843,10 +856,50 @@ func fetchProviderSubscriptionInfo(ctx context.Context, apiPort int, secret stri
 	return nil
 }
 
+func (e *Engine) resolveFallbackProfileBytes(prof string) ([]byte, bool) {
+	trimmed := strings.TrimSpace(prof)
+	if trimmed == "" {
+		return []byte(profile.DefaultStarterConfigYAML), true
+	}
+	if strings.EqualFold(trimmed, "config") {
+		if _, ok := e.subMgr.FindByName(prof); !ok {
+			return []byte(profile.DefaultStarterConfigYAML), true
+		}
+	}
+	return nil, false
+}
+
+func (e *Engine) readSelectedProfileBytes(prof string) ([]byte, error) {
+	if raw, ok := e.resolveFallbackProfileBytes(prof); ok {
+		return raw, nil
+	}
+	return os.ReadFile(e.store.ProfilePath(prof))
+}
+
+func (e *Engine) watchActiveConfigDir() {
+	_ = e.store.WatchActiveConfigDir(func(changedFile string) {
+		base := filepath.Base(changedFile)
+		ext := filepath.Ext(base)
+		stem := strings.TrimSuffix(base, ext)
+		selected := e.store.Settings().SelectedProfile
+		isSelectedManagedSub := false
+		if strings.EqualFold(stem, selected) {
+			_, isSelectedManagedSub = e.subMgr.FindByName(stem)
+		}
+		if profile.IsProfileMixinFileName(base) || isSelectedManagedSub {
+			_, _ = e.applyAndSync(context.Background(), false, false)
+		}
+	})
+}
+
 func (e *Engine) Snapshot() DaemonSnapshot {
 	settings := e.store.Settings()
 	rt := e.ctrl.LastState()
-	profiles, _ := e.store.ListProfiles()
+	subs := e.subMgr.List()
+	profiles := make([]string, 0, len(subs))
+	for _, sub := range subs {
+		profiles = append(profiles, sub.Name)
+	}
 	nsSnap, _ := e.nodeCoord.Snapshot(settings.SelectedProfile)
 	sig := e.currentNetworkSignature(false)
 
@@ -899,7 +952,7 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 		DefaultRuleTarget:      defTarget,
 		AILockCandidates:       cands,
 		AILockRelay:            relay,
-		Subscriptions:          e.subMgr.List(),
+		Subscriptions:          subs,
 		ActiveSubscriptionInfo: activeSubInfo,
 		NodeServices:           nsSnap,
 		ActiveNetwork:          sig,
@@ -925,7 +978,7 @@ func (e *Engine) refreshLiveCoreMetadata(ctx context.Context) {
 
 	// Load candidate targets + relay from selected profile YAML (+ proxy-providers) even if core isn't up
 	var rawRoot map[string]any
-	if data, err := os.ReadFile(e.store.ProfilePath(settings.SelectedProfile)); err == nil {
+	if data, err := e.readSelectedProfileBytes(settings.SelectedProfile); err == nil {
 		rawRoot, _ = profile.UnmarshalYAMLMap(data)
 	}
 	var cands []ailock.CandidateNode
@@ -1661,17 +1714,10 @@ func (e *Engine) RemoveSubscription(ctx context.Context, name string, deleteFile
 	if err := e.subMgr.Remove(name, deleteFile); err != nil {
 		return err
 	}
-	if deleteFile && e.store.Settings().SelectedProfile == name {
+	if strings.EqualFold(e.store.Settings().SelectedProfile, name) {
 		fallback := "config"
 		if subs := e.subMgr.List(); len(subs) > 0 {
 			fallback = subs[0].Name
-		} else if profs, err := e.store.ListProfiles(); err == nil {
-			for _, p := range profs {
-				if !strings.EqualFold(p, "config") && !strings.EqualFold(p, name) {
-					fallback = p
-					break
-				}
-			}
 		}
 		_ = e.SelectProfile(ctx, fallback)
 	} else {
@@ -1836,9 +1882,7 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 	}
 
 	if next.CustomConfigDir != cur.CustomConfigDir {
-		_ = e.store.WatchActiveConfigDir(func(_ string) {
-			_, _ = e.applyAndSync(context.Background(), false, false)
-		})
+		e.watchActiveConfigDir()
 	}
 
 	_, err := e.applyAndSync(ctx, false, true)
@@ -1848,7 +1892,7 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 func (e *Engine) currentProfileDefaultTarget() (string, bool) {
 	settings := e.store.Settings()
 	var rawRoot map[string]any
-	if data, err := os.ReadFile(e.store.ProfilePath(settings.SelectedProfile)); err == nil {
+	if data, err := e.readSelectedProfileBytes(settings.SelectedProfile); err == nil {
 		rawRoot, _ = profile.UnmarshalYAMLMap(data)
 	}
 	if rawRoot == nil {
@@ -1965,7 +2009,7 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 		rawRoot, _ = profile.UnmarshalYAMLMap(data)
 	}
 	if rawRoot == nil {
-		if data, err := os.ReadFile(e.store.ProfilePath(settings.SelectedProfile)); err == nil {
+		if data, err := e.readSelectedProfileBytes(settings.SelectedProfile); err == nil {
 			rawRoot, _ = profile.UnmarshalYAMLMap(data)
 		}
 	}

@@ -402,7 +402,10 @@ final class TrayController: NSObject, NSMenuDelegate {
         let settings = (snapshot["settings"] as? [String: Any]) ?? [:]
         let runtime = (snapshot["runtime"] as? [String: Any]) ?? [:]
         let coreRunning = (snapshot["core_running"] as? Bool) ?? false
-        let profile = (settings["selected_profile"] as? String) ?? "config"
+        let profiles = (snapshot["profiles"] as? [String]) ?? []
+        let profileLabel = profiles.isEmpty
+            ? L("未导入订阅", "No Subscription")
+            : ((settings["selected_profile"] as? String) ?? profiles[0])
         let mode = ((settings["outbound_mode"] as? String) ?? "rule").uppercased()
         let mixedPort = (runtime["mixed_port"] as? Int) ?? 7890
         let sysProxy = (settings["system_proxy_enabled"] as? Bool) ?? false
@@ -416,7 +419,7 @@ final class TrayController: NSObject, NSMenuDelegate {
         if !coreRunning {
             lines.append(L("状态: 内核未运行 (请检查配置)", "Status: Core Stopped (Check Config)"))
         }
-        lines.append(L("配置: ", "Profile: ") + profile + "  |  " + L("模式: ", "Mode: ") + mode)
+        lines.append(L("配置: ", "Profile: ") + profileLabel + "  |  " + L("模式: ", "Mode: ") + mode)
         lines.append(L("混合端口: ", "Mixed Port: ") + "\(mixedPort)")
         if !suspendedNet.isEmpty {
             lines.append(L("系统代理: 已自动暂停 (", "System Proxy: Paused (") + suspendedNet + ")")
@@ -710,15 +713,19 @@ final class TrayController: NSObject, NSMenuDelegate {
         // Config submenu
         let cfgSub = NSMenu()
         let profiles = (snapshot["profiles"] as? [String]) ?? []
-        for pName in profiles {
-            addItem(to: cfgSub, title: pName, enabled: true, checked: pName == selProfile) { [weak self] in
-                self?.client.call(method: "select_profile", params: ["name": pName]) { ok, _, err, _ in
-                    self?.handleConfigMutationResult(
-                        actionTitle: L("切换配置", "Switch Profile"),
-                        retryAction: { self?.client.call(method: "select_profile", params: ["name": pName]) },
-                        ok: ok,
-                        err: err
-                    )
+        if profiles.isEmpty {
+            addItem(to: cfgSub, title: L("暂无已导入订阅", "No Subscriptions"), enabled: false) {}
+        } else {
+            for pName in profiles {
+                addItem(to: cfgSub, title: pName, enabled: true, checked: pName == selProfile) { [weak self] in
+                    self?.client.call(method: "select_profile", params: ["name": pName]) { ok, _, err, _ in
+                        self?.handleConfigMutationResult(
+                            actionTitle: L("切换配置", "Switch Profile"),
+                            retryAction: { self?.client.call(method: "select_profile", params: ["name": pName]) },
+                            ok: ok,
+                            err: err
+                        )
+                    }
                 }
             }
         }
@@ -754,7 +761,10 @@ final class TrayController: NSObject, NSMenuDelegate {
                 )
             }
         }
-        let cfgItem = NSMenuItem(title: L("配置管理", "Config") + " (\(selProfile))", action: nil, keyEquivalent: "")
+        let cfgMenuTitle = profiles.isEmpty
+            ? L("配置管理", "Config")
+            : L("配置管理", "Config") + " (\(selProfile))"
+        let cfgItem = NSMenuItem(title: cfgMenuTitle, action: nil, keyEquivalent: "")
         cfgItem.submenu = cfgSub
         trayMenu.addItem(cfgItem)
 

@@ -690,30 +690,39 @@ void TrayController::rebuildMenuContents() {
     trayMenu_->addSeparator();
 
     // 6. Config submenu
-    QMenu* cfgMenu = trayMenu_->addMenu(L("配置管理", "Config") + QStringLiteral(" (%1)").arg(selProfile));
-    for (const QJsonValue& pv : snapshot_.value(QStringLiteral("profiles")).toArray()) {
-        const QString pName = pv.toString();
-        QAction* pAct = cfgMenu->addAction(pName);
-        pAct->setCheckable(true);
-        pAct->setChecked(pName == selProfile);
-        connect(pAct, &QAction::triggered, this, [this, pName]() {
-            auto doSelect = [this, pName]() {
-                QJsonObject p;
-                p.insert(QStringLiteral("name"), pName);
-                client_->call(QStringLiteral("select_profile"), p, [this, pName](bool ok, const QJsonValue&, const QString& err, const QString&) {
-                    handleConfigMutationResult(
-                        L("切换配置", "Switch Profile"),
-                        [this, pName]() {
-                            QJsonObject retryP;
-                            retryP.insert(QStringLiteral("name"), pName);
-                            client_->call(QStringLiteral("select_profile"), retryP);
-                        },
-                        ok,
-                        err);
-                });
-            };
-            doSelect();
-        });
+    const QJsonArray profiles = snapshot_.value(QStringLiteral("profiles")).toArray();
+    const QString cfgMenuTitle = profiles.isEmpty()
+        ? L("配置管理", "Config")
+        : (L("配置管理", "Config") + QStringLiteral(" (%1)").arg(selProfile));
+    QMenu* cfgMenu = trayMenu_->addMenu(cfgMenuTitle);
+    if (profiles.isEmpty()) {
+        QAction* emptyAct = cfgMenu->addAction(L("暂无已导入订阅", "No Subscriptions"));
+        emptyAct->setEnabled(false);
+    } else {
+        for (const QJsonValue& pv : profiles) {
+            const QString pName = pv.toString();
+            QAction* pAct = cfgMenu->addAction(pName);
+            pAct->setCheckable(true);
+            pAct->setChecked(pName == selProfile);
+            connect(pAct, &QAction::triggered, this, [this, pName]() {
+                auto doSelect = [this, pName]() {
+                    QJsonObject p;
+                    p.insert(QStringLiteral("name"), pName);
+                    client_->call(QStringLiteral("select_profile"), p, [this, pName](bool ok, const QJsonValue&, const QString& err, const QString&) {
+                        handleConfigMutationResult(
+                            L("切换配置", "Switch Profile"),
+                            [this, pName]() {
+                                QJsonObject retryP;
+                                retryP.insert(QStringLiteral("name"), pName);
+                                client_->call(QStringLiteral("select_profile"), retryP);
+                            },
+                            ok,
+                            err);
+                    });
+                };
+                doSelect();
+            });
+        }
     }
     cfgMenu->addSeparator();
     cfgMenu->addAction(L("重载当前配置", "Reload Config"), this, [this]() {

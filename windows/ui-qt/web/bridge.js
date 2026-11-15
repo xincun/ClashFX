@@ -428,6 +428,12 @@ async function runDomSmokeTest(dwellMs = 45) {
       }
       btn.click();
       await wait(dwellMs);
+      if (pageId === 1) {
+        const subText = document.getElementById('page-content')?.textContent || '';
+        if (subText.includes('本地 YAML') || subText.includes('Local YAML')) {
+          report.errors.push('unexpected local YAML card rendered on subscriptions page');
+        }
+      }
       if (pageId === 6) {
         const exInp = document.getElementById('set-tun-excludes');
         const saveBtn = document.getElementById('set-save');

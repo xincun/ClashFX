@@ -3,6 +3,7 @@
 
 #include <QColor>
 #include <QImage>
+#include <QJsonArray>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
@@ -154,7 +155,10 @@ QString TrayIconGenerator::buildTooltip(bool connected, const QJsonObject& snaps
     const QJsonObject settings = snapshot.value(QStringLiteral("settings")).toObject();
     const QJsonObject runtime = snapshot.value(QStringLiteral("runtime")).toObject();
     const bool coreRunning = snapshot.value(QStringLiteral("core_running")).toBool(false);
-    const QString profile = settings.value(QStringLiteral("selected_profile")).toString(QStringLiteral("config"));
+    const QJsonArray profiles = snapshot.value(QStringLiteral("profiles")).toArray();
+    const QString profile = profiles.isEmpty()
+        ? L("未导入订阅", "No Subscription")
+        : settings.value(QStringLiteral("selected_profile")).toString(profiles.first().toString());
     const QString mode = settings.value(QStringLiteral("outbound_mode")).toString(QStringLiteral("rule")).toUpper();
     const int mixedPort = runtime.value(QStringLiteral("mixed_port")).toInt(7890);
     const bool sysProxy = settings.value(QStringLiteral("system_proxy_enabled")).toBool(false);

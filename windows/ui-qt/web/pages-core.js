@@ -83,9 +83,6 @@ export function renderSubscriptionsPage(root) {
   const snap = store.snapshot || {};
   const settings = snap.settings || {};
   const subs = Array.isArray(snap.subscriptions) ? snap.subscriptions : [];
-  const allProfiles = Array.isArray(snap.profiles) ? snap.profiles : [];
-  const subNames = new Set(subs.map((s) => s.name));
-  const localOnlyProfiles = allProfiles.filter((p) => !subNames.has(p));
 
   const subCardsHtml = subs
     .map((s) => {
@@ -135,30 +132,6 @@ export function renderSubscriptionsPage(root) {
     })
     .join('');
 
-  const pathSep = store.platform === 'darwin' ? '/' : '\\';
-  const cleanConfigDir = String(snap.config_dir || '').replace(/[\\/]+$/, '');
-  const localCardsHtml = localOnlyProfiles
-    .map((name) => {
-      const isActive = settings.selected_profile === name;
-      return `
-        <div class="sub-card ${isActive ? 'is-active' : ''}">
-          <div class="row-flex" style="justify-content:space-between;">
-            <div class="row-flex">
-              <strong style="font-size:14px;">${esc(name)}</strong>
-              <span class="pill">${t('本地 YAML', 'Local YAML')}</span>
-              ${isActive ? `<span class="pill pill-green">${t('使用中', 'Active')}</span>` : ''}
-            </div>
-            ${
-              isActive
-                ? `<span class="pill pill-blue">${t('当前生效', 'Current')}</span>`
-                : `<button type="button" class="btn btn-sm btn-primary" data-sub-select="${esc(name)}">${t('切换使用', 'Activate')}</button>`
-            }
-          </div>
-          <div class="metric-sub mono">${esc(cleanConfigDir)}${pathSep}${esc(name)}.yaml</div>
-        </div>`;
-    })
-    .join('');
-
   root.innerHTML = `
     <div class="card">
       <div class="card-head">
@@ -185,11 +158,11 @@ export function renderSubscriptionsPage(root) {
       </div>
     </div>
 
-    <div class="bento-grid-2">
-      ${subCardsHtml}
-      ${localCardsHtml}
-    </div>
-    ${!subs.length && !localOnlyProfiles.length ? `<div class="card empty-state">${t('暂无订阅或本地配置，请粘贴订阅链接导入。', 'No subscriptions or profiles found yet.')}</div>` : ''}
+    ${
+      subs.length > 0
+        ? `<div class="bento-grid-2">${subCardsHtml}</div>`
+        : `<div class="card empty-state">${t('暂无订阅，请粘贴订阅链接导入。', 'No subscriptions found yet. Paste a subscription link above to import.')}</div>`
+    }
   `;
 
   root.querySelector('#sub-url-input')?.addEventListener('input', (e) => {

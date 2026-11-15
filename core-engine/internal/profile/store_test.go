@@ -18,10 +18,9 @@ func TestStoreCustomConfigDirMixinAndWatcher(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Default config.yaml created automatically
-	profiles, err := store.ListProfiles()
-	if err != nil || len(profiles) != 1 || profiles[0] != "config" {
-		t.Fatalf("ListProfiles = %v, %v; want [config]", profiles, err)
+	// Neither default dir nor custom dir should auto-create starter config.yaml
+	if _, err := os.Stat(filepath.Join(appDir, "config.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("did not expect starter config.yaml to be auto-created in appDir, stat err=%v", err)
 	}
 
 	// Switch to custom folder (replaces iCloud sync on Windows)
@@ -35,8 +34,8 @@ func TestStoreCustomConfigDirMixinAndWatcher(t *testing.T) {
 	if store.ActiveConfigDir() != customDir {
 		t.Fatalf("ActiveConfigDir = %q, want %q", store.ActiveConfigDir(), customDir)
 	}
-	if _, err := os.Stat(filepath.Join(customDir, "config.yaml")); err != nil {
-		t.Fatalf("expected starter config in custom dir: %v", err)
+	if _, err := os.Stat(filepath.Join(customDir, "config.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("did not expect starter config.yaml to be auto-created in custom dir, stat err=%v", err)
 	}
 
 	// Remember recovery selections
@@ -104,71 +103,6 @@ profile:
 	if notifyCount.Load() == 0 {
 		t.Fatal("expected fsnotify callback on work.yaml write")
 	}
-}
-
-func assertProfilesEqual(t *testing.T, got []string, want ...string) {
-	t.Helper()
-	if len(got) != len(want) {
-		t.Fatalf("ListProfiles = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("ListProfiles = %v, want %v", got, want)
-		}
-	}
-}
-
-func TestListProfilesHidesUnmodifiedStarterConfigWhenInactive(t *testing.T) {
-	store, err := NewStore(t.TempDir(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	// 1. Fresh store: SelectedProfile == "config" -> [config]
-	profs, err := store.ListProfiles()
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertProfilesEqual(t, profs, "config")
-
-	// 2. Active subscription present while config.yaml is unmodified starter -> omit config
-	dir := store.ActiveConfigDir()
-	if err := WriteFileAtomic(filepath.Join(dir, "sub1.yaml"), []byte("mixed-port: 7890\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.UpdateSettings(func(st *AppSettings) error {
-		st.SelectedProfile = "sub1"
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	profs, err = store.ListProfiles()
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertProfilesEqual(t, profs, "sub1")
-
-	// 3. User adds a custom local YAML -> retained while unmodified starter config stays hidden
-	if err := WriteFileAtomic(filepath.Join(dir, "custom-local.yaml"), []byte("mixed-port: 7890\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	profs, err = store.ListProfiles()
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertProfilesEqual(t, profs, "custom-local", "sub1")
-
-	// 4. User modifies config.yaml -> config.yaml is no longer starter template, so keep it visible
-	customCfg := "mixed-port: 7890\nproxies:\n  - name: n1\n    type: direct\n"
-	if err := WriteFileAtomic(filepath.Join(dir, "config.yaml"), []byte(customCfg), 0600); err != nil {
-		t.Fatal(err)
-	}
-	profs, err = store.ListProfiles()
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertProfilesEqual(t, profs, "config", "custom-local", "sub1")
 }
 
 func TestEagerProfileMixinUpgradeAndInternalWriteWatcherSuppression(t *testing.T) {

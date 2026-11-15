@@ -224,10 +224,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let snap = client.snapshot
         let coreRunning = (snap["core_running"] as? Bool) ?? false
         let platform = (snap["platform"] as? String) ?? ""
-        let passed = console.isUiReady && client.isConnected
+        let basePassed = console.isUiReady && client.isConnected
 
         console.collectSmokeDomSummary { [weak self] dom in
             guard let self else { return }
+            let domOk = (dom["ok"] as? Bool) ?? false
+            let passed = basePassed && domOk
             let report: [String: Any] = [
                 "ui_ready": console.isUiReady,
                 "daemon_connected": client.isConnected,
