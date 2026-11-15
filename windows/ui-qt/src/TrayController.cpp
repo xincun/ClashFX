@@ -396,10 +396,13 @@ void TrayController::rebuildTrayVisualsAndMenu(bool forceMenu) {
     const bool sysProxy = settings.value(QStringLiteral("system_proxy_enabled")).toBool(false);
     const bool enhanced = settings.value(QStringLiteral("enhanced_mode")).toBool(false);
     const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
+    const QJsonArray profiles = snapshot_.value(QStringLiteral("profiles")).toArray();
+    const bool armedStandby = profiles.isEmpty() && !aiLocked;
 
     TrayVisualState vis = TrayVisualState::Disconnected;
     if (connected_ && !snapshot_.isEmpty() && coreRunning) {
-        if (enhanced) vis = TrayVisualState::EnhancedTun;
+        if (armedStandby) vis = TrayVisualState::Idle;
+        else if (enhanced) vis = TrayVisualState::EnhancedTun;
         else if (sysProxy) vis = TrayVisualState::SystemProxy;
         else vis = TrayVisualState::Idle;
     }

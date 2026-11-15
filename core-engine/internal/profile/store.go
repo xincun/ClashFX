@@ -111,6 +111,9 @@ func DefaultSettings() AppSettings {
 	return AppSettings{
 		SelectedProfile:       "config",
 		OutboundMode:          "rule",
+		SystemProxyEnabled:    true,
+		EnhancedMode:          true,
+		BypassCNApps:          true,
 		APIPort:               19090,
 		LogLevel:              "info",
 		TunMTU:                1500,

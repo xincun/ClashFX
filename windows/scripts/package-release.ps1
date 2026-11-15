@@ -53,12 +53,28 @@ Write-Host "=== [Package] Using Inno Setup Compiler: $IsccExe ==="
 
 $DistDir = Join-Path $RepoRoot "windows\dist"
 $InstallerDir = Join-Path $RepoRoot "windows\installer"
+$CacheDir = Join-Path $RepoRoot "windows\build\.cache"
+New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+
+$Wv2Bootstrapper = Join-Path $CacheDir "MicrosoftEdgeWebView2Setup.exe"
+if (-not (Test-Path $Wv2Bootstrapper) -or (Get-Item $Wv2Bootstrapper).Length -lt 100KB) {
+    Write-Host "=== [Package] Downloading MicrosoftEdgeWebView2Setup.exe bootstrapper ==="
+    $wv2Tmp = "C:\Temp\MicrosoftEdgeWebView2Setup.exe.tmp"
+    New-Item -ItemType Directory -Force -Path "C:\Temp" | Out-Null
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $wv2Tmp -UseBasicParsing
+    if ((Get-Item $wv2Tmp).Length -lt 100KB) {
+        throw "Downloaded MicrosoftEdgeWebView2Setup.exe looks invalid/too small"
+    }
+    Move-Item -Force $wv2Tmp $Wv2Bootstrapper
+}
 
 # Stage locally on C:\Temp so ISCC and Compress-Archive run at native SSD speed without UNC overhead
 $PackWork = "C:\Temp\clashfx-package-work"
 if (Test-Path $PackWork) { Remove-Item -Recurse -Force $PackWork }
 New-Item -ItemType Directory -Force -Path "$PackWork\out" | Out-Null
 Copy-Item -Force (Join-Path $InstallerDir "*") $PackWork
+Copy-Item -Force $Wv2Bootstrapper (Join-Path $PackWork "MicrosoftEdgeWebView2Setup.exe")
 
 foreach ($arch in @("arm64", "amd64")) {
     $srcDist = Join-Path $DistDir "windows-$arch"

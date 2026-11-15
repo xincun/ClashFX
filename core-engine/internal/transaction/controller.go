@@ -68,15 +68,16 @@ type AppliedRuntimeState struct {
 // Controller serializes runtime configuration generation, preflight validation,
 // port reservation checks, and live reload with automatic rollback on failure.
 type Controller struct {
-	applyMu        sync.Mutex
-	stateMu        sync.RWMutex
-	store          *profile.Store
-	applier        CoreApplier
-	dashboardUI    string
-	hooks          []TransformHook
-	probePort      func(port int, checkUDP bool) (bool, bool)
-	sourceResolver func(profileName string) ([]byte, bool)
-	lastState      AppliedRuntimeState
+	applyMu          sync.Mutex
+	stateMu          sync.RWMutex
+	store            *profile.Store
+	applier          CoreApplier
+	dashboardUI      string
+	hooks            []TransformHook
+	probePort        func(port int, checkUDP bool) (bool, bool)
+	sourceResolver   func(profileName string) ([]byte, bool)
+	settingsResolver func(profile.AppSettings) profile.AppSettings
+	lastState        AppliedRuntimeState
 }
 
 func NewController(store *profile.Store, applier CoreApplier, dashboardUI string, hooks ...TransformHook) *Controller {
@@ -94,6 +95,14 @@ func (c *Controller) SetProfileSourceResolver(fn func(profileName string) ([]byt
 	c.applyMu.Lock()
 	defer c.applyMu.Unlock()
 	c.sourceResolver = fn
+}
+
+// SetEffectiveSettingsResolver transforms persisted settings into effective runtime settings
+// during config generation without mutating settings.json on disk.
+func (c *Controller) SetEffectiveSettingsResolver(fn func(profile.AppSettings) profile.AppSettings) {
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+	c.settingsResolver = fn
 }
 
 func (c *Controller) SetPortProbeForTest(fn func(port int, checkUDP bool) (bool, bool)) {
@@ -134,6 +143,9 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 
 	prevState := c.LastState()
 	settings := c.store.Settings()
+	if c.settingsResolver != nil {
+		settings = c.settingsResolver(settings)
+	}
 	cfgDir := c.store.ActiveConfigDir()
 
 	var srcBytes []byte

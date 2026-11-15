@@ -12,6 +12,7 @@ func TestSystemProxyLifecycleCrashRecoveryAILockAndWakeHeal(t *testing.T) {
 	// Helper mode for external VM crash-kill verification:
 	// CLASHFX_SYSPROXY_HELPER_DIR=<dir> CLASHFX_SYSPROXY_HELPER_ACTION=enable|recover
 	if helperDir := strings.TrimSpace(os.Getenv("CLASHFX_SYSPROXY_HELPER_DIR")); helperDir != "" {
+		_ = os.Setenv("CLASHFX_TEST_REAL_OS_SYSPROXY", "1")
 		mgr := NewManager(helperDir, NewOSBackend())
 		switch os.Getenv("CLASHFX_SYSPROXY_HELPER_ACTION") {
 		case "enable":

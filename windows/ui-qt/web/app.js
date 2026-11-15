@@ -227,6 +227,7 @@ function renderChrome() {
   const profiles = Array.isArray(snap.profiles) ? snap.profiles : [];
   const activeProf = settings.selected_profile || 'config';
   const port = runtime.mixed_port || settings.port_override || 7890;
+  const armedStandby = subsCount === 0 && !aiOn;
 
   // Brand status line
   const verEl = document.getElementById('brand-version');
@@ -323,8 +324,8 @@ function renderChrome() {
     if (tunBtn) tunBtn.classList.toggle('is-on', tunOn);
     if (sysLbl) sysLbl.textContent = t('系统代理', 'Sys Proxy');
     if (tunLbl) tunLbl.textContent = t('TUN 增强', 'TUN Mode');
-    if (sysSub) sysSub.textContent = sysOn ? `:${port}` : t('已关闭', 'Off');
-    if (tunSub) tunSub.textContent = tunOn ? String(settings.tun_stack || 'mixed') : t('已关闭', 'Off');
+    if (sysSub) sysSub.textContent = sysOn ? (armedStandby ? t('待导入订阅', 'Pending Sub') : `:${port}`) : t('已关闭', 'Off');
+    if (tunSub) tunSub.textContent = tunOn ? (armedStandby ? t('待导入订阅', 'Pending Sub') : String(settings.tun_stack || 'mixed')) : t('已关闭', 'Off');
     if (profLbl) profLbl.textContent = t('当前配置', 'Profile');
     if (spdEl) spdEl.textContent = `↑ ${formatSpeed(store.telemetry.up)} · ↓ ${formatSpeed(store.telemetry.down)}`;
     if (refBtn) refBtn.title = t('更新当前订阅 / 配置', 'Refresh active profile');
@@ -373,6 +374,9 @@ function renderChrome() {
     if (!store.connected) {
       tbChip.className = 'topbar-chip err';
       tbChip.textContent = t('核心守护未连接', 'Daemon Disconnected');
+    } else if (armedStandby && (sysOn || tunOn)) {
+      tbChip.className = 'topbar-chip warn';
+      tbChip.textContent = t('就绪 · 导入订阅后自动开启代理', 'Ready · Import Sub to Activate');
     } else if (tags.length) {
       tbChip.className = 'topbar-chip ok';
       tbChip.textContent = `${tags.join(' + ')} · :${port}`;
@@ -424,6 +428,7 @@ function syncConsoleHost(forceReload = false) {
   const settings = snap.settings || {};
   const runtime = snap.runtime || {};
   const aiOn = Boolean(settings.claudeProxyLockEnabled);
+  const subsCount = Array.isArray(snap.subscriptions) ? snap.subscriptions.length : 0;
 
   if (consoleBanner) {
     if (snap.last_error) {
@@ -440,6 +445,13 @@ function syncConsoleHost(forceReload = false) {
         <span>${esc(t(`检测到受信任网络「${snap.suspended_by_network}」，代理已自动挂起。`, `Trusted network "${snap.suspended_by_network}" detected — proxy suspended.`))}</span>
         <button type="button" class="btn btn-xs" id="console-banner-settings">${t('网络规则', 'Network Rules')}</button>`;
       consoleBanner.querySelector('#console-banner-settings')?.addEventListener('click', () => go(6));
+    } else if (store.connected && subsCount === 0 && !aiOn) {
+      consoleBanner.hidden = false;
+      consoleBanner.className = 'console-banner';
+      consoleBanner.innerHTML = `
+        <span>${esc(t('权限与默认分流规则已就绪（国内直连 / 局域网直连 / 国内应用直连）。导入一个订阅即可自动开启代理。', 'Permissions & direct bypass rules are ready. Import one subscription to start proxying automatically.'))}</span>
+        <button type="button" class="btn btn-xs btn-primary" id="console-banner-import">${t('导入订阅', 'Import Subscription')}</button>`;
+      consoleBanner.querySelector('#console-banner-import')?.addEventListener('click', () => go(1));
     } else {
       consoleBanner.hidden = true;
       consoleBanner.innerHTML = '';

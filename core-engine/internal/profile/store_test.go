@@ -1,8 +1,10 @@
 package profile
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -205,5 +207,80 @@ func TestUnmarshalYAMLMapAndApplyMixinSanitizesTabIndentation(t *testing.T) {
 	fourSpaceTab := []byte("profile:\n    prepend-rules:\n\t- DOMAIN-SUFFIX,example.com,JMS\n    - MATCH,JMS\n")
 	if _, err := UnmarshalYAMLMap(fourSpaceTab); err != nil {
 		t.Fatalf("expected 4-space tab-indented YAML to parse: %v", err)
+	}
+}
+
+func TestOutOfTheBoxDefaultSettingsAndMixin(t *testing.T) {
+	store, err := NewStore(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	st := store.Settings()
+	if !st.SystemProxyEnabled {
+		t.Fatalf("expected SystemProxyEnabled=true by default")
+	}
+	if !st.EnhancedMode {
+		t.Fatalf("expected EnhancedMode=true by default")
+	}
+	if !st.BypassCNApps {
+		t.Fatalf("expected BypassCNApps=true by default")
+	}
+	if st.OutboundMode != "rule" {
+		t.Fatalf("expected OutboundMode=rule by default, got %q", st.OutboundMode)
+	}
+	if !st.AutoUpdateSubs {
+		t.Fatalf("expected AutoUpdateSubs=true by default")
+	}
+	if strings.TrimSpace(st.ProxyBypassList) == "" {
+		t.Fatalf("expected non-empty default ProxyBypassList")
+	}
+
+	rawMixin, err := store.ReadProfileMixinBytes()
+	if err != nil {
+		t.Fatalf("ReadProfileMixinBytes failed: %v", err)
+	}
+	mixinText := string(rawMixin)
+	for _, want := range []string{
+		"GEOSITE,private,DIRECT",
+		"GEOIP,LAN,DIRECT,no-resolve",
+		"GEOSITE,cn,DIRECT",
+		"GEOIP,CN,DIRECT,no-resolve",
+	} {
+		if !strings.Contains(mixinText, want) {
+			t.Fatalf("expected default Profile Mixin to contain %q, got:\n%s", want, mixinText)
+		}
+	}
+
+	merged, err := ApplyProfileMixin(map[string]any{
+		"mixed-port": 7890,
+		"rules":      []any{"MATCH,Proxy"},
+	}, rawMixin)
+	if err != nil {
+		t.Fatalf("ApplyProfileMixin failed: %v", err)
+	}
+	var mergedRules []string
+	switch v := merged["rules"].(type) {
+	case []string:
+		mergedRules = v
+	case []any:
+		for _, item := range v {
+			mergedRules = append(mergedRules, fmt.Sprint(item))
+		}
+	default:
+		t.Fatalf("unexpected merged rules type %T", merged["rules"])
+	}
+	joinedRules := strings.Join(mergedRules, "\n")
+	for _, want := range []string{
+		"GEOSITE,private,DIRECT",
+		"GEOIP,LAN,DIRECT,no-resolve",
+		"GEOSITE,cn,DIRECT",
+		"GEOIP,CN,DIRECT,no-resolve",
+		"MATCH,Proxy",
+	} {
+		if !strings.Contains(joinedRules, want) {
+			t.Fatalf("expected merged rules to contain %q, got:\n%s", want, joinedRules)
+		}
 	}
 }

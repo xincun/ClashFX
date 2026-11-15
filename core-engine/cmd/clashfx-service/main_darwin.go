@@ -168,6 +168,53 @@ func retireLegacyDarwinHelper() {
 	time.Sleep(250 * time.Millisecond)
 }
 
+const darwinSocketFilterFW = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+
+func runSocketFilterFW(args ...string) error {
+	if _, err := os.Stat(darwinSocketFilterFW); err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, darwinSocketFilterFW, args...).Run()
+}
+
+func ensureDarwinFirewallRules(srcDir string) {
+	if _, err := os.Stat(darwinSocketFilterFW); err != nil {
+		return
+	}
+	targets := []string{
+		filepath.Join(service.DarwinPrivilegedBinDir, "mihomo_core"),
+		filepath.Join(service.DarwinPrivilegedBinDir, "clashfx-service"),
+		filepath.Join(srcDir, "clashfx-daemon"),
+		filepath.Join(srcDir, "mihomo_core"),
+	}
+	cleanSrc := filepath.Clean(srcDir)
+	if strings.HasSuffix(cleanSrc, string(filepath.Separator)+"Contents"+string(filepath.Separator)+"MacOS") {
+		appBundle := filepath.Dir(filepath.Dir(cleanSrc))
+		targets = append(targets, appBundle)
+	}
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		clean := filepath.Clean(target)
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		if _, err := os.Stat(clean); err != nil {
+			continue
+		}
+		_ = runSocketFilterFW("--add", clean)
+		_ = runSocketFilterFW("--unblockapp", clean)
+	}
+}
+
+func removeDarwinFirewallRules() {
+	for _, name := range []string{"mihomo_core", "clashfx-service"} {
+		_ = runSocketFilterFW("--remove", filepath.Join(service.DarwinPrivilegedBinDir, name))
+	}
+}
+
 func installAndStartService(sourceDir string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("install must be run as root")
@@ -199,6 +246,8 @@ func installAndStartService(sourceDir string) error {
 			return fmt.Errorf("install %s: %w", name, err)
 		}
 	}
+
+	ensureDarwinFirewallRules(srcDir)
 
 	plistData := []byte(buildLaunchDaemonPlist())
 	if err := os.WriteFile(service.DarwinLaunchDaemonPlist, plistData, 0644); err != nil {
@@ -234,6 +283,7 @@ func uninstallService() error {
 	_ = exec.Command("/bin/launchctl", "bootout", "system", service.DarwinLaunchDaemonPlist).Run()
 	_ = os.Remove(service.DarwinLaunchDaemonPlist)
 	_ = os.Remove(service.ServiceSocketPath())
+	removeDarwinFirewallRules()
 	_ = os.RemoveAll(service.DarwinPrivilegedBinDir)
 	return nil
 }

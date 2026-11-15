@@ -48,6 +48,8 @@ chinesesimplified.AdditionalShortcuts=附加快捷方式:
 english.AdditionalShortcuts=Additional shortcuts:
 chinesesimplified.RegisterServiceMsg=正在注册 ClashFX 提权 TUN 系统服务...
 english.RegisterServiceMsg=Registering ClashFX privileged TUN service...
+chinesesimplified.InstallWebView2Msg=正在安装 Microsoft Edge WebView2 运行时...
+english.InstallWebView2Msg=Installing Microsoft Edge WebView2 Runtime...
 chinesesimplified.LaunchAppDesc=立即启动 ClashFX
 english.LaunchAppDesc=Launch ClashFX
 
@@ -56,6 +58,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopShortcut}"; GroupDescription
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "MicrosoftEdgeWebView2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsWebView2Runtime
 
 [Icons]
 Name: "{autoprograms}\ClashFX"; Filename: "{app}\clashfx-ui.exe"
@@ -78,6 +81,7 @@ Root: HKCR; Subkey: "clashfx\shell\open\command"; ValueType: string; ValueName: 
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "ClashFX"; Flags: uninsdeletevalue
 
 [Run]
+Filename: "{tmp}\MicrosoftEdgeWebView2Setup.exe"; Parameters: "/silent /install"; StatusMsg: "{cm:InstallWebView2Msg}"; Flags: runhidden waituntilterminated; Check: NeedsWebView2Runtime
 Filename: "{app}\clashfx-service.exe"; Parameters: "install"; StatusMsg: "{cm:RegisterServiceMsg}"; Flags: runhidden waituntilterminated
 Filename: "{app}\clashfx-ui.exe"; Description: "{cm:LaunchAppDesc}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
@@ -87,6 +91,26 @@ Filename: "{app}\clashfx-daemon.exe"; Parameters: "-cleanup-uninstall"; RunOnceI
 Filename: "{app}\clashfx-service.exe"; Parameters: "uninstall"; RunOnceId: "UninstallClashFXService"; Flags: runhidden waituntilterminated skipifdoesntexist
 
 [Code]
+function HasValidWebView2Version(RootKey: Integer; const Subkey: String): Boolean;
+var
+  Pv: String;
+begin
+  Result := RegQueryStringValue(RootKey, Subkey, 'pv', Pv) and (Pv <> '') and (Pv <> '0.0.0.0');
+end;
+
+function NeedsWebView2Runtime(): Boolean;
+var
+  Wv2Subkey: String;
+begin
+  Wv2Subkey := 'Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
+  if HasValidWebView2Version(HKLM32, Wv2Subkey) or
+     HasValidWebView2Version(HKLM64, Wv2Subkey) or
+     HasValidWebView2Version(HKCU, Wv2Subkey) then
+    Result := False
+  else
+    Result := True;
+end;
+
 procedure CleanupLoopbackProxyForHive(RootKey: Integer; const BaseSubkey: String);
 var
   InetKey: String;

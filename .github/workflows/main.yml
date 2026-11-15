@@ -47,7 +47,7 @@ jobs:
           echo "BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
           echo "Version: $tag (build $build_number)"
 
-      - name: Build Universal macOS App & DMG
+      - name: Build Universal macOS App, PKG & DMG
         run: |
           python3 macos/scripts/build-core.py
           python3 macos/scripts/build-daemon.py --version "$TAG_VERSION"
@@ -56,27 +56,31 @@ jobs:
           python3 scripts/verify-release-compatibility.py --app macos/dist/ClashFX.app
           bash scripts/verify-dashboard-compatibility-bundle.sh macos/dist/ClashFX.app
           codesign --verify --deep --strict --verbose=2 macos/dist/ClashFX.app
+          python3 macos/scripts/package-pkg.py --version "$TAG_VERSION"
           python3 macos/scripts/package-dmg.py
 
-      - name: Verify mounted DMG contents
+      - name: Verify mounted DMG & expanded PKG contents
         run: |
           DMG_VERIFY_DIR=$(mktemp -d /tmp/clashfx-dmg-verify.XXXXXX)
           DMG_MOUNT_POINT="$DMG_VERIFY_DIR/mount"
           mkdir -p "$DMG_MOUNT_POINT"
           cleanup_dmg() {
             hdiutil detach "$DMG_MOUNT_POINT" -quiet 2>/dev/null || true
-            rmdir "$DMG_MOUNT_POINT" "$DMG_VERIFY_DIR" 2>/dev/null || true
+            rm -rf "$DMG_VERIFY_DIR" 2>/dev/null || true
           }
           trap cleanup_dmg EXIT
           hdiutil attach macos/dist/ClashFX.dmg -nobrowse -readonly -mountpoint "$DMG_MOUNT_POINT"
-          python3 scripts/verify-release-compatibility.py --app "$DMG_MOUNT_POINT/ClashFX.app"
-          bash scripts/verify-dashboard-compatibility-bundle.sh "$DMG_MOUNT_POINT/ClashFX.app"
+          test -f "$DMG_MOUNT_POINT/ClashFX.pkg"
+          pkgutil --expand-full "$DMG_MOUNT_POINT/ClashFX.pkg" "$DMG_VERIFY_DIR/expanded"
+          EXPANDED_APP="$DMG_VERIFY_DIR/expanded/ClashFX-component.pkg/Payload/Applications/ClashFX.app"
+          python3 scripts/verify-release-compatibility.py --app "$EXPANDED_APP"
+          bash scripts/verify-dashboard-compatibility-bundle.sh "$EXPANDED_APP"
 
       - name: Go core-engine tests & Appcast release-notes regression
         run: |
           (
             cd core-engine
-            CLASHFX_DISABLE_OS_SYSPROXY=1 CLASHFX_DISABLE_LAUNCH_AGENT=1 CLASHFX_DISABLE_LEGACY_PLIST_MIGRATION=1 \
+            CLASHFX_DISABLE_OS_SYSPROXY=1 CLASHFX_DISABLE_LAUNCH_AGENT=1 CLASHFX_DISABLE_LEGACY_PLIST_MIGRATION=1 CLASHFX_DISABLE_PRIVILEGED_SERVICE=1 \
               go test -race -count=1 ./...
           )
           python3 scripts/test_appcast_release_notes.py
@@ -87,7 +91,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          files: macos/dist/ClashFX.dmg
+          files: |
+            macos/dist/ClashFX.dmg
+            macos/dist/ClashFX.pkg
           draft: false
           prerelease: ${{ env.RELEASE_CHANNEL == 'lab' }}
           body_path: RELEASE_NOTES.md

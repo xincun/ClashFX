@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"flag"
 	"fmt"
 	"net"
+	"os"
 	"os/user"
 	"strings"
 	"sync"
@@ -137,6 +139,12 @@ func buildCurrentUserPipeSDDL() string {
 }
 
 func IsPrivilegedServiceInstalled(serviceName string) bool {
+	if strings.TrimSpace(os.Getenv("CLASHFX_DISABLE_PRIVILEGED_SERVICE")) == "1" {
+		return false
+	}
+	if flag.Lookup("test.v") != nil && strings.TrimSpace(os.Getenv("CLASHFX_TEST_REAL_SERVICE")) != "1" {
+		return false
+	}
 	registered := false
 	m, err := mgr.Connect()
 	if err != nil {
@@ -231,6 +239,12 @@ func ElevateAndInstallService(serviceExePath string) error {
 }
 
 func SetLaunchAtLogin(enabled bool, uiExePath string) error {
+	if strings.TrimSpace(os.Getenv("CLASHFX_DISABLE_LAUNCH_AGENT")) == "1" {
+		return nil
+	}
+	if flag.Lookup("test.v") != nil && strings.TrimSpace(os.Getenv("CLASHFX_TEST_REAL_LAUNCH_AGENT")) != "1" {
+		return nil
+	}
 	k, _, err := registry.CreateKey(registry.CURRENT_USER, runRegistryKeyPath, registry.QUERY_VALUE|registry.SET_VALUE)
 	if err != nil {
 		return fmt.Errorf("open HKCU Run registry key: %w", err)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -78,6 +79,75 @@ func acceptLoop(ln net.Listener, runner *service.Runner) {
 	}
 }
 
+var windowsFirewallBinaries = []string{
+	"mihomo_core.exe",
+	"clashfx-daemon.exe",
+	"clashfx-service.exe",
+	"clashfx-ui.exe",
+}
+
+func netshExePath() string {
+	if sysRoot := os.Getenv("SystemRoot"); sysRoot != "" {
+		cand := filepath.Join(sysRoot, "System32", "netsh.exe")
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+	}
+	return "netsh.exe"
+}
+
+func runNetshHidden(args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, netshExePath(), args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+	}
+	return cmd.Run()
+}
+
+func ensureWindowsFirewallRules(trustedDir string) {
+	for _, binName := range windowsFirewallBinaries {
+		prog := filepath.Join(trustedDir, binName)
+		if _, err := os.Stat(prog); err != nil {
+			continue
+		}
+		baseName := "ClashFX - " + binName
+		for _, suffix := range []string{"", " (In)", " (Out)"} {
+			_ = runNetshHidden("advfirewall", "firewall", "delete", "rule", "name="+baseName+suffix)
+		}
+		for _, spec := range []struct {
+			suffix string
+			dir    string
+		}{
+			{" (In)", "in"},
+			{" (Out)", "out"},
+		} {
+			if err := runNetshHidden(
+				"advfirewall", "firewall", "add", "rule",
+				"name="+baseName+spec.suffix,
+				"dir="+spec.dir,
+				"action=allow",
+				"program="+prog,
+				"enable=yes",
+				"profile=any",
+			); err != nil {
+				fmt.Fprintf(os.Stderr, "[clashfx-service] firewall add rule %s%s warning: %v\n", baseName, spec.suffix, err)
+			}
+		}
+	}
+}
+
+func removeWindowsFirewallRules() {
+	for _, binName := range windowsFirewallBinaries {
+		baseName := "ClashFX - " + binName
+		for _, suffix := range []string{"", " (In)", " (Out)"} {
+			_ = runNetshHidden("advfirewall", "firewall", "delete", "rule", "name="+baseName+suffix)
+		}
+	}
+}
+
 func resolveTrustedDir() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -134,6 +204,7 @@ func installAndStartService() error {
 			{Type: mgr.NoAction},
 		}, 86400)
 	}
+	ensureWindowsFirewallRules(filepath.Dir(exe))
 	if err := s.Start(); err != nil {
 		st, qErr := s.Query()
 		if qErr != nil || (st.State != svc.Running && st.State != svc.StartPending) {
@@ -155,6 +226,8 @@ func uninstallService() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	_, _ = service.Call(ctx, service.Request{Action: "stop_core"})
 	cancel()
+
+	removeWindowsFirewallRules()
 
 	m, err := mgr.Connect()
 	if err != nil {

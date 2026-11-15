@@ -179,8 +179,10 @@ QString TrayIconGenerator::buildTooltip(bool connected, const QJsonObject& snaps
     if (!suspendedNet.isEmpty()) {
         lines << L("系统代理: 已自动暂停 (", "System Proxy: Paused (") + suspendedNet + QStringLiteral(")");
     } else {
-        lines << L("系统代理: ", "System Proxy: ") + (sysProxy ? L("已开启", "On") : L("已关闭", "Off")) +
-                     QStringLiteral("  |  TUN: ") + (enhanced ? L("已开启", "On") : L("已关闭", "Off"));
+        const bool armedStandby = profiles.isEmpty() && !aiLocked;
+        const QString onLabel = armedStandby ? L("待导入订阅", "Pending Sub") : L("已开启", "On");
+        lines << L("系统代理: ", "System Proxy: ") + (sysProxy ? onLabel : L("已关闭", "Off")) +
+                     QStringLiteral("  |  TUN: ") + (enhanced ? onLabel : L("已关闭", "Off"));
     }
 
     if (aiLocked) {

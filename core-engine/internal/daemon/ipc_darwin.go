@@ -85,6 +85,12 @@ func DialIPC(endpoint string) (net.Conn, error) {
 }
 
 func IsPrivilegedServiceInstalled(_ string) bool {
+	if strings.TrimSpace(os.Getenv("CLASHFX_DISABLE_PRIVILEGED_SERVICE")) == "1" {
+		return false
+	}
+	if flag.Lookup("test.v") != nil && strings.TrimSpace(os.Getenv("CLASHFX_TEST_REAL_SERVICE")) != "1" {
+		return false
+	}
 	for _, reqPath := range []string{
 		service.DarwinLaunchDaemonPlist,
 		filepath.Join(service.DarwinPrivilegedBinDir, "clashfx-service"),

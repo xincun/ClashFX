@@ -3,6 +3,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:CLASHFX_DISABLE_OS_SYSPROXY = "1"
+$env:CLASHFX_DISABLE_LAUNCH_AGENT = "1"
+$env:CLASHFX_DISABLE_PRIVILEGED_SERVICE = "1"
 
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -20,8 +23,15 @@ public class UiTestWin32 {
 "@
 [UiTestWin32]::SetProcessDPIAware() | Out-Null
 
-# Ensure any previous test run is cleanly stopped
-Stop-Process -Name clashfx-ui, clashfx-daemon, mihomo_core -Force -ErrorAction SilentlyContinue
+function Get-ScopedClashProcesses {
+    param([string]$PrefixPath)
+    @(Get-Process clashfx-ui, clashfx-daemon, mihomo_core -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and $_.Path.StartsWith($PrefixPath, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+}
+
+# Ensure any previous test run under C:\Temp\clashfx-verify-ui is cleanly stopped (never disturb installed ClashFXService)
+Get-ScopedClashProcesses "C:\Temp\clashfx-verify-ui" | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 
 # Minimize background terminal windows so screenshots show ClashFX cleanly
@@ -143,7 +153,7 @@ rules:
     }
     Write-Host "  [OK] Automated WebView2 DOM smoke test passed ($($smokeJson.dom.steps.Count) steps)"
     Start-Sleep -Milliseconds 600
-    Stop-Process -Name clashfx-ui, clashfx-daemon, mihomo_core -Force -ErrorAction SilentlyContinue
+    Get-ScopedClashProcesses $appDir | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 400
 
     $uiProc = Start-Process -FilePath $uiExe `
@@ -240,14 +250,14 @@ rules:
     $exited = $false
     for ($w = 0; $w -lt 20; $w++) {
         Start-Sleep -Milliseconds 400
-        $rem = @(Get-Process clashfx-ui, clashfx-daemon, mihomo_core -ErrorAction SilentlyContinue)
+        $rem = Get-ScopedClashProcesses $appDir
         if ($rem.Count -eq 0) {
             $exited = $true
             break
         }
     }
     if (-not $exited) {
-        Stop-Process -Name clashfx-ui, clashfx-daemon, mihomo_core -Force -ErrorAction SilentlyContinue
+        Get-ScopedClashProcesses $appDir | Stop-Process -Force -ErrorAction SilentlyContinue
         throw "Processes did not exit cleanly on --quit for $arch"
     }
     Write-Host "  [OK] Graceful --quit verified for $arch (zero leftover processes)"

@@ -128,6 +128,31 @@ if errorlevel 1 exit /b 1
         throw "windeployqt failed for $arch (exit code $LASTEXITCODE)"
     }
 
+    # Bundle app-local MSVC C++ CRT DLLs matching target architecture (without vc_redist.exe bloat)
+    $msvcRedistBase = Join-Path $VsPath "VC\Redist\MSVC"
+    $crtDir = $null
+    if (Test-Path $msvcRedistBase) {
+        $verDirs = Get-ChildItem -Path $msvcRedistBase -Directory |
+            Where-Object { $_.Name -match '^\d+\.\d+' } |
+            Sort-Object { [version]$_.Name } -Descending
+        foreach ($vd in $verDirs) {
+            $archDir = Join-Path $vd.FullName $t.WebView2Arch
+            if (Test-Path $archDir) {
+                $candidateCrt = Get-ChildItem -Path $archDir -Directory -Filter "Microsoft.VC*.CRT" | Select-Object -First 1
+                if ($candidateCrt) {
+                    $crtDir = $candidateCrt.FullName
+                    break
+                }
+            }
+        }
+    }
+    if (-not $crtDir) {
+        throw "Could not locate Microsoft.VC*.CRT redist DLLs for $($t.WebView2Arch) under $msvcRedistBase"
+    }
+    Get-ChildItem -Path $crtDir -Filter "*.dll" -File | ForEach-Object {
+        Copy-Item -Force $_.FullName (Join-Path $stageDir $_.Name)
+    }
+
     # Copy Go binaries + Wintun for this architecture
     $binDir = Join-Path $RepoRoot "windows\build\bin\$arch"
     foreach ($f in @("mihomo_core.exe", "wintun.dll", "clashfx-service.exe", "clashfx-daemon.exe")) {
@@ -151,7 +176,7 @@ if errorlevel 1 exit /b 1
     Copy-Item -Recurse -Force (Join-Path $RepoRoot "windows\ui-qt\web") $stageUi
 
     # Verify PE architecture headers strictly on all core executables & DLLs
-    foreach ($peName in @("clashfx-ui.exe", "clashfx-daemon.exe", "clashfx-service.exe", "mihomo_core.exe", "wintun.dll", "Qt6Widgets.dll")) {
+    foreach ($peName in @("clashfx-ui.exe", "clashfx-daemon.exe", "clashfx-service.exe", "mihomo_core.exe", "wintun.dll", "Qt6Widgets.dll", "vcruntime140.dll", "msvcp140.dll")) {
         Assert-PeArch -FilePath (Join-Path $stageDir $peName) -ExpectedMachine $t.PeMachine -Label $arch
     }
 

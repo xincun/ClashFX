@@ -214,6 +214,7 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 	eng.ctrl.SetProfileSourceResolver(func(profileName string) ([]byte, bool) {
 		return eng.resolveFallbackProfileBytes(profileName)
 	})
+	eng.ctrl.SetEffectiveSettingsResolver(eng.effectiveRuntimeSettings)
 
 	eng.nodeCoord = nodeservices.NewCoordinator(
 		nodeStore,
@@ -251,8 +252,8 @@ func (e *Engine) Start(ctx context.Context) error {
 		settings = e.store.Settings()
 	}
 
-	// Recover previous crashed session's system proxy if user doesn't want system proxy now
-	_, _ = e.sysProxy.RecoverAfterUncleanShutdown(settings.SystemProxyEnabled)
+	// Recover previous crashed session's system proxy if effective runtime doesn't want system proxy now
+	_, _ = e.sysProxy.RecoverAfterUncleanShutdown(e.effectiveRuntimeSettings(settings).SystemProxyEnabled)
 
 	// Self-heal Login item / HKCU Run\ClashFX path if the user moved or reinstalled ClashFX
 	if settings.LaunchAtLogin {
@@ -498,11 +499,35 @@ func (e *Engine) isServiceCoreRunning() bool {
 	return err == nil && resp.OK && resp.Status != nil && resp.Status.Running
 }
 
+func (e *Engine) hasUsableManagedSubscription() bool {
+	if e.subMgr == nil {
+		return false
+	}
+	for _, sub := range e.subMgr.List() {
+		if _, err := os.Stat(e.store.ProfilePath(sub.Name)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// effectiveRuntimeSettings keeps persisted preferences (System Proxy / TUN) checked
+// while holding OS proxy and TUN in clean standby until at least one usable
+// subscription exists (unless AI Lock explicitly forces active control).
+func (e *Engine) effectiveRuntimeSettings(s profile.AppSettings) profile.AppSettings {
+	if !e.hasUsableManagedSubscription() && !s.AILockEnabled {
+		s.EnhancedMode = false
+		s.SystemProxyEnabled = false
+	}
+	return s
+}
+
 func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUAC bool) (transaction.AppliedRuntimeState, error) {
 	e.opMu.Lock()
 	e.allowPromptUAC = allowUAC
 	prevViaService := e.isCoreViaService()
-	wantService := e.store.Settings().EnhancedMode && supportsPrivilegedService()
+	effSettings := e.effectiveRuntimeSettings(e.store.Settings())
+	wantService := effSettings.EnhancedMode && supportsPrivilegedService()
 	if prevViaService != wantService {
 		e.ctrl.ResetActiveState()
 	}
@@ -591,6 +616,7 @@ func (e *Engine) currentNetworkSignature(forceRefresh bool) features.ActiveNetwo
 
 func (e *Engine) reconcileSystemProxy() {
 	settings := e.store.Settings()
+	eff := e.effectiveRuntimeSettings(settings)
 	rt := e.ctrl.LastState()
 	sig := e.currentNetworkSignature(true)
 	matchedRule, shouldSuspend := features.MatchSuspendNetwork(sig, settings.SuspendNetworks)
@@ -604,7 +630,7 @@ func (e *Engine) reconcileSystemProxy() {
 	e.suspendedByNet = matchedRule
 	e.statusMu.Unlock()
 
-	if settings.SystemProxyEnabled && !shouldSuspend && rt.HTTPPort > 0 {
+	if eff.SystemProxyEnabled && !shouldSuspend && rt.HTTPPort > 0 {
 		_, _ = e.sysProxy.ReconcileIfExpected(true, rt.HTTPPort, settings.ProxyBypassList)
 	} else {
 		_ = e.sysProxy.Restore()
@@ -617,7 +643,7 @@ func (e *Engine) handleWakeOrNetworkCheck() {
 		_, _ = e.applyAndSync(context.Background(), true, false)
 		return
 	}
-	if settings.SystemProxyEnabled {
+	if e.effectiveRuntimeSettings(settings).SystemProxyEnabled {
 		e.reconcileSystemProxy()
 	}
 	e.notifyStateChanged()
@@ -1358,6 +1384,14 @@ func (e *Engine) SetEnhancedMode(ctx context.Context, enabled bool, allowUAC boo
 	if cur.AILockEnabled && !enabled {
 		return fmt.Errorf("AI Proxy Lock requires Enhanced Mode (TUN); disable AI Proxy Lock first")
 	}
+	if enabled && supportsPrivilegedService() && !IsPrivilegedServiceInstalled(service.ServiceName) {
+		if !allowUAC {
+			return ErrServiceInstallRequired
+		}
+		if err := ElevateAndInstallService(serviceExecutablePath(e.cfg.BinDir)); err != nil {
+			return err
+		}
+	}
 	prev := cur.EnhancedMode
 	if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
 		s.EnhancedMode = enabled
@@ -1672,12 +1706,25 @@ func (e *Engine) SelectProfile(ctx context.Context, name string) error {
 }
 
 func (e *Engine) UpsertSubscription(ctx context.Context, name, rawURL, userAgent string, selectAfter bool) (subscription.ManagedSubscription, error) {
+	prevSubs := e.subMgr.List()
 	sub, err := e.subMgr.AddOrUpdate(name, rawURL, userAgent)
 	if err != nil {
 		return subscription.ManagedSubscription{}, err
 	}
+	wasExisting := false
+	for _, s := range prevSubs {
+		if s.Name == sub.Name {
+			wasExisting = true
+			break
+		}
+	}
 	updated, err := e.subMgr.Refresh(ctx, sub.Name, 0)
 	if err != nil {
+		if !wasExisting {
+			if _, statErr := os.Stat(e.store.ProfilePath(sub.Name)); os.IsNotExist(statErr) {
+				_ = e.subMgr.Remove(sub.Name, false)
+			}
+		}
 		return sub, err
 	}
 	if selectAfter {

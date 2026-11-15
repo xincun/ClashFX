@@ -21,6 +21,7 @@ import (
 	"github.com/clashfx/core-engine/internal/ailock"
 	"github.com/clashfx/core-engine/internal/features"
 	"github.com/clashfx/core-engine/internal/profile"
+	"github.com/clashfx/core-engine/internal/subscription"
 	"github.com/clashfx/core-engine/internal/transaction"
 )
 
@@ -1082,5 +1083,173 @@ rules:
 	}
 	if !strings.Contains(rtText, "MATCH,Proxy") {
 		t.Fatalf("expected .runtime-config.yaml to include DefaultStarterConfigYAML rules, got:\n%s", rtText)
+	}
+}
+
+type noopSubCoreHelper struct{}
+
+func (noopSubCoreHelper) ConvertShareLinks(raw []byte) ([]byte, error) {
+	return raw, nil
+}
+
+func (noopSubCoreHelper) ValidateConfig(_, _ string) error {
+	return nil
+}
+
+func TestZeroSubscriptionArmedStandbyAndAutoActivateOnImport(t *testing.T) {
+	t.Setenv("CLASHFX_DISABLE_LEGACY_PLIST_MIGRATION", "1")
+	t.Setenv("CLASHFX_DISABLE_LAUNCH_AGENT", "1")
+	t.Setenv("CLASHFX_DISABLE_OS_SYSPROXY", "1")
+	t.Setenv("CLASHFX_DISABLE_PRIVILEGED_SERVICE", "1")
+
+	subYAML := `mixed-port: 17895
+proxies:
+  - name: "Tokyo-Edge"
+    type: socks5
+    server: 198.51.100.25
+    port: 1080
+proxy-groups:
+  - name: "Proxy"
+    type: select
+    proxies: ["Tokyo-Edge", "DIRECT"]
+rules:
+  - MATCH,Proxy
+`
+	subSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(subYAML))
+	}))
+	defer subSrv.Close()
+
+	appData := t.TempDir()
+	eng, err := NewEngine(Config{AppDataDir: appData}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Shutdown()
+
+	initSt := eng.store.Settings()
+	if !initSt.SystemProxyEnabled || !initSt.EnhancedMode || !initSt.BypassCNApps || initSt.OutboundMode != "rule" || !initSt.AutoUpdateSubs {
+		t.Fatalf("expected out-of-the-box defaults armed before Start, got %+v", initSt)
+	}
+
+	eng.subMgr, err = subscription.NewManager(eng.store, noopSubCoreHelper{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.ctrl = transaction.NewController(eng.store, noopApplier{}, "", features.TransformHookForCNApps())
+	eng.ctrl.SetProfileSourceResolver(eng.resolveFallbackProfileBytes)
+	eng.ctrl.SetEffectiveSettingsResolver(eng.effectiveRuntimeSettings)
+
+	// Without a privileged service installed, Engine.Start downgrades EnhancedMode=false
+	// while keeping SystemProxyEnabled=true and BypassCNApps=true checked.
+	if err := eng.Start(context.Background()); err != nil {
+		t.Fatalf("eng.Start failed: %v", err)
+	}
+
+	st0 := eng.store.Settings()
+	if !st0.SystemProxyEnabled || !st0.BypassCNApps || st0.OutboundMode != "rule" || !st0.AutoUpdateSubs {
+		t.Fatalf("unexpected fresh settings with 0 subscriptions: %+v", st0)
+	}
+	os0, err := eng.sysProxy.CurrentOSState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os0.ProxyEnable != 0 {
+		t.Fatalf("expected OS ProxyEnable=0 while 0 subscriptions exist, got %+v", os0)
+	}
+
+	// Simulate an installed privileged service by testing effectiveRuntimeSettings directly
+	if _, err := eng.store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.EnhancedMode = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	effBefore := eng.effectiveRuntimeSettings(eng.store.Settings())
+	if effBefore.EnhancedMode || effBefore.SystemProxyEnabled {
+		t.Fatalf("expected effectiveRuntimeSettings to hold EnhancedMode & SystemProxyEnabled off while 0 subs exist, got %+v", effBefore)
+	}
+
+	// Import 1 subscription via single UpsertSubscription call (zero manual proxy/rule toggles)
+	// Keep EnhancedMode=false for noopApplier, then check effectiveRuntimeSettings with EnhancedMode=true below.
+	if _, err := eng.store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.EnhancedMode = false
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := eng.UpsertSubscription(context.Background(), "MySub", subSrv.URL, "", true)
+	if err != nil {
+		t.Fatalf("UpsertSubscription failed: %v", err)
+	}
+	if sub.Name != "MySub" {
+		t.Fatalf("unexpected subscription name: %q", sub.Name)
+	}
+
+	osAfter, err := eng.sysProxy.CurrentOSState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if osAfter.ProxyEnable != 1 || !strings.HasPrefix(osAfter.ProxyServer, "127.0.0.1:") {
+		t.Fatalf("expected OS system proxy automatically engaged on first subscription import, got %+v", osAfter)
+	}
+
+	// Now verify effectiveRuntimeSettings activates BOTH EnhancedMode and SystemProxyEnabled when a usable sub exists
+	if _, err := eng.store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.EnhancedMode = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	effAfter := eng.effectiveRuntimeSettings(eng.store.Settings())
+	if !effAfter.EnhancedMode || !effAfter.SystemProxyEnabled {
+		t.Fatalf("expected effectiveRuntimeSettings to activate EnhancedMode & SystemProxyEnabled once subscription exists, got %+v", effAfter)
+	}
+	if _, err := eng.ctrl.Apply(context.Background(), false); err != nil {
+		t.Fatalf("ctrl.Apply failed: %v", err)
+	}
+
+	rawRuntime, err := os.ReadFile(eng.ctrl.RuntimeConfigPath())
+	if err != nil {
+		t.Fatalf("read .runtime-config.yaml failed: %v", err)
+	}
+	rtText := string(rawRuntime)
+	for _, wantRule := range []string{
+		"RULE-SET,clashfx-cn-apps-direct,DIRECT",
+		"GEOSITE,cn,DIRECT",
+		"GEOIP,CN,DIRECT,no-resolve",
+		"GEOSITE,private,DIRECT",
+		"GEOIP,LAN,DIRECT,no-resolve",
+	} {
+		if !strings.Contains(rtText, wantRule) {
+			t.Fatalf("expected out-of-the-box direct rule %q in runtime config:\n%s", wantRule, rtText)
+		}
+	}
+
+	// Removing the last subscription restores OS ProxyEnable=0 while preserving Settings.SystemProxyEnabled=true
+	if err := eng.RemoveSubscription(context.Background(), "MySub", true); err != nil {
+		t.Fatalf("RemoveSubscription failed: %v", err)
+	}
+	osRemoved, err := eng.sysProxy.CurrentOSState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if osRemoved.ProxyEnable != 0 {
+		t.Fatalf("expected OS system proxy automatically restored to ProxyEnable=0 after removing last subscription, got %+v", osRemoved)
+	}
+	if !eng.store.Settings().SystemProxyEnabled {
+		t.Fatalf("expected persisted SystemProxyEnabled=true to remain checked across empty subscription state")
+	}
+
+	// Failed initial URL import must not leave a broken orphan entry in subscriptions.json
+	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer badSrv.Close()
+	if _, err := eng.UpsertSubscription(context.Background(), "BrokenSub", badSrv.URL, "", true); err == nil {
+		t.Fatalf("expected UpsertSubscription against HTTP 502 to fail")
+	}
+	if len(eng.subMgr.List()) != 0 {
+		t.Fatalf("expected failed first-time import to clean up subscriptions.json, got %+v", eng.subMgr.List())
 	}
 }

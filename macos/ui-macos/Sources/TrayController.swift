@@ -275,10 +275,13 @@ final class TrayController: NSObject, NSMenuDelegate {
         let sysProxy = (settings["system_proxy_enabled"] as? Bool) ?? false
         let enhanced = (settings["enhanced_mode"] as? Bool) ?? false
         let aiLocked = (settings["claudeProxyLockEnabled"] as? Bool) ?? false
+        let profiles = (snapshot["profiles"] as? [String]) ?? []
+        let armedStandby = profiles.isEmpty && !aiLocked
 
         var vis: VisualState = .disconnected
         if connected && !snapshot.isEmpty && coreRunning {
-            if enhanced { vis = .enhancedTun }
+            if armedStandby { vis = .idle }
+            else if enhanced { vis = .enhancedTun }
             else if sysProxy { vis = .systemProxy }
             else { vis = .idle }
         }
@@ -424,9 +427,11 @@ final class TrayController: NSObject, NSMenuDelegate {
         if !suspendedNet.isEmpty {
             lines.append(L("系统代理: 已自动暂停 (", "System Proxy: Paused (") + suspendedNet + ")")
         } else {
+            let armedStandby = profiles.isEmpty && !aiLocked
+            let onLabel = armedStandby ? L("待导入订阅", "Pending Sub") : L("已开启", "On")
             lines.append(
-                L("系统代理: ", "System Proxy: ") + (sysProxy ? L("已开启", "On") : L("已关闭", "Off"))
-                + "  |  TUN: " + (enhanced ? L("已开启", "On") : L("已关闭", "Off"))
+                L("系统代理: ", "System Proxy: ") + (sysProxy ? onLabel : L("已关闭", "Off"))
+                + "  |  TUN: " + (enhanced ? onLabel : L("已关闭", "Off"))
             )
         }
         if aiLocked {

@@ -4,26 +4,35 @@ package sysproxy
 
 import (
 	"errors"
+	"flag"
 	"fmt"
+	"os"
+	"strings"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
 const (
-	internetSettingsKeyPath          = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	internetOptionRefresh            = 37
-	internetOptionSettingsChanged    = 39
+	internetSettingsKeyPath       = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+	internetOptionRefresh         = 37
+	internetOptionSettingsChanged = 39
 )
 
 var (
-	modwininet               = windows.NewLazySystemDLL("wininet.dll")
-	procInternetSetOptionW   = modwininet.NewProc("InternetSetOptionW")
+	modwininet             = windows.NewLazySystemDLL("wininet.dll")
+	procInternetSetOptionW = modwininet.NewProc("InternetSetOptionW")
 )
 
 type windowsRegistryBackend struct{}
 
 func NewOSBackend() Backend {
+	if strings.TrimSpace(os.Getenv("CLASHFX_DISABLE_OS_SYSPROXY")) == "1" {
+		return &memoryBackend{}
+	}
+	if flag.Lookup("test.v") != nil && strings.TrimSpace(os.Getenv("CLASHFX_TEST_REAL_OS_SYSPROXY")) != "1" {
+		return &memoryBackend{}
+	}
 	return windowsRegistryBackend{}
 }
 
