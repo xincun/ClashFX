@@ -1767,6 +1767,42 @@ func (e *Engine) UpdateNodeServices(ctx context.Context, nextSettings *nodeservi
 	return err
 }
 
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func coreOrProxySettingsChanged(a, b profile.AppSettings) bool {
+	return a.SelectedProfile != b.SelectedProfile ||
+		a.CustomConfigDir != b.CustomConfigDir ||
+		a.OutboundMode != b.OutboundMode ||
+		a.AllowLan != b.AllowLan ||
+		a.IPv6 != b.IPv6 ||
+		a.SystemProxyEnabled != b.SystemProxyEnabled ||
+		a.EnhancedMode != b.EnhancedMode ||
+		a.CustomConfigAsIs != b.CustomConfigAsIs ||
+		a.BypassCNApps != b.BypassCNApps ||
+		a.PortOverride != b.PortOverride ||
+		a.APIPort != b.APIPort ||
+		a.APISecret != b.APISecret ||
+		a.LogLevel != b.LogLevel ||
+		a.TunMTU != b.TunMTU ||
+		a.TunStack != b.TunStack ||
+		a.TunInterfaceName != b.TunInterfaceName ||
+		a.TunRouteExcludes != b.TunRouteExcludes ||
+		a.ProxyBypassList != b.ProxyBypassList ||
+		a.AILockEnabled != b.AILockEnabled ||
+		a.AILockTarget != b.AILockTarget ||
+		!stringSlicesEqual(a.SuspendNetworks, b.SuspendNetworks)
+}
+
 func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSettings) error {
 	cur := e.store.Settings()
 	if strings.TrimSpace(next.SelectedProfile) == "" {
@@ -1792,6 +1828,11 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 		return nil
 	}); err != nil {
 		return err
+	}
+
+	if !coreOrProxySettingsChanged(cur, next) {
+		e.notifyStateChanged()
+		return nil
 	}
 
 	if next.CustomConfigDir != cur.CustomConfigDir {

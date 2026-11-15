@@ -423,6 +423,24 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
             renderedOk = false;
           }
           await sleep(16);
+          if (navId === 6) {
+            var exInp = document.getElementById('set-tun-excludes');
+            var saveBtn = document.getElementById('set-save');
+            if (exInp && saveBtn) {
+              exInp.dispatchEvent(new Event('input', { bubbles: true }));
+              saveBtn.click();
+              var saveDeadline = performance.now() + 1500;
+              while (performance.now() < saveDeadline) {
+                var bar = document.getElementById('set-save-bar');
+                if (bar && bar.hidden) break;
+                await sleep(30);
+              }
+              var finalBar = document.getElementById('set-save-bar');
+              if (!finalBar || !finalBar.hidden) renderedOk = false;
+            } else {
+              renderedOk = false;
+            }
+          }
         }
 
         var effTabBtn = document.querySelector('[data-rule-tab="2"]');

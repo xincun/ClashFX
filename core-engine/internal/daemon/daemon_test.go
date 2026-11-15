@@ -801,3 +801,179 @@ func TestSingleConnectionConcurrentRPCNoHeadOfLineBlock(t *testing.T) {
 		t.Fatalf("expected clash-verge:// scheme accepted, got %q", resps[1].Error)
 	}
 }
+
+func TestUpdateSettingsFrontendPayloadAndLaunchAtLogin(t *testing.T) {
+	sockDir, err := os.MkdirTemp("", "cfx-updset-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+
+	appData := t.TempDir()
+	t.Setenv("CLASHFX_SERVICE_SOCK", filepath.Join(appData, "nonexistent-service.sock"))
+	t.Setenv("CLASHFX_DISABLE_LAUNCH_AGENT", "1")
+
+	endpoint := filepath.Join(sockDir, "d.sock")
+	if runtime.GOOS == "windows" {
+		endpoint = fmt.Sprintf(`\\.\pipe\ClashFXDaemonSettingsTest-%d`, time.Now().UnixNano())
+	}
+
+	ln, err := ListenIPC(endpoint)
+	if err != nil {
+		t.Fatalf("ListenIPC failed: %v", err)
+	}
+	eng, err := NewEngine(Config{AppDataDir: appData}, nil)
+	if err != nil {
+		_ = ln.Close()
+		t.Fatal(err)
+	}
+	defer eng.Shutdown()
+
+	srv := &Server{
+		endpoint: endpoint,
+		engine:   eng,
+		ln:       ln,
+		clients:  map[*clientConn]struct{}{},
+		quitCh:   make(chan struct{}),
+	}
+	go srv.acceptLoop()
+	defer func() {
+		_ = ln.Close()
+		srv.clientsMu.Lock()
+		for c := range srv.clients {
+			_ = c.conn.Close()
+		}
+		srv.clients = map[*clientConn]struct{}{}
+		srv.clientsMu.Unlock()
+	}()
+
+	conn, err := DialIPC(endpoint)
+	if err != nil {
+		t.Fatalf("DialIPC failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 1) Fast-path desktop settings update (must succeed with zero core restart / validation).
+	cur := eng.store.Settings()
+	cur.LaunchAtLogin = true
+	cur.TrayIconPreset = "monochrome"
+	cur.Language = "en_US"
+	cur.AutoUpdateSubs = false
+	cur.UpdateChannel = "lab"
+	cur.BenchmarkURL = "https://example.com/generate_204"
+	cur.Hotkeys = profile.HotkeySettings{
+		ToggleSystemProxy:  "Cmd+Shift+P",
+		SwitchOutboundMode: "Cmd+Shift+M",
+	}
+	fastPayload, _ := json.Marshal(map[string]any{"settings": cur})
+	fastFrame, _ := json.Marshal(RPCRequest{
+		ID:     41,
+		Method: "update_settings",
+		Params: json.RawMessage(fastPayload),
+	})
+	fastFrame = append(fastFrame, '\n')
+	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write(fastFrame); err != nil {
+		t.Fatalf("write fast update_settings failed: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	fastLine, err := bufio.NewReader(conn).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read fast update_settings reply failed: %v", err)
+	}
+	var fastResp RPCResponse
+	if err := json.Unmarshal(fastLine, &fastResp); err != nil {
+		t.Fatalf("unmarshal fast update_settings reply: %v", err)
+	}
+	if !fastResp.OK {
+		t.Fatalf("expected desktop-only update_settings fast path OK, got error=%q code=%q", fastResp.Error, fastResp.ErrorCode)
+	}
+
+	// 2) Full frontend payload including string tun_route_excludes (must never fail JSON unmarshal).
+	frontendSettings := `{
+		"settings": {
+			"selected_profile": "config",
+			"outbound_mode": "rule",
+			"allow_lan": false,
+			"ipv6": false,
+			"system_proxy_enabled": false,
+			"enhanced_mode": false,
+			"port_override": 0,
+			"api_port": 19090,
+			"log_level": "info",
+			"tun_mtu": 1500,
+			"tun_stack": "mixed",
+			"tun_route_excludes": "192.168.0.0/16, 10.0.0.0/8",
+			"proxy_bypass_list": "localhost,127.0.0.1",
+			"auto_update_subs": true,
+			"tray_icon_preset": "monochrome",
+			"language": "zh_CN",
+			"launch_at_login": true,
+			"hotkeys": {"toggle_system_proxy": "Cmd+Shift+P", "switch_outbound_mode": "Cmd+Shift+M"},
+			"suspend_networks": ["CorpWiFi"],
+			"update_channel": "stable",
+			"benchmark_url": "https://cp.cloudflare.com/generate_204"
+		}
+	}`
+	frame, _ := json.Marshal(RPCRequest{
+		ID:     42,
+		Method: "update_settings",
+		Params: json.RawMessage(frontendSettings),
+	})
+	frame = append(frame, '\n')
+	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatalf("write update_settings failed: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, err := bufio.NewReader(conn).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read update_settings reply failed: %v", err)
+	}
+	var resp RPCResponse
+	if err := json.Unmarshal(line, &resp); err != nil {
+		t.Fatalf("unmarshal update_settings reply: %v", err)
+	}
+	if strings.Contains(resp.Error, "unmarshal") {
+		t.Fatalf("unexpected JSON unmarshal error on frontend settings payload: %q", resp.Error)
+	}
+
+	got := eng.store.Settings()
+	if got.TunRouteExcludes != "192.168.0.0/16, 10.0.0.0/8" {
+		t.Fatalf("unexpected tun_route_excludes: %q", got.TunRouteExcludes)
+	}
+	if !got.LaunchAtLogin {
+		t.Fatalf("expected launch_at_login=true")
+	}
+	if got.TrayIconPreset != "monochrome" {
+		t.Fatalf("expected tray_icon_preset=monochrome, got %q", got.TrayIconPreset)
+	}
+	if len(got.SuspendNetworks) != 1 || got.SuspendNetworks[0] != "CorpWiFi" {
+		t.Fatalf("unexpected suspend_networks: %+v", got.SuspendNetworks)
+	}
+
+	if runtime.GOOS == "darwin" {
+		tempHome := t.TempDir()
+		t.Setenv("HOME", tempHome)
+		t.Setenv("CLASHFX_DISABLE_LAUNCH_AGENT", "")
+		t.Setenv("CLASHFX_TEST_REAL_LAUNCH_AGENT", "1")
+
+		if err := SetLaunchAtLogin(true, "/Applications/ClashFX.app/Contents/MacOS/ClashFX"); err != nil {
+			t.Fatalf("SetLaunchAtLogin(true) failed: %v", err)
+		}
+		plistPath := filepath.Join(tempHome, "Library", "LaunchAgents", "com.clashfx.app.login.plist")
+		raw, err := os.ReadFile(plistPath)
+		if err != nil {
+			t.Fatalf("read LaunchAgent plist failed: %v", err)
+		}
+		if !strings.Contains(string(raw), "<string>--minimized</string>") {
+			t.Fatalf("expected --minimized in plist, got:\n%s", string(raw))
+		}
+		if err := SetLaunchAtLogin(false, ""); err != nil {
+			t.Fatalf("SetLaunchAtLogin(false) failed: %v", err)
+		}
+		if _, err := os.Stat(plistPath); !os.IsNotExist(err) {
+			t.Fatalf("expected plist removed on disable, stat err=%v", err)
+		}
+	}
+}

@@ -782,7 +782,11 @@ export function renderSettingsPage(root) {
     settingsState.draft = JSON.parse(hash || '{}');
     if (!settingsState.draft.hotkeys) settingsState.draft.hotkeys = {};
     if (!Array.isArray(settingsState.draft.suspend_networks)) settingsState.draft.suspend_networks = [];
-    if (!Array.isArray(settingsState.draft.tun_route_excludes)) settingsState.draft.tun_route_excludes = [];
+    if (Array.isArray(settingsState.draft.tun_route_excludes)) {
+      settingsState.draft.tun_route_excludes = settingsState.draft.tun_route_excludes.join(', ');
+    } else if (typeof settingsState.draft.tun_route_excludes !== 'string') {
+      settingsState.draft.tun_route_excludes = '';
+    }
   }
   const d = settingsState.draft || {};
   const hk = d.hotkeys || {};
@@ -829,7 +833,7 @@ export function renderSettingsPage(root) {
         </div>
         <div class="form-row">
           <div class="form-label-col"><div class="form-label">${t('开机自动启动', store.platform === 'darwin' ? 'Launch at Login' : 'Launch at Windows Login')}</div></div>
-          <label class="switch"><input type="checkbox" data-set-bool="launch_at_login" ${d.launch_at_login ? 'checked' : ''} /><span class="switch-track"></span></label>
+          <label class="switch"><input type="checkbox" id="set-autostart" ${d.launch_at_login ? 'checked' : ''} /><span class="switch-track"></span></label>
         </div>
       </div>
 
@@ -882,7 +886,7 @@ export function renderSettingsPage(root) {
         </div>
         <div class="form-row">
           <div class="form-label-col"><div class="form-label">${t('TUN 排除路由段 (Route Excludes)', 'TUN Route Excludes')}</div><div class="form-desc">${t('逗号分隔的 CIDR 网段，不经由 TUN 虚拟网卡接管', 'Comma-separated CIDRs excluded from TUN capture')}</div></div>
-          <div class="form-control" style="width:240px;"><input type="text" class="input mono" id="set-tun-excludes" value="${esc((d.tun_route_excludes || []).join(', '))}" placeholder="192.168.0.0/16, 10.0.0.0/8" /></div>
+          <div class="form-control" style="width:240px;"><input type="text" class="input mono" id="set-tun-excludes" data-set-str="tun_route_excludes" value="${esc(d.tun_route_excludes || '')}" placeholder="192.168.0.0/16, 10.0.0.0/8" /></div>
         </div>
         <div class="form-row">
           <div class="form-label-col"><div class="form-label">${t('内核日志级别', 'Core Log Level')}</div></div>
@@ -992,10 +996,38 @@ export function renderSettingsPage(root) {
     }
   });
 
-  root.querySelector('#set-tray')?.addEventListener('change', (e) => {
-    d.tray_icon_preset = e.target.value;
-    settingsState.dirty = true;
+  const applyImmediateOrMarkDirty = async (revertFn, okMsg) => {
+    if (settingsState.dirty) {
+      renderSettingsPage(root);
+      return;
+    }
+    const res = await rpc('update_settings', { settings: d });
+    if (res.ok) {
+      settingsState.loadedHash = '';
+      if (okMsg) showToast(okMsg, 'ok');
+      await rpc('get_state', {}, { silent: true });
+    } else if (revertFn) {
+      revertFn();
+    }
     renderSettingsPage(root);
+  };
+
+  root.querySelector('#set-tray')?.addEventListener('change', async (e) => {
+    const prev = d.tray_icon_preset;
+    d.tray_icon_preset = e.target.value;
+    await applyImmediateOrMarkDirty(
+      () => { d.tray_icon_preset = prev; },
+      t('托盘图标风格已更新', 'Tray icon style updated')
+    );
+  });
+
+  root.querySelector('#set-autostart')?.addEventListener('change', async (e) => {
+    const prev = Boolean(d.launch_at_login);
+    d.launch_at_login = e.target.checked;
+    await applyImmediateOrMarkDirty(
+      () => { d.launch_at_login = prev; },
+      d.launch_at_login ? t('已开启开机自动启动', 'Launch at Login enabled') : t('已关闭开机自动启动', 'Launch at Login disabled')
+    );
   });
 
   root.querySelectorAll('[data-set-bool]').forEach((cb) => {
@@ -1008,7 +1040,7 @@ export function renderSettingsPage(root) {
 
   root.querySelectorAll('[data-set-num]').forEach((inp) => {
     inp.addEventListener('input', (e) => {
-      d[inp.getAttribute('data-set-num')] = Number(e.target.value) || 0;
+      d[inp.getAttribute('data-set-num')] = Math.max(0, Math.trunc(Number(e.target.value) || 0));
       markSettingsDirty();
     });
   });
@@ -1019,14 +1051,6 @@ export function renderSettingsPage(root) {
       d[el.getAttribute('data-set-str')] = e.target.value;
       markSettingsDirty();
     });
-  });
-
-  root.querySelector('#set-tun-excludes')?.addEventListener('input', (e) => {
-    d.tun_route_excludes = e.target.value
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    markSettingsDirty();
   });
 
   root.querySelector('#set-suspend-nets')?.addEventListener('input', (e) => {

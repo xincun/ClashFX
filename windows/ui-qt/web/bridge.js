@@ -428,6 +428,24 @@ async function runDomSmokeTest(dwellMs = 45) {
       }
       btn.click();
       await wait(dwellMs);
+      if (pageId === 6) {
+        const exInp = document.getElementById('set-tun-excludes');
+        const saveBtn = document.getElementById('set-save');
+        if (!exInp || !saveBtn) {
+          report.errors.push('missing settings save controls');
+        } else {
+          exInp.dispatchEvent(new Event('input', { bubbles: true }));
+          saveBtn.click();
+          const saveDeadline = performance.now() + 1500;
+          while (performance.now() < saveDeadline) {
+            if (document.getElementById('set-save-bar')?.hidden) break;
+            await wait(30);
+          }
+          if (!document.getElementById('set-save-bar')?.hidden) {
+            report.errors.push('settings save failed');
+          }
+        }
+      }
       const pageEl = document.getElementById('page-content');
       report.steps.push({
         page: store.page,
