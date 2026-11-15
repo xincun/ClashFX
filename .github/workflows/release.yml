@@ -42,6 +42,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           python3 - << 'PY'
           import json
@@ -99,6 +100,26 @@ jobs:
                           should_release = False
                           break
           else:
+              before_sha = (os.environ.get("BEFORE_SHA") or "").strip()
+              if event_name == "push" and before_sha and set(before_sha) != {"0"}:
+                  diff_proc = subprocess.run(
+                      ["git", "diff", "--name-only", before_sha, os.environ["GITHUB_SHA"]],
+                      capture_output=True,
+                      text=True,
+                  )
+                  if diff_proc.returncode == 0:
+                      changed = [line.strip() for line in diff_proc.stdout.splitlines() if line.strip()]
+                      if changed and all(
+                          path.endswith(".md")
+                          or path.startswith("docs/")
+                          or path.startswith(".github/ISSUE_TEMPLATE/")
+                          or path in {"LICENSE", ".gitignore"}
+                          for path in changed
+                      ):
+                          print("Docs-only push on release branch; skipping binary release build.")
+                          should_build = False
+                          should_release = False
+
               candidates = [(base_parsed[0], base_parsed[1], base_parsed[2])]
 
               tags_out = subprocess.check_output(["git", "tag", "-l"], text=True)

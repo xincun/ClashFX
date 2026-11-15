@@ -1,47 +1,55 @@
 # AI Proxy Lock / AI 专用锁定
 
-AI 专用锁定将受支持的 Claude、Codex、Antigravity 流量统一固定到一个具体节点。节点不可用时阻断连接，不回落到其他节点或直连。它沿用原有锁定事务、TUN 接管、系统代理和规则模式保护；偏好键仍使用 `claudeProxyLockEnabled` / `claudeProxyLockTarget`，保留升级前的设置。
+AI 专用锁定在 **macOS** 与 **Windows** 上共用同一套策略引擎（实现位于 `core-engine/internal/ailock/`），将 **Claude**、**Codex** 和 **Antigravity (`agy`)** 的桌面端、CLI 以及精确匹配的 API / 登录端点固定到一个具体代理节点，并在节点故障或协议不受支持时**硬阻断（Fail-Closed）**，避免泄漏到 `DIRECT` 或自动切换代理组。
 
-## 使用
+---
 
-菜单栏图标 → **AI 专用锁定…** → 选择具体节点 → **启用锁定**。不能选择 DIRECT、REJECT、COMPATIBLE、PASS、REJECT-DROP 或自动切换的代理组；这些内置项不会显示在候选列表中。
+## 入口与工作方式
 
-启用后自动使用增强模式、规则模式和系统代理。停用锁定后才能关闭这些保护设置。锁定状态直接退出 ClashFX 会保留指向停止内核的系统代理，使遵循该系统代理的应用无法联网；需要恢复原网络代理时先停用锁定。
+- **入口**：控制中心左侧 **AI 锁定** 页面，或系统托盘菜单 → **AI 锁定**。
+- **目标限制**：只能绑定具体出站节点；`DIRECT`、`REJECT`、`COMPATIBLE`、`PASS`、`REJECT-DROP` 等内置策略项不会作为可锁定目标。
+- **联动保护**：启用 AI 锁定后会自动锁定为 **Rule（规则）模式 + 增强模式（TUN）+ 系统代理**，并保存锁定前的网络状态 snapshot（停用锁定时恢复）。在 AI 锁定生效期间，普通退出 ClashFX 会遵循 Fail-Closed 策略阻止未授权回落直连。
 
-## 桌面端与 CLI
+---
 
-| 产品 | 进程与安装路径匹配 | 域名兜底 |
-| --- | --- | --- |
-| Claude | Claude、Claude Helper、`claude`，及版本目录形式的原生 CLI | claude.ai、claude.com、anthropic.com、claudeusercontent.com |
-| Codex | Codex、`codex`、codex-app-server、ChatGPT 宿主与相应辅助进程/应用路径 | chatgpt.com、openai.com，以及 OpenAI 自有静态资源/内容域名 |
-| Antigravity | Antigravity、辅助进程、`agy`、antigravity-cli；在应用目录和 Antigravity 专用目录中的后台程序 | antigravity.google，以及明确列出的 Google AI 服务和登录端点 |
+## 跨平台匹配规则 (`clashfx-ai-lock`)
 
-进程规则不匹配整个 Chrome、VS Code、node 或 python，也不按通用 `language_server` 名称全局捕获。Antigravity 后台程序有多个版本命名，使用所属应用/专用目录路径兜底，避免把其他编辑器的语言服务器一起锁定。
+规则定义集中在 `core-engine/internal/profile/ruleset.go` 与 `core-engine/internal/ailock/policy.go`，运行时以最高优先级规则置于普通规则与国内直连规则之前，并强制开启 `find-process-mode` 进程识别：
 
-Google API 使用精确域名规则，例如 `cloudcode-pa.googleapis.com`、`businessaicode.googleapis.com`、区域化企业服务、`generativelanguage.googleapis.com`，以及 `accounts.google.com` / `oauth2.googleapis.com` 登录端点；不把整个 google.com 或 googleapis.com 加入锁定。共享登录端点的规则也可能影响浏览器中的其他 Google 登录。
+1. **进程名正则 (`PROCESS-NAME-REGEX`)**：匹配 `claude`、`codex`、`codex-app-server`、`chatgpt`、`antigravity`、`antigravity-cli`、`agy` 及其 Helper / `.exe` 变体。
+2. **安装路径正则 (`PROCESS-PATH-REGEX`)**：
+   - **macOS**：匹配 `Claude.app`、`Codex.app`、`CodexCLI.app`、`ChatGPT.app`、`Antigravity.app` 应用 Bundle 内子进程（例如隐藏在应用内部的语言服务器）。
+   - **Windows**：匹配 `Programs` / `Program Files` / `AppData\Local\AnthropicClaude` / `WindowsApps` / `.local\bin` / `.antigravity` / `.gemini\antigravity-cli` 目录下的对应二进制。
+   - 不会宽泛匹配整个浏览器、编辑器主进程或其他无关语言服务器，避免误伤。
+3. **精确域名后缀 (`DOMAIN-SUFFIX`)**：覆盖 `claude.ai`、`claude.com`、`anthropic.com`、`claudeusercontent.com`、`openai.com`、`chatgpt.com`、`oaistatic.com`、`oaiusercontent.com`、`oaistatsig.com`、`openaimerge.com`、`antigravity.google` 及受控的 Google/API 服务端点。
 
-这些规则在运行时放到原规则前面，并启用进程查找。每条 AI 匹配后紧跟相同匹配条件的 REJECT，避免 mihomo 因锁定节点不支持 UDP 而跳过它后落到其他出口。
+### Fail-Closed 规则生成
 
-## 与多节点代理一起使用
+运行时会在通用规则前插入两条绑定 inline provider `clashfx-ai-lock` 的规则：
 
-多节点窗口的端口可以同时运行。AI 锁定开启时，每个受管理端口使用单独的子规则：
+```yaml
+- RULE-SET,clashfx-ai-lock,<已选具体节点>
+- RULE-SET,clashfx-ai-lock,REJECT
+```
 
-1. AI 进程或服务域名 → 锁定节点；失败则阻断。
-2. 其他页面 → 该端口对应的节点。
-3. 该节点不支持的协议 → 阻断，避免回落 DIRECT。
+即使所选节点不支持特定协议（如 UDP）导致 mihomo 跳过第一条匹配，第二条 `REJECT` 规则也会立刻截断连接，确保不会穿透到后续通用分流规则或 `DIRECT`。
 
-内部订阅刷新端口同样遵循 AI 保护规则，普通订阅下载仍走 DIRECT。后台巡检和自动刷新可以与 AI 锁定同时运行。
+---
 
-Chrome 扩展应指向本版本“多节点代理…”窗口给出的本机端口。指向 XrayGUI 或其他代理软件的端口不会经过本版本的子规则。用户自己编写的自定义 listeners、其他代理栈和 VPN 同样不属于这些受管理端口的保护范围。
+## 与多节点固定端口协同工作
 
-CLI 的非标准包装器或自定义网关需要能被进程/路径规则识别，或显式补充网关域名规则。锁定的是具体节点；供应商更换该节点的外部 IP 时，实际 IP 仍会改变。
+当 **多节点服务（`21000+`）** 与 **AI 专用锁定** 同时开启时，每个多节点固定端口监听器会自动绑定独立的子规则列表：
 
-## 信息来源与验证范围
+1. 匹配 `clashfx-ai-lock` 的流量 → 强制走**锁定节点**；失败则走 `REJECT` 阻断；
+2. 其他流量 → 走该固定端口绑定的**目标节点**；协议不兼容时阻断，不回落 `DIRECT`。
 
-- [Claude Code 官方网络要求](https://code.claude.com/docs/en/network-config)
-- [OpenAI 官方网络域名与 Codex WebSocket 要求](https://help.openai.com/en/articles/9247338-network-recommendations-for-chatgpt-errors-on-web-and-apps)
-- [Codex 官方 CLI 二进制定义](https://github.com/openai/codex/blob/main/codex-rs/cli/Cargo.toml)
-- [Antigravity 官方 CLI 安装与 agy 命令](https://antigravity.google/docs/getting-started?tab=cli)
-- [Antigravity 官方企业网络端点](https://antigravity.google/docs/enterprise)
+后台 `DIRECT` 订阅刷新监听端口同样内置内部直连白名单并隔离通用规则，可与 AI 锁定安全共存。
 
-验证使用静态进程/路径样例、模拟流量和独立内核。按用户要求，不启动本机 Claude、Codex、Antigravity 或它们的 CLI；这些检查不代表已经使用真实账户做端到端登录验证。
+---
+
+## 自动化测试验证
+
+```bash
+cd core-engine
+go test -race -count=1 ./internal/ailock/...
+```

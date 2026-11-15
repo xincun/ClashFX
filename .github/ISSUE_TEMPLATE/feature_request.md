@@ -1,59 +1,23 @@
 ---
-name: Feature request
-about: Suggest an idea for this project
-title: "[Feature]"
+name: Feature request / 功能建议
+about: Suggest an enhancement for ClashFX / 提交 ClashFX 功能或优化建议
+title: "[Feature] "
 labels: ''
 assignees: ''
-
 ---
 
-<!-- The English version is available. -->
-感谢你向 ClashX 提交 Feature Request！
-在提交之前，请确认：
+提交前请先在 [Issues](https://github.com/xincun/ClashFX/issues) 查看是否已有相关讨论。
 
-- [ ] 我已经在 [Issue Tracker](……/) 中找过我要提出的请求
+### 适用平台 / Target Platform
 
-请注意，如果你并没有遵照这个 issue template 填写内容，我们将直接关闭这个 issue。
+- [ ] macOS (Apple Silicon / Intel)
+- [ ] Windows (`amd64` / `arm64`)
+- [ ] 全平台通用功能 (Core Engine & Control Center UI)
 
-<!--
-Thanks for submitting a feature request towards the ClashX!
-But before so, please do the following checklist:
+### 需求说明 / Feature Description
 
-- [ ] I have searched on the [issue tracker](……/) before creating the issue.
+<!-- 希望解决什么问题？期望的交互方式或配置行为是什么？ -->
 
-Please understand that we close issues that fail to follow the issue template.
--->
+### 补充信息 / Additional Context
 
-我都确认过了，我要继续提交。
-<!-- None of the above, create a feature request -->
-------------------------------------------------------------------
-
-请附上任何可以帮助我们解决这个问题的信息，如果我们收到的信息不足，我们将对这个 issue 加上 *Needs more information* 标记并在收到更多资讯之前关闭 issue。
-<!-- Make sure to add **all the information needed to understand the bug** so that someone can help. If the info is missing we'll add the 'Needs more information' label and close the issue until there is enough information. -->
-
-
-### 环境 Environment
-
-* 使用者的操作系统 (the OS running on the client)
-……
-* 网路环境或拓扑 (network conditions/topology)
-……
-* iptables，如果适用 (if applicable)
-……
-* ISP 有没有进行 DNS 污染 (is your ISP performing DNS pollution?)
-……
-* 其他
-……
-
-### 说明 Description
-
-<!--
-请详细、清晰地表达你要提出的论述，例如这个问题如何影响到你？你想实现什么功能？目前 Clash 的行为是什麽？
--->
-
-### 可能的解决方案 Possible Solution
-<!-- 此项非必须，但是如果你有想法的话欢迎提出。 -->
-<!-- Not obligatory, but suggest a fix/reason for the bug, -->
-<!-- or ideas how to implement the addition or change -->
-
-### 更多信息 More Information
+<!-- 可选：参考实现、协议规范或使用场景截图 -->
