@@ -720,20 +720,20 @@ func (s *Store) PrepareWithProviderProxies(root map[string]any, profileName stri
 	st.ActiveNames[pKey] = names
 	st.ProviderOwners[pKey] = providerOwners
 
-	var directPtr *int
-	if st.Settings.RecoveryEnabled {
-		dp, err := st.Registry.PrepareDirectPort(reserved, coreRunning, func(port int) bool {
-			if s.probePort == nil {
-				return true
-			}
-			ok, _ := s.probePort(port, false)
-			return ok
-		})
-		if err != nil {
-			return nil, err
+	// Always allocate DirectPort whenever node listeners are active so manual and
+	// scheduled subscription refreshes can bypass TUN/dead nodes via DIRECT even
+	// if background 204 auto-recovery is disabled.
+	dp, err := st.Registry.PrepareDirectPort(reserved, coreRunning, func(port int) bool {
+		if s.probePort == nil {
+			return true
 		}
-		directPtr = &dp
+		ok, _ := s.probePort(port, false)
+		return ok
+	})
+	if err != nil {
+		return nil, err
 	}
+	directPtr := &dp
 
 	var appliedBindings []NodePortBinding
 	if st.Settings.PortsEnabled {

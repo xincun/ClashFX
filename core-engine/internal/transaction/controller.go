@@ -23,8 +23,8 @@ var defaultWindowsFakeIPFilter = []any{
 	"*.lan",
 	"*.local",
 	"*.localdomain",
-	"*.msftconnecttest.com",
-	"*.msftncsi.com",
+	"+.msftconnecttest.com",
+	"+.msftncsi.com",
 	"dns.msftncsi.com",
 	"captive.apple.com",
 	"time.apple.com",
@@ -438,12 +438,32 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 			dnsMap["fake-ip-filter"] = append([]any(nil), defaultWindowsFakeIPFilter...)
 		}
 		if dnsMap["default-nameserver"] == nil {
-			dnsMap["default-nameserver"] = []string{"114.114.114.114", "223.5.5.5", "119.29.29.29"}
+			dnsMap["default-nameserver"] = []string{"114.114.114.114", "223.5.5.5", "119.29.29.29", "system"}
 		}
 		if dnsMap["nameserver"] == nil {
 			dnsMap["nameserver"] = []string{"https://doh.pub/dns-query", "tls://223.5.5.5:853"}
 		}
+		policyMap, _ := dnsMap["nameserver-policy"].(map[string]any)
+		if policyMap == nil {
+			if norm, ok := profile.NormalizeYAMLValue(dnsMap["nameserver-policy"]).(map[string]any); ok && norm != nil {
+				policyMap = norm
+			} else {
+				policyMap = map[string]any{}
+			}
+		}
+		for _, k := range []string{"captive.apple.com", "+.msftconnecttest.com", "+.msftncsi.com"} {
+			if _, exists := policyMap[k]; !exists {
+				policyMap[k] = "system"
+			}
+		}
+		dnsMap["nameserver-policy"] = policyMap
 		root["dns"] = dnsMap
+	}
+
+	captiveDirectRules := []string{
+		"DOMAIN,captive.apple.com,DIRECT",
+		"DOMAIN-SUFFIX,msftconnecttest.com,DIRECT",
+		"DOMAIN-SUFFIX,msftncsi.com,DIRECT",
 	}
 
 	if settings.EnhancedMode {
@@ -494,9 +514,22 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 			}
 		}
 		root["tun"] = tunMap
-		if settings.BypassCNApps && !settings.CustomConfigAsIs && root["find-process-mode"] == nil {
+		if !settings.CustomConfigAsIs && root["find-process-mode"] == nil {
 			root["find-process-mode"] = "always"
 		}
+		tunCaptiveRules := captiveDirectRules
+		switch runtime.GOOS {
+		case "darwin":
+			tunCaptiveRules = append([]string{
+				"PROCESS-NAME,captiveagent,DIRECT",
+				"PROCESS-NAME,Captive Network Assistant,DIRECT",
+			}, captiveDirectRules...)
+		case "windows":
+			tunCaptiveRules = append([]string{
+				"PROCESS-NAME,WWAHost.exe,DIRECT",
+			}, captiveDirectRules...)
+		}
+		PrependUniqueRules(root, tunCaptiveRules)
 		// Keep only mihomo_core itself in the internal TUN loop-prevention rule-set so
 		// clashfx-service/clashfx-daemon can route core/GEO/app updates via local proxyPort.
 		profile.SetInlineClassicalRuleProvider(root, profile.InternalDirectRuleProviderName, []string{
@@ -508,6 +541,7 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		})
 	} else {
 		root["tun"] = map[string]any{"enable": false}
+		PrependUniqueRules(root, captiveDirectRules)
 	}
 
 	// Strip any legacy custom recovery key; stock Mihomo persists selections via profile.store-selected + REST replay.

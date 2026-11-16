@@ -170,6 +170,9 @@ func applyLegacyDictToSettings(dict map[string]any, s *AppSettings) {
 	if v, ok := dictBool(dict, "autoUpdateEnable"); ok {
 		s.AutoUpdateSubs = v
 	}
+	if v, ok := dictBool(dict, "showNetSpeedIndicator"); ok {
+		s.ShowTraySpeed = v
+	}
 }
 
 func migrateLegacyRemoteConfigs(dict map[string]any, appDataDir string) error {

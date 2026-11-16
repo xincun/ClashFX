@@ -14,11 +14,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var consoleWindow: ConsoleWindowController?
     private var trayController: TrayController?
     private var wakeObserver: NSObjectProtocol?
+    private var powerOffObserver: NSObjectProtocol?
     private var instanceLockFd: Int32 = -1
     private var controlListenFd: Int32 = -1
     private var controlSocketPath = ""
     private var isTerminating = false
     private var terminationCompleted = false
+    private var poweringOff = false
+    private var isPromptingQuit = false
+    private var quitPromptConfirmed = false
+    private var killAiClientsOnQuit = false
 
     override init() {
         super.init()
@@ -69,6 +74,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.daemonClient?.call(method: "power_resume")
         }
 
+        powerOffObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willPowerOffNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.poweringOff = true
+        }
+
         if !startupUri.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak tray] in
                 tray?.handleExternalCommand("URI:\(self.startupUri)")
@@ -95,20 +108,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if terminationCompleted {
             return .terminateNow
         }
-        consoleWindow?.setAllowClose(true)
         guard let client = daemonClient else {
+            consoleWindow?.setAllowClose(true)
             terminationCompleted = true
             return .terminateNow
         }
-        if isTerminating {
+        if isTerminating || isPromptingQuit {
             return .terminateLater
         }
+
+        let settings = (client.snapshot["settings"] as? [String: Any]) ?? [:]
+        let aiLocked = (settings["claudeProxyLockEnabled"] as? Bool) ?? false
+        let forceRestore = trayController?.forceRestoreProxyOnQuit ?? false
+        let headless = (trayController?.headlessQuitOnTerminate ?? false) || poweringOff || smokeTestMs > 0
+
+        if aiLocked && client.isConnected && !forceRestore && !headless && !quitPromptConfirmed {
+            isPromptingQuit = true
+            client.call(method: "list_running_ai_clients", timeoutSeconds: 2) { [weak self] ok, data, _, _ in
+                guard let self else { return }
+                var names: [String] = []
+                if ok, let dict = data as? [String: Any], let rawNames = dict["names"] as? [String] {
+                    names = rawNames.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                }
+
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = L("退出 ClashFX（AI 专用锁定已开启）", "Quit ClashFX (AI Proxy Lock Active)")
+                if !names.isEmpty {
+                    let zhList = names.joined(separator: "、")
+                    let enList = names.joined(separator: ", ")
+                    alert.informativeText = L(
+                        "检测到正在运行的受保护 AI 工具：\(zhList)。\n\n退出 ClashFX 将自动关闭系统代理并恢复本机直连上网。是否先关闭这些 AI 工具，防止它们在退出后直连窜网？",
+                        "Running protected AI tools detected: \(enList).\n\nQuitting ClashFX will turn off System Proxy and restore direct network access. Close these AI tools first so they cannot reconnect directly?"
+                    )
+                } else {
+                    alert.informativeText = L(
+                        "当前已开启 AI 专用锁定（暂未检测到运行中的受保护 AI 工具）。\n\n退出 ClashFX 将自动关闭系统代理并恢复本机直连上网。是否在退出前仍检查并关闭 AI 工具以防窜网？",
+                        "AI Proxy Lock is active (no running protected AI tools currently detected).\n\nQuitting ClashFX will turn off System Proxy and restore direct network access. Check and close any AI tools before exiting?"
+                    )
+                }
+                alert.addButton(withTitle: L("关闭 AI 工具并退出", "Close AI Tools & Quit"))
+                alert.addButton(withTitle: L("仅退出 ClashFX", "Quit ClashFX Only"))
+                alert.addButton(withTitle: L("取消", "Cancel"))
+
+                NSApp.activate(ignoringOtherApps: true)
+                let choice = alert.runModal()
+                self.isPromptingQuit = false
+
+                if choice == .alertThirdButtonReturn {
+                    self.trayController?.resetQuitFlags()
+                    NSApp.reply(toApplicationShouldTerminate: false)
+                    return
+                }
+                self.killAiClientsOnQuit = (choice == .alertFirstButtonReturn)
+                self.quitPromptConfirmed = true
+                self.proceedWithDaemonQuit(client: client)
+            }
+            return .terminateLater
+        }
+
+        proceedWithDaemonQuit(client: client)
+        return .terminateLater
+    }
+
+    private func proceedWithDaemonQuit(client: DaemonClient) {
+        if isTerminating {
+            return
+        }
         isTerminating = true
+        trayController?.stopTrafficStreamForQuit()
+        consoleWindow?.setAllowClose(true)
         client.stopReconnect()
 
         var params: [String: Any] = [:]
         if trayController?.forceRestoreProxyOnQuit == true {
             params["force_restore_proxy"] = true
+        }
+        if killAiClientsOnQuit {
+            params["kill_ai_clients"] = true
         }
 
         var replied = false
@@ -127,13 +204,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             finishTermination()
         }
-        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
             self.wakeObserver = nil
+        }
+        if let powerOffObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(powerOffObserver)
+            self.powerOffObserver = nil
         }
         stopControlSocket()
         if instanceLockFd >= 0 {

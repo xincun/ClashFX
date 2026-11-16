@@ -257,6 +257,9 @@ func (e *Engine) Start(ctx context.Context) error {
 		settings = e.store.Settings()
 	}
 
+	// Clean stale legacy 198.18.0.2 DNS left by pre-unified ClashFX Helper versions.
+	_, _ = sysproxy.CleanLegacyTunDNS()
+
 	// Recover previous crashed session's system proxy if effective runtime doesn't want system proxy now
 	_, _ = e.sysProxy.RecoverAfterUncleanShutdown(e.effectiveRuntimeSettings(settings).SystemProxyEnabled)
 
@@ -304,11 +307,20 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
+type ShutdownOptions struct {
+	ForceRestoreProxy bool
+	KillAIClients     bool
+}
+
 func (e *Engine) Shutdown() {
-	e.ShutdownWithForceRestore(false)
+	e.ShutdownWithOptions(ShutdownOptions{})
 }
 
 func (e *Engine) ShutdownWithForceRestore(forceRestore bool) {
+	e.ShutdownWithOptions(ShutdownOptions{ForceRestoreProxy: forceRestore})
+}
+
+func (e *Engine) ShutdownWithOptions(opts ShutdownOptions) {
 	select {
 	case <-e.stopBgCh:
 		return
@@ -321,14 +333,20 @@ func (e *Engine) ShutdownWithForceRestore(forceRestore bool) {
 	}
 	e.nodeCoord.Stop()
 
-	settings := e.store.Settings()
+	cfgDir := e.store.ActiveConfigDir()
 	e.store.Close()
 
-	if forceRestore {
+	// Terminate protected AI clients BEFORE restoring OS proxy or stopping TUN so
+	// they cannot leak onto a direct network connection during teardown.
+	if opts.KillAIClients {
+		_, _ = ailock.TerminateRunningAIClients(cfgDir)
+	}
+
+	if opts.ForceRestoreProxy {
 		_ = e.sysProxy.CleanupForUninstall()
 		_ = SetLaunchAtLogin(false, "")
 	} else {
-		_ = e.sysProxy.Shutdown(settings.AILockEnabled)
+		_ = e.sysProxy.Shutdown(false)
 	}
 
 	_ = e.localRunner.Stop()
@@ -336,6 +354,10 @@ func (e *Engine) ShutdownWithForceRestore(forceRestore bool) {
 	if viaSvc {
 		_, _ = callService(5*time.Second, service.Request{Action: "stop_core"})
 	}
+}
+
+func (e *Engine) ListRunningAIClients() ailock.RunningAIClientsResult {
+	return ailock.ListRunningAIClients(e.store.ActiveConfigDir())
 }
 
 // CleanupUninstallState unconditionally clears any ClashFX-managed system proxy snapshot,
@@ -693,7 +715,7 @@ func (e *Engine) backgroundMaintenanceLoop() {
 			}
 			lastAutoSubAt = time.Now()
 			for _, sub := range e.subMgr.List() {
-				_, _ = e.subMgr.Refresh(context.Background(), sub.Name, 0)
+				_, _ = e.refreshSubscriptionSmart(context.Background(), sub.Name)
 			}
 			_, _ = e.applyAndSync(context.Background(), false, false)
 		}
@@ -1059,6 +1081,25 @@ func (e *Engine) activeLocalProxyPort() int {
 		return rt.MixedPort
 	}
 	return 0
+}
+
+func (e *Engine) activeDirectRefreshPort() int {
+	if !e.IsCoreRunning() {
+		return 0
+	}
+	settings := e.store.Settings()
+	if settings.EnhancedMode && settings.CustomConfigAsIs {
+		return 0
+	}
+	_, directPtr, _, err := e.nodeStore.ActiveBindings(settings.SelectedProfile)
+	if err == nil && directPtr != nil && *directPtr > 0 {
+		return *directPtr
+	}
+	return 0
+}
+
+func (e *Engine) refreshSubscriptionSmart(ctx context.Context, name string) (subscription.ManagedSubscription, error) {
+	return e.subMgr.RefreshWithFallback(ctx, name, e.activeLocalProxyPort(), e.activeDirectRefreshPort())
 }
 
 func (e *Engine) loadProviderProxiesForNodeServices(rawRoot map[string]any) []nodeservices.ProviderProxy {
@@ -1736,7 +1777,7 @@ func (e *Engine) UpsertSubscription(ctx context.Context, name, rawURL, userAgent
 			break
 		}
 	}
-	updated, err := e.subMgr.Refresh(ctx, sub.Name, 0)
+	updated, err := e.refreshSubscriptionSmart(ctx, sub.Name)
 	if err != nil {
 		if !wasExisting {
 			if _, statErr := os.Stat(e.store.ProfilePath(sub.Name)); os.IsNotExist(statErr) {
@@ -1761,7 +1802,7 @@ func (e *Engine) UpsertSubscription(ctx context.Context, name, rawURL, userAgent
 }
 
 func (e *Engine) RefreshSubscription(ctx context.Context, name string) (subscription.ManagedSubscription, error) {
-	updated, err := e.subMgr.Refresh(ctx, name, 0)
+	updated, err := e.refreshSubscriptionSmart(ctx, name)
 	if err != nil {
 		return subscription.ManagedSubscription{}, err
 	}

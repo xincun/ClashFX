@@ -28,7 +28,7 @@ if pgrep -f '/Applications/ClashFX.app/Contents/MacOS/ClashFX' >/dev/null 2>&1; 
     touch "$MARKER"
     chmod 600 "$MARKER"
     if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ -n "$CONSOLE_UID" ]; then
-        launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" osascript -e 'tell application id "com.clashfx.app" to quit' >/dev/null 2>&1 || true
+        launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" "/Applications/ClashFX.app/Contents/MacOS/ClashFX" --quit >/dev/null 2>&1 || true
     fi
     for _ in $(seq 1 15); do
         if ! pgrep -f '/Applications/ClashFX.app/Contents/MacOS/ClashFX' >/dev/null 2>&1; then
@@ -36,6 +36,10 @@ if pgrep -f '/Applications/ClashFX.app/Contents/MacOS/ClashFX' >/dev/null 2>&1; 
         fi
         sleep 0.2
     done
+    if pgrep -f '/Applications/ClashFX.app/Contents/MacOS/ClashFX' >/dev/null 2>&1 && [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ -n "$CONSOLE_UID" ]; then
+        launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" osascript -e 'tell application id "com.clashfx.app" to quit' >/dev/null 2>&1 || true
+        sleep 0.4
+    fi
     pkill -TERM -f '/Applications/ClashFX.app/Contents/MacOS/(ClashFX|clashfx-daemon)' >/dev/null 2>&1 || true
     sleep 0.3
 fi

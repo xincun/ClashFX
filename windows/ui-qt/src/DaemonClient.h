@@ -32,7 +32,7 @@ public:
 
     void start();
     void stopReconnect();
-    bool sendQuitDaemonSync(bool forceRestoreProxy = false, int timeoutMs = 600);
+    bool sendQuitDaemonSync(bool forceRestoreProxy = false, int timeoutMs = 600, bool killAiClients = false);
 
     bool isConnected() const;
     QJsonObject snapshot() const { return snapshot_; }

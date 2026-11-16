@@ -117,17 +117,23 @@ func TestSystemProxyLifecycleCrashRecoveryAILockAndWakeHeal(t *testing.T) {
 		t.Fatalf("ReconcileIfExpected idempotent check = (%v, %v), want (false, nil)", repaired, err)
 	}
 
-	// 3. Simulate AI Proxy Lock fail-closed exit: Shutdown(true) leaves proxy pointing at 127.0.0.1:7890!
+	// 3. Graceful Shutdown always restores pre-ClashFX proxy settings (even when AI Proxy Lock is active)
 	if err := mgr.Shutdown(true); err != nil {
 		t.Fatal(err)
 	}
 	st, _ = backend.ReadState()
-	if st.ProxyEnable != 1 || st.ProxyServer != "127.0.0.1:7890" {
-		t.Fatalf("AI Lock fail-closed Shutdown(true) should keep 127.0.0.1:7890, got %+v", st)
+	if st != initial {
+		t.Fatalf("graceful Shutdown(true) should restore initial %+v, got %+v", initial, st)
+	}
+	if _, err := os.Stat(filepath.Join(appDir, SnapshotFileName)); !os.IsNotExist(err) {
+		t.Fatalf("expected snapshot removed after graceful Shutdown, stat err=%v", err)
 	}
 
 	// 4. Simulate hard-kill crash recovery on next launch when wantsSystemProxy=false:
 	// must restore the original corporate PAC + corp-proxy settings!
+	if err := mgr.Apply(7890, ""); err != nil {
+		t.Fatal(err)
+	}
 	mgrAfterCrash := NewManager(appDir, backend)
 	recovered, err := mgrAfterCrash.RecoverAfterUncleanShutdown(false)
 	if err != nil || !recovered {
@@ -150,12 +156,11 @@ func TestSystemProxyLifecycleCrashRecoveryAILockAndWakeHeal(t *testing.T) {
 		t.Fatalf("ForceClearAll left residual proxy settings: %+v", cleared)
 	}
 
-	// 6. Simulate uninstall after AI Lock Shutdown(true): CleanupForUninstall must restore unconditionally!
+	// 6. Simulate uninstall after active proxy apply: CleanupForUninstall must restore unconditionally!
 	_ = backend.WriteState(initial)
 	if err := mgrAfterCrash.Apply(7890, ""); err != nil {
 		t.Fatal(err)
 	}
-	_ = mgrAfterCrash.Shutdown(true) // leaves 127.0.0.1:7890 enabled
 	if err := mgrAfterCrash.CleanupForUninstall(); err != nil {
 		t.Fatal(err)
 	}

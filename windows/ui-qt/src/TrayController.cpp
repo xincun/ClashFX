@@ -15,10 +15,15 @@
 #include <QJsonDocument>
 #include <QLocalSocket>
 #include <QMessageBox>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPushButton>
 #include <QTimer>
 #include <QUrl>
 #include <algorithm>
+#include <array>
+#include <cmath>
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -53,6 +58,34 @@ QString formatTrafficBytes(qint64 bytes) {
     }
     const double mb = static_cast<double>(bytes) / (1024.0 * 1024.0);
     return QString::number(mb, 'f', 1) + QStringLiteral(" MB");
+}
+
+QString formatSpeedRate(qint64 bytesPerSec) {
+    static const std::array<const char*, 5> units = {"B/s", "KB/s", "MB/s", "GB/s", "TB/s"};
+    static const std::array<double, 5> scales = {
+        1.0,
+        1024.0,
+        1024.0 * 1024.0,
+        1024.0 * 1024.0 * 1024.0,
+        1024.0 * 1024.0 * 1024.0 * 1024.0,
+    };
+    const qint64 valueBytes = qMax<qint64>(0, bytesPerSec);
+    if (valueBytes < 1000) {
+        return QString::number(valueBytes) + QLatin1String(units[0]);
+    }
+    size_t idx = 0;
+    while (idx + 1 < units.size() && static_cast<double>(valueBytes) / scales[idx] >= 1000.0) {
+        ++idx;
+    }
+    double scaled = static_cast<double>(valueBytes) / scales[idx];
+    if (std::round(scaled) >= 1000.0 && idx + 1 < units.size()) {
+        ++idx;
+        scaled = static_cast<double>(valueBytes) / scales[idx];
+    }
+    if (scaled < 9.95) {
+        return QString::number(scaled, 'f', 1) + QLatin1String(units[idx]);
+    }
+    return QString::number(std::round(scaled), 'f', 0) + QLatin1String(units[idx]);
 }
 
 QString buildTopSubscriptionStatusText(const QString& profileName, const QJsonObject& subInfo) {
@@ -111,6 +144,10 @@ TrayController::TrayController(DaemonClient* client,
     , uiServerName_(uiServerName) {
     hotkeys_ = new HotkeyManager(this);
     consoleWindow_ = new ConsoleWindow(client_);
+    netMgr_ = new QNetworkAccessManager(this);
+    trafficReconnectTimer_ = new QTimer(this);
+    trafficReconnectTimer_->setSingleShot(true);
+    connect(trafficReconnectTimer_, &QTimer::timeout, this, &TrayController::syncTrafficStream);
     trayMenu_ = new QMenu();
     trayIcon_ = new QSystemTrayIcon(TrayIconGenerator::generate(QStringLiteral("default"),
                                                                 TrayVisualState::Disconnected,
@@ -151,7 +188,7 @@ TrayController::TrayController(DaemonClient* client,
         }
         if (!daemonQuitSent_ && client_) {
             daemonQuitSent_ = true;
-            client_->sendQuitDaemonSync(forceRestoreOnQuit_, 500);
+            client_->sendQuitDaemonSync(forceRestoreOnQuit_, 500, killAiClientsOnQuit_);
         }
     });
 
@@ -163,6 +200,7 @@ TrayController::TrayController(DaemonClient* client,
 }
 
 TrayController::~TrayController() {
+    stopTrafficStream(false);
     if (consoleWindow_) {
         consoleWindow_->setAllowClose(true);
         delete consoleWindow_;
@@ -330,6 +368,7 @@ QByteArray TrayController::buildMenuSignature() const {
     sig.insert(QStringLiteral("core_running"), snapshot_.value(QStringLiteral("core_running")).toBool(false));
     sig.insert(QStringLiteral("lang"), I18n::instance().language());
     sig.insert(QStringLiteral("preset"), settings.value(QStringLiteral("tray_icon_preset")));
+    sig.insert(QStringLiteral("show_speed"), settings.value(QStringLiteral("show_tray_speed")).toBool(true));
     sig.insert(QStringLiteral("sys"), settings.value(QStringLiteral("system_proxy_enabled")));
     sig.insert(QStringLiteral("tun"), settings.value(QStringLiteral("enhanced_mode")));
     sig.insert(QStringLiteral("ai_en"), settings.value(QStringLiteral("claudeProxyLockEnabled")));
@@ -389,6 +428,156 @@ void TrayController::handleConfigMutationResult(const QString& actionTitle,
     trayIcon_->showMessage(QStringLiteral("ClashFX"), actionTitle + QStringLiteral(": ") + localizedErr, QSystemTrayIcon::Warning);
 }
 
+bool TrayController::isTraySpeedEnabled() const {
+    const QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
+    if (!settings.contains(QStringLiteral("show_tray_speed"))) {
+        return true;
+    }
+    return settings.value(QStringLiteral("show_tray_speed")).toBool(true);
+}
+
+bool TrayController::shouldStreamTraffic() const {
+    const QJsonObject runtime = snapshot_.value(QStringLiteral("runtime")).toObject();
+    const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
+    const int apiPort = runtime.value(QStringLiteral("api_port")).toInt(0);
+    return connected_ && coreRunning && apiPort > 0 && isTraySpeedEnabled();
+}
+
+QString TrayController::formatMenuSpeedTitle() const {
+    const QString upStr = formatSpeedRate(liveUpRate_);
+    const QString downStr = formatSpeedRate(liveDownRate_);
+    return L("代理速率: ", "Proxy Speed: ") + QStringLiteral("↑ %1   ↓ %2").arg(upStr, downStr);
+}
+
+QString TrayController::buildEffectiveTooltip() const {
+    QString base = TrayIconGenerator::buildTooltip(connected_, snapshot_);
+    const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
+    if (!connected_ || snapshot_.isEmpty() || !coreRunning || !isTraySpeedEnabled()) {
+        return base;
+    }
+    const QString speedLine = L("代理速率: ", "Speed: ") +
+                              QStringLiteral("↑ %1  ↓ %2")
+                                  .arg(formatSpeedRate(liveUpRate_), formatSpeedRate(liveDownRate_));
+    QStringList lines = base.split(QLatin1Char('\n'));
+    if (!lines.isEmpty()) {
+        lines.insert(1, speedLine);
+    } else {
+        lines << speedLine;
+    }
+    QString full = lines.join(QLatin1Char('\n'));
+    if (full.size() > 124) {
+        full = full.left(121) + QStringLiteral("...");
+    }
+    return full;
+}
+
+void TrayController::syncTrafficStream() {
+    const QJsonObject runtime = snapshot_.value(QStringLiteral("runtime")).toObject();
+    const int apiPort = runtime.value(QStringLiteral("api_port")).toInt(0);
+    const QString secret = runtime.value(QStringLiteral("api_secret")).toString();
+    if (!shouldStreamTraffic() || apiPort <= 0) {
+        stopTrafficStream(true);
+        return;
+    }
+    if (trafficReply_ && activeTrafficPort_ == apiPort && activeTrafficSecret_ == secret) {
+        return;
+    }
+    startTrafficStream(apiPort, secret);
+}
+
+void TrayController::startTrafficStream(int apiPort, const QString& secret) {
+    stopTrafficStream(false);
+    if (!netMgr_ || apiPort <= 0) {
+        return;
+    }
+
+    activeTrafficPort_ = apiPort;
+    activeTrafficSecret_ = secret;
+
+    QNetworkRequest req(QUrl(QStringLiteral("http://127.0.0.1:%1/traffic").arg(apiPort)));
+    if (!secret.isEmpty()) {
+        req.setRawHeader("Authorization", QByteArray("Bearer ") + secret.toUtf8());
+    }
+
+    QNetworkReply* reply = netMgr_->get(req);
+    trafficReply_ = reply;
+
+    connect(reply, &QNetworkReply::readyRead, this, [this, reply]() {
+        if (!reply || reply != trafficReply_) {
+            return;
+        }
+        trafficBuffer_.append(reply->readAll());
+        bool gotUpdate = false;
+        while (true) {
+            const int nl = trafficBuffer_.indexOf('\n');
+            if (nl < 0) {
+                break;
+            }
+            const QByteArray line = trafficBuffer_.left(nl).trimmed();
+            trafficBuffer_.remove(0, nl + 1);
+            if (line.isEmpty()) {
+                continue;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(line);
+            if (!doc.isObject()) {
+                continue;
+            }
+            const QJsonObject obj = doc.object();
+            liveUpRate_ = static_cast<qint64>(obj.value(QStringLiteral("up")).toDouble(0));
+            liveDownRate_ = static_cast<qint64>(obj.value(QStringLiteral("down")).toDouble(0));
+            gotUpdate = true;
+        }
+        if (gotUpdate) {
+            updateLiveSpeedDisplay();
+        }
+    });
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        if (trafficReply_ == reply) {
+            trafficReply_ = nullptr;
+            activeTrafficPort_ = 0;
+            activeTrafficSecret_.clear();
+            liveUpRate_ = 0;
+            liveDownRate_ = 0;
+            updateLiveSpeedDisplay();
+            if (shouldStreamTraffic() && trafficReconnectTimer_) {
+                trafficReconnectTimer_->start(1500);
+            }
+        }
+        reply->deleteLater();
+    });
+}
+
+void TrayController::stopTrafficStream(bool resetRates) {
+    if (trafficReconnectTimer_) {
+        trafficReconnectTimer_->stop();
+    }
+    if (trafficReply_) {
+        trafficReply_->disconnect(this);
+        trafficReply_->abort();
+        trafficReply_->deleteLater();
+        trafficReply_ = nullptr;
+    }
+    trafficBuffer_.clear();
+    activeTrafficPort_ = 0;
+    activeTrafficSecret_.clear();
+    if (resetRates) {
+        liveUpRate_ = 0;
+        liveDownRate_ = 0;
+    }
+}
+
+void TrayController::updateLiveSpeedDisplay() {
+    if (liveSpeedAction_) {
+        liveSpeedAction_->setText(formatMenuSpeedTitle());
+    }
+    const QString tooltip = buildEffectiveTooltip();
+    if (tooltip != lastTooltip_) {
+        lastTooltip_ = tooltip;
+        trayIcon_->setToolTip(tooltip);
+    }
+}
+
 void TrayController::rebuildTrayVisualsAndMenu(bool forceMenu) {
     const QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
     const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
@@ -416,11 +605,8 @@ void TrayController::rebuildTrayVisualsAndMenu(bool forceMenu) {
         trayIcon_->setIcon(TrayIconGenerator::generate(preset, vis, aiLocked));
     }
 
-    const QString tooltip = TrayIconGenerator::buildTooltip(connected_, snapshot_);
-    if (tooltip != lastTooltip_) {
-        lastTooltip_ = tooltip;
-        trayIcon_->setToolTip(tooltip);
-    }
+    syncTrafficStream();
+    updateLiveSpeedDisplay();
 
     const QByteArray nextSig = buildMenuSignature();
     if (!forceMenu && !menuDirty_ && nextSig == lastMenuSig_) {
@@ -439,6 +625,7 @@ void TrayController::rebuildMenuContents() {
     const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
 
     const QString preset = settings.value(QStringLiteral("tray_icon_preset")).toString(QStringLiteral("default"));
+    const bool showSpeed = isTraySpeedEnabled();
     const bool sysProxy = settings.value(QStringLiteral("system_proxy_enabled")).toBool(false);
     const bool enhanced = settings.value(QStringLiteral("enhanced_mode")).toBool(false);
     const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
@@ -449,6 +636,7 @@ void TrayController::rebuildMenuContents() {
 
     lastMenuSig_ = buildMenuSignature();
     menuDirty_ = false;
+    liveSpeedAction_.clear();
 
     const auto oldSubMenus = trayMenu_->findChildren<QMenu*>(QString(), Qt::FindDirectChildrenOnly);
     trayMenu_->clear();
@@ -463,12 +651,23 @@ void TrayController::rebuildMenuContents() {
         trayMenu_->addSeparator();
     }
 
-    // 0. Top subscription quota & expiry status row (aligned with macOS ClashFX)
+    // 0. Live proxy speed & top subscription quota/expiry status row
+    bool hasTopStatus = false;
+    if (showSpeed && coreRunning) {
+        QAction* speedAct = trayMenu_->addAction(formatMenuSpeedTitle());
+        speedAct->setEnabled(false);
+        liveSpeedAction_ = speedAct;
+        hasTopStatus = true;
+    }
+
     const QJsonObject activeSubInfo = snapshot_.value(QStringLiteral("active_subscription_info")).toObject();
     const QString subStatusLine = buildTopSubscriptionStatusText(selProfile, activeSubInfo);
     if (!subStatusLine.isEmpty()) {
         QAction* subStatusAct = trayMenu_->addAction(subStatusLine);
         subStatusAct->setEnabled(false);
+        hasTopStatus = true;
+    }
+    if (hasTopStatus) {
         trayMenu_->addSeparator();
     }
 
@@ -803,16 +1002,18 @@ void TrayController::rebuildMenuContents() {
     settingsMenu->addAction(L("偏好设置…", "Preferences…"), this, &TrayController::openSettingsDialog);
     settingsMenu->addSeparator();
 
-    auto addToggleSetting = [&](const QString& title, const QString& jsonKey) {
+    auto addToggleSetting = [&](const QString& title, const QString& jsonKey, bool defaultVal = false) {
         QAction* act = settingsMenu->addAction(title);
         act->setCheckable(true);
-        act->setChecked(settings.value(jsonKey).toBool(false));
+        const bool checked = settings.contains(jsonKey) ? settings.value(jsonKey).toBool(defaultVal) : defaultVal;
+        act->setChecked(checked);
         act->setEnabled(connected_);
         connect(act, &QAction::triggered, this, [this, jsonKey](bool checked) {
             mutateSettingBool(jsonKey, checked);
         });
     };
 
+    addToggleSetting(L("显示 ClashFX 代理速率", "Show Proxy Speed"), QStringLiteral("show_tray_speed"), true);
     addToggleSetting(L("允许局域网连接 (Allow LAN)", "Allow LAN"), QStringLiteral("allow_lan"));
     addToggleSetting(L("启用 IPv6", "Enable IPv6"), QStringLiteral("ipv6"));
     addToggleSetting(L("绕过常用国内应用", "Bypass Common Chinese Apps"), QStringLiteral("bypass_cn_apps"));
@@ -867,7 +1068,7 @@ void TrayController::rebuildMenuContents() {
     helpMenu->addAction(L("关于 ClashFX", "About ClashFX"), this, &TrayController::showAboutBox);
 
     trayMenu_->addSeparator();
-    trayMenu_->addAction(L("退出 ClashFX", "Quit ClashFX"), this, [this]() { quitAll(false); });
+    trayMenu_->addAction(L("退出 ClashFX", "Quit ClashFX"), this, &TrayController::requestInteractiveQuit);
 }
 
 void TrayController::mutateSettingBool(const QString& key, bool value) {
@@ -1041,9 +1242,70 @@ void TrayController::openSettingsDialog() {
     consoleWindow_->presentWindow();
 }
 
-void TrayController::quitAll(bool forceRestoreProxy) {
+void TrayController::requestInteractiveQuit() {
+    if (promptingQuit_) {
+        return;
+    }
+    const QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
+    const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
+    if (!aiLocked || !connected_ || !client_) {
+        quitAll(false, false);
+        return;
+    }
+
+    promptingQuit_ = true;
+    client_->call(QStringLiteral("list_running_ai_clients"), QJsonObject(),
+                  [this](bool ok, const QJsonValue& data, const QString&, const QString&) {
+        promptingQuit_ = false;
+
+        QStringList names;
+        if (ok && data.isObject()) {
+            const QJsonArray arr = data.toObject().value(QStringLiteral("names")).toArray();
+            for (const QJsonValue& v : arr) {
+                const QString n = v.toString().trimmed();
+                if (!n.isEmpty()) {
+                    names.append(n);
+                }
+            }
+        }
+
+        QMessageBox box(modalDialogParent());
+        box.setIcon(QMessageBox::Warning);
+        box.setWindowTitle(L("退出 ClashFX（AI 专用锁定已开启）", "Quit ClashFX (AI Proxy Lock Active)"));
+        if (!names.isEmpty()) {
+            const QString zhList = names.join(QStringLiteral("、"));
+            const QString enList = names.join(QStringLiteral(", "));
+            box.setText(L("检测到正在运行的受保护 AI 工具：", "Running protected AI tools detected: ")
+                        + (I18n::instance().isChinese() ? zhList : enList)
+                        + L("。\n\n退出 ClashFX 将自动关闭系统代理并恢复本机直连上网。是否先关闭这些 AI 工具，防止它们在退出后直连窜网？",
+                            ".\n\nQuitting ClashFX will turn off System Proxy and restore direct network access. Close these AI tools first so they cannot reconnect directly?"));
+        } else {
+            box.setText(L("当前已开启 AI 专用锁定（暂未检测到运行中的受保护 AI 工具）。\n\n退出 ClashFX 将自动关闭系统代理并恢复本机直连上网。是否在退出前仍检查并关闭 AI 工具以防窜网？",
+                          "AI Proxy Lock is active (no running protected AI tools currently detected).\n\nQuitting ClashFX will turn off System Proxy and restore direct network access. Check and close any AI tools before exiting?"));
+        }
+
+        QPushButton* closeAiBtn = box.addButton(L("关闭 AI 工具并退出", "Close AI Tools & Quit"), QMessageBox::AcceptRole);
+        QPushButton* quitOnlyBtn = box.addButton(L("仅退出 ClashFX", "Quit ClashFX Only"), QMessageBox::DestructiveRole);
+        QPushButton* cancelBtn = box.addButton(L("取消", "Cancel"), QMessageBox::RejectRole);
+        box.setDefaultButton(closeAiBtn);
+        box.setEscapeButton(cancelBtn);
+        box.exec();
+
+        if (box.clickedButton() == closeAiBtn) {
+            quitAll(false, true);
+        } else if (box.clickedButton() == quitOnlyBtn) {
+            quitAll(false, false);
+        }
+    });
+}
+
+void TrayController::quitAll(bool forceRestoreProxy, bool killAiClients) {
+    stopTrafficStream(false);
     if (forceRestoreProxy) {
         forceRestoreOnQuit_ = true;
+    }
+    if (killAiClients) {
+        killAiClientsOnQuit_ = true;
     }
     if (consoleWindow_) {
         consoleWindow_->setAllowClose(true);
@@ -1056,6 +1318,9 @@ void TrayController::quitAll(bool forceRestoreProxy) {
         if (forceRestoreOnQuit_) {
             params.insert(QStringLiteral("force_restore_proxy"), true);
         }
+        if (killAiClientsOnQuit_) {
+            params.insert(QStringLiteral("kill_ai_clients"), true);
+        }
         client_->call(QStringLiteral("quit_daemon"), params, [](bool, const QJsonValue&, const QString&, const QString&) {
             QTimer::singleShot(120, qApp, &QCoreApplication::quit);
         });
@@ -1063,7 +1328,7 @@ void TrayController::quitAll(bool forceRestoreProxy) {
     } else {
         if (client_) {
             daemonQuitSent_ = true;
-            client_->sendQuitDaemonSync(forceRestoreOnQuit_, 500);
+            client_->sendQuitDaemonSync(forceRestoreOnQuit_, 500, killAiClientsOnQuit_);
         }
         QCoreApplication::quit();
     }

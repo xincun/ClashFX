@@ -233,8 +233,25 @@ func TestOutOfTheBoxDefaultSettingsAndMixin(t *testing.T) {
 	if !st.AutoUpdateSubs {
 		t.Fatalf("expected AutoUpdateSubs=true by default")
 	}
+	if !st.ShowTraySpeed {
+		t.Fatalf("expected ShowTraySpeed=true by default")
+	}
 	if strings.TrimSpace(st.ProxyBypassList) == "" {
 		t.Fatalf("expected non-empty default ProxyBypassList")
+	}
+
+	// Loading an existing settings.json that omits show_tray_speed must default ShowTraySpeed=true.
+	legacyJSONDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(legacyJSONDir, "settings.json"), []byte(`{"selected_profile":"config"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	legacyStore, err := NewStore(legacyJSONDir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyStore.Close()
+	if !legacyStore.Settings().ShowTraySpeed {
+		t.Fatalf("expected missing show_tray_speed in existing settings.json to default true")
 	}
 
 	rawMixin, err := store.ReadProfileMixinBytes()

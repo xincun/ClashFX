@@ -1,7 +1,7 @@
 import Cocoa
 import Foundation
 
-final class TrayController: NSObject, NSMenuDelegate {
+final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
     private let client: DaemonClient
     private let consoleWindow: ConsoleWindowController
     private let hotkeys = HotkeyManager()
@@ -13,13 +13,37 @@ final class TrayController: NSObject, NSMenuDelegate {
     private var isMenuOpen = false
     private var menuDirty = false
     private var lastIconKey = ""
+    private var cachedPillIcon: NSImage?
+    private var lastVisualKey = ""
     private var lastTooltip = ""
     private var lastMenuSig = ""
     private var i18nObserverID: UUID?
     private(set) var forceRestoreProxyOnQuit = false
+    private(set) var headlessQuitOnTerminate = false
+
+    private var liveUpRate: Int64 = 0
+    private var liveDownRate: Int64 = 0
+    private var trafficSession: URLSession?
+    private var trafficTask: URLSessionDataTask?
+    private var trafficBuffer = Data()
+    private var activeTrafficPort = 0
+    private var activeTrafficSecret = ""
+    private var trafficReconnectWork: DispatchWorkItem?
+    private weak var liveSpeedMenuItem: NSMenuItem?
 
     private var nextTag = 100
     private var actionMap: [Int: () -> Void] = [:]
+
+    private static let speedUnits = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"]
+    private static let speedScales: [Double] = [
+        1.0,
+        1024.0,
+        1024.0 * 1024.0,
+        1024.0 * 1024.0 * 1024.0,
+        1024.0 * 1024.0 * 1024.0 * 1024.0,
+    ]
+    private static let speedFont = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .medium)
+    private static let speedSampleText = "999.9KB/s"
 
     init(client: DaemonClient, consoleWindow: ConsoleWindowController, showConsoleInitially: Bool) {
         self.client = client
@@ -51,6 +75,7 @@ final class TrayController: NSObject, NSMenuDelegate {
     }
 
     deinit {
+        stopTrafficStream(resetRates: false)
         if let id = i18nObserverID {
             _ = id
         }
@@ -131,9 +156,9 @@ final class TrayController: NSObject, NSMenuDelegate {
         } else if message == "--open-settings" {
             openSettingsDialog()
         } else if message == "--quit" {
-            quitAll(forceRestoreProxy: false)
+            quitAll(forceRestoreProxy: false, headless: true)
         } else if message == "--quit-uninstall" {
-            quitAll(forceRestoreProxy: true)
+            quitAll(forceRestoreProxy: true, headless: true)
         } else if message.lowercased().hasPrefix("clash://") || message.lowercased().hasPrefix("clashfx://") {
             importSchemeUri(message)
         }
@@ -203,12 +228,23 @@ final class TrayController: NSObject, NSMenuDelegate {
         }
     }
 
-    func quitAll(forceRestoreProxy: Bool) {
+    func quitAll(forceRestoreProxy: Bool, headless: Bool = false) {
         if forceRestoreProxy {
             forceRestoreProxyOnQuit = true
         }
-        consoleWindow.setAllowClose(true)
+        if headless {
+            headlessQuitOnTerminate = true
+        }
         NSApp.terminate(nil)
+    }
+
+    func resetQuitFlags() {
+        forceRestoreProxyOnQuit = false
+        headlessQuitOnTerminate = false
+    }
+
+    func stopTrafficStreamForQuit() {
+        stopTrafficStream(resetRates: false)
     }
 
     // MARK: - Hotkeys
@@ -268,6 +304,144 @@ final class TrayController: NSObject, NSMenuDelegate {
         case enhancedTun = 3
     }
 
+    private func isTraySpeedEnabled() -> Bool {
+        let settings = (snapshot["settings"] as? [String: Any]) ?? [:]
+        return (settings["show_tray_speed"] as? Bool) ?? true
+    }
+
+    private func shouldStreamTraffic() -> Bool {
+        let runtime = (snapshot["runtime"] as? [String: Any]) ?? [:]
+        let coreRunning = (snapshot["core_running"] as? Bool) ?? false
+        let apiPort = (runtime["api_port"] as? Int) ?? 0
+        return connected && coreRunning && apiPort > 0 && isTraySpeedEnabled()
+    }
+
+    private func formatMenuBarSpeed(_ bytesPerSec: Int64) -> String {
+        let valueBytes = max(bytesPerSec, 0)
+        if valueBytes < 1000 {
+            return "\(valueBytes)\(Self.speedUnits[0])"
+        }
+        var unitIdx = 0
+        while unitIdx < Self.speedUnits.count - 1,
+              Double(valueBytes) / Self.speedScales[unitIdx] >= 1000.0 {
+            unitIdx += 1
+        }
+        var scaled = Double(valueBytes) / Self.speedScales[unitIdx]
+        if scaled.rounded() >= 1000.0, unitIdx < Self.speedUnits.count - 1 {
+            unitIdx += 1
+            scaled = Double(valueBytes) / Self.speedScales[unitIdx]
+        }
+        if scaled < 9.95 {
+            return String(format: "%.1f%@", scaled, Self.speedUnits[unitIdx])
+        }
+        return String(format: "%.0f%@", scaled.rounded(), Self.speedUnits[unitIdx])
+    }
+
+    private func formatMenuSpeedTitle() -> String {
+        let upStr = formatMenuBarSpeed(liveUpRate)
+        let downStr = formatMenuBarSpeed(liveDownRate)
+        return L("代理速率: ", "Proxy Speed: ") + "↑ \(upStr)   ↓ \(downStr)"
+    }
+
+    private func syncTrafficStream() {
+        let runtime = (snapshot["runtime"] as? [String: Any]) ?? [:]
+        let apiPort = (runtime["api_port"] as? Int) ?? 0
+        let secret = (runtime["api_secret"] as? String) ?? ""
+        guard shouldStreamTraffic(), apiPort > 0 else {
+            stopTrafficStream(resetRates: true)
+            return
+        }
+        if trafficTask != nil && activeTrafficPort == apiPort && activeTrafficSecret == secret {
+            return
+        }
+        startTrafficStream(apiPort: apiPort, secret: secret)
+    }
+
+    private func startTrafficStream(apiPort: Int, secret: String) {
+        stopTrafficStream(resetRates: false)
+        guard let url = URL(string: "http://127.0.0.1:\(apiPort)/traffic") else { return }
+
+        activeTrafficPort = apiPort
+        activeTrafficSecret = secret
+        trafficBuffer.removeAll(keepingCapacity: false)
+
+        let sessionCfg = URLSessionConfiguration.ephemeral
+        sessionCfg.timeoutIntervalForRequest = 0
+        sessionCfg.timeoutIntervalForResource = 0
+        let session = URLSession(configuration: sessionCfg, delegate: self, delegateQueue: .main)
+        trafficSession = session
+
+        var req = URLRequest(url: url)
+        if !secret.isEmpty {
+            req.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+        }
+        let task = session.dataTask(with: req)
+        trafficTask = task
+        task.resume()
+    }
+
+    private func stopTrafficStream(resetRates: Bool) {
+        trafficReconnectWork?.cancel()
+        trafficReconnectWork = nil
+        trafficTask?.cancel()
+        trafficTask = nil
+        trafficSession?.invalidateAndCancel()
+        trafficSession = nil
+        trafficBuffer.removeAll(keepingCapacity: false)
+        activeTrafficPort = 0
+        activeTrafficSecret = ""
+        if resetRates {
+            liveUpRate = 0
+            liveDownRate = 0
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard session === trafficSession else { return }
+        trafficBuffer.append(data)
+        var gotUpdate = false
+        while let nlRange = trafficBuffer.firstRange(of: Data([0x0A])) {
+            let line = trafficBuffer.subdata(in: 0..<nlRange.lowerBound)
+            trafficBuffer.removeSubrange(0..<nlRange.upperBound)
+            guard !line.isEmpty,
+                  let obj = try? JSONSerialization.jsonObject(with: line, options: []) as? [String: Any] else {
+                continue
+            }
+            liveUpRate = (obj["up"] as? NSNumber)?.int64Value ?? 0
+            liveDownRate = (obj["down"] as? NSNumber)?.int64Value ?? 0
+            gotUpdate = true
+        }
+        if gotUpdate {
+            refreshStatusBarVisual()
+            if let item = liveSpeedMenuItem {
+                item.title = formatMenuSpeedTitle()
+            }
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard session === trafficSession else { return }
+        trafficTask = nil
+        trafficSession?.finishTasksAndInvalidate()
+        trafficSession = nil
+        activeTrafficPort = 0
+        activeTrafficSecret = ""
+        liveUpRate = 0
+        liveDownRate = 0
+        refreshStatusBarVisual()
+        if let item = liveSpeedMenuItem {
+            item.title = formatMenuSpeedTitle()
+        }
+        if shouldStreamTraffic() {
+            trafficReconnectWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                self?.syncTrafficStream()
+            }
+            trafficReconnectWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+        }
+    }
+
     private func rebuildVisualsAndMenu(forceMenu: Bool = false) {
         let settings = (snapshot["settings"] as? [String: Any]) ?? [:]
         let coreRunning = (snapshot["core_running"] as? Bool) ?? false
@@ -287,12 +461,13 @@ final class TrayController: NSObject, NSMenuDelegate {
         }
 
         let iconKey = "\(preset)|\(vis.rawValue)|\(aiLocked ? 1 : 0)"
-        if iconKey != lastIconKey {
+        if iconKey != lastIconKey || cachedPillIcon == nil {
             lastIconKey = iconKey
-            if let btn = statusItem.button {
-                btn.image = renderStatusBarImage(preset: preset, state: vis, aiLocked: aiLocked)
-            }
+            cachedPillIcon = renderStatusBarImage(preset: preset, state: vis, aiLocked: aiLocked)
         }
+
+        syncTrafficStream()
+        refreshStatusBarVisual()
 
         let tip = buildTooltip()
         if tip != lastTooltip {
@@ -309,6 +484,74 @@ final class TrayController: NSObject, NSMenuDelegate {
             return
         }
         rebuildMenuContents()
+    }
+
+    private func refreshStatusBarVisual() {
+        guard let btn = statusItem.button, let pillIcon = cachedPillIcon else { return }
+        let showSpeed = isTraySpeedEnabled()
+        if !showSpeed {
+            let key = "\(lastIconKey)|0"
+            if key != lastVisualKey {
+                lastVisualKey = key
+                statusItem.length = NSStatusItem.squareLength
+                btn.image = pillIcon
+            }
+            return
+        }
+
+        let upText = formatMenuBarSpeed(liveUpRate)
+        let downText = formatMenuBarSpeed(liveDownRate)
+        let key = "\(lastIconKey)|1|\(upText)|\(downText)"
+        if key == lastVisualKey {
+            return
+        }
+        lastVisualKey = key
+        statusItem.length = NSStatusItem.variableLength
+        btn.image = renderStatusBarCompositeImage(pillIcon: pillIcon, upText: upText, downText: downText)
+    }
+
+    private func renderStatusBarCompositeImage(pillIcon: NSImage, upText: String, downText: String) -> NSImage {
+        let font = Self.speedFont
+        let baseAttrs: [NSAttributedString.Key: Any] = [.font: font]
+        let sampleW = ceil(("↑ \(Self.speedSampleText)" as NSString).size(withAttributes: baseAttrs).width)
+        let arrowW = max(
+            ceil(("↑" as NSString).size(withAttributes: baseAttrs).width),
+            ceil(("↓" as NSString).size(withAttributes: baseAttrs).width)
+        )
+        let upW = ceil((upText as NSString).size(withAttributes: baseAttrs).width)
+        let downW = ceil((downText as NSString).size(withAttributes: baseAttrs).width)
+        let textColW = max(sampleW, arrowW + 2 + max(upW, downW))
+
+        let iconSize: CGFloat = 18
+        let gap: CGFloat = 4
+        let height: CGFloat = 22
+        let width = iconSize + gap + textColW + 1
+
+        // Draw direct strings + image inside flipped NSImage (never NSTextField)
+        // to avoid the macOS 26+ (Tahoe) NSStatusBarButton infinite redraw CPU bug.
+        let img = NSImage(size: NSSize(width: width, height: height), flipped: true) { rect in
+            pillIcon.draw(
+                in: NSRect(x: 0, y: (height - iconSize) / 2.0, width: iconSize, height: iconSize),
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1.0,
+                respectFlipped: true,
+                hints: nil
+            )
+            let drawAttrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.labelColor,
+            ]
+            let textX = iconSize + gap
+            let rightEdge = rect.width - 1
+            ("↑" as NSString).draw(at: NSPoint(x: textX, y: 0.5), withAttributes: drawAttrs)
+            (upText as NSString).draw(at: NSPoint(x: max(textX + arrowW + 1, rightEdge - upW), y: 0.5), withAttributes: drawAttrs)
+            ("↓" as NSString).draw(at: NSPoint(x: textX, y: 11.0), withAttributes: drawAttrs)
+            (downText as NSString).draw(at: NSPoint(x: max(textX + arrowW + 1, rightEdge - downW), y: 11.0), withAttributes: drawAttrs)
+            return true
+        }
+        img.isTemplate = false
+        return img
     }
 
     private func renderStatusBarImage(preset: String, state: VisualState, aiLocked: Bool) -> NSImage {
@@ -437,6 +680,10 @@ final class TrayController: NSObject, NSMenuDelegate {
         if aiLocked {
             lines.append(L("AI 专用锁定: ", "AI Proxy Lock: ") + aiTarget)
         }
+        if isTraySpeedEnabled() {
+            lines.append(L("仅显示经过 ClashFX 本地代理或增强模式的流量，不代表电脑整体网速。",
+                           "Shows traffic that passes through ClashFX's local proxy or Enhanced Mode, not total system traffic."))
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -450,6 +697,7 @@ final class TrayController: NSObject, NSMenuDelegate {
             "core_running": (snapshot["core_running"] as? Bool) ?? false,
             "lang": I18n.shared.language,
             "preset": settings["tray_icon_preset"] ?? "default",
+            "show_speed": (settings["show_tray_speed"] as? Bool) ?? true,
             "sys": settings["system_proxy_enabled"] ?? false,
             "tun": settings["enhanced_mode"] ?? false,
             "ai_en": settings["claudeProxyLockEnabled"] ?? false,
@@ -510,12 +758,14 @@ final class TrayController: NSObject, NSMenuDelegate {
     private func rebuildMenuContents() {
         actionMap.removeAll()
         nextTag = 100
+        liveSpeedMenuItem = nil
         trayMenu.removeAllItems()
 
         let settings = (snapshot["settings"] as? [String: Any]) ?? [:]
         let runtime = (snapshot["runtime"] as? [String: Any]) ?? [:]
         let coreRunning = (snapshot["core_running"] as? Bool) ?? false
         let preset = (settings["tray_icon_preset"] as? String) ?? "default"
+        let showSpeed = (settings["show_tray_speed"] as? Bool) ?? true
         let sysProxy = (settings["system_proxy_enabled"] as? Bool) ?? false
         let enhanced = (settings["enhanced_mode"] as? Bool) ?? false
         let aiLocked = (settings["claudeProxyLockEnabled"] as? Bool) ?? false
@@ -538,12 +788,18 @@ final class TrayController: NSObject, NSMenuDelegate {
             trayMenu.addItem(.separator())
         }
 
+        if showSpeed && coreRunning {
+            liveSpeedMenuItem = addItem(to: trayMenu, title: formatMenuSpeedTitle(), enabled: false)
+        }
+
         if let subInfo = snapshot["active_subscription_info"] as? [String: Any] {
             let line = buildTopSubscriptionStatusText(profileName: selProfile, subInfo: subInfo)
             if !line.isEmpty {
                 addItem(to: trayMenu, title: line, enabled: false)
-                trayMenu.addItem(.separator())
             }
+        }
+        if trayMenu.numberOfItems > 0 && !((trayMenu.items.last?.isSeparatorItem) ?? true) {
+            trayMenu.addItem(.separator())
         }
 
         addItem(to: trayMenu, title: L("打开控制台 (MetaCubeXD)", "Open Console (MetaCubeXD)"), bold: true) { [weak self] in
@@ -802,15 +1058,16 @@ final class TrayController: NSObject, NSMenuDelegate {
         addItem(to: settingsSub, title: L("偏好设置…", "Preferences…")) { [weak self] in self?.openSettingsDialog() }
         settingsSub.addItem(.separator())
 
-        let toggles: [(String, String)] = [
-            (L("允许局域网连接 (Allow LAN)", "Allow LAN"), "allow_lan"),
-            (L("启用 IPv6", "Enable IPv6"), "ipv6"),
-            (L("绕过常用国内应用", "Bypass Common Chinese Apps"), "bypass_cn_apps"),
-            (L("增强模式按原样使用配置", "Use Custom Config as-is"), "custom_config_as_is"),
-            (L("开机自动启动", "Launch at Login"), "launch_at_login"),
+        let toggles: [(String, String, Bool)] = [
+            (L("显示 ClashFX 代理速率", "Show Proxy Speed"), "show_tray_speed", true),
+            (L("允许局域网连接 (Allow LAN)", "Allow LAN"), "allow_lan", false),
+            (L("启用 IPv6", "Enable IPv6"), "ipv6", false),
+            (L("绕过常用国内应用", "Bypass Common Chinese Apps"), "bypass_cn_apps", false),
+            (L("增强模式按原样使用配置", "Use Custom Config as-is"), "custom_config_as_is", false),
+            (L("开机自动启动", "Launch at Login"), "launch_at_login", false),
         ]
-        for (title, key) in toggles {
-            let cur = (settings[key] as? Bool) ?? false
+        for (title, key, defaultVal) in toggles {
+            let cur = (settings[key] as? Bool) ?? defaultVal
             addItem(to: settingsSub, title: title, enabled: connected, checked: cur) { [weak self] in
                 self?.mutateSetting(key: key, value: !cur)
             }

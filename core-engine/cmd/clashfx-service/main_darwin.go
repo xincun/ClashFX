@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/clashfx/core-engine/internal/service"
+	"github.com/clashfx/core-engine/internal/sysproxy"
 )
 
 func acceptLoop(ln net.Listener, runner *service.Runner) {
@@ -63,6 +64,7 @@ func resolveTrustedDir() (string, error) {
 }
 
 func runDaemon() error {
+	_, _ = sysproxy.CleanLegacyTunDNS()
 	dir, err := resolveTrustedDir()
 	if err != nil {
 		return err
@@ -169,6 +171,7 @@ func retireLegacyDarwinHelper() {
 	}
 	_ = exec.Command("/usr/bin/pkill", "-TERM", "-f", `mihomo_core.*\.enhanced_config`).Run()
 	time.Sleep(250 * time.Millisecond)
+	_, _ = sysproxy.CleanLegacyTunDNS()
 }
 
 const darwinSocketFilterFW = "/usr/libexec/ApplicationFirewall/socketfilterfw"

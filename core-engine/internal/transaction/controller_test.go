@@ -102,12 +102,34 @@ rules:
 		t.Fatalf("expected default Windows NCSI fake-ip-filter in managed TUN config:\n%s", applier.appliedData)
 	}
 	var appliedDoc struct {
+		DNS struct {
+			NameserverPolicy map[string]string `yaml:"nameserver-policy"`
+		} `yaml:"dns"`
+		Rules         []string `yaml:"rules"`
 		RuleProviders map[string]struct {
 			Payload []string `yaml:"payload"`
 		} `yaml:"rule-providers"`
 	}
 	if err := yaml.Unmarshal([]byte(applier.appliedData), &appliedDoc); err != nil {
 		t.Fatalf("unmarshal applied runtime yaml: %v", err)
+	}
+	for _, k := range []string{"captive.apple.com", "+.msftconnecttest.com", "+.msftncsi.com"} {
+		if got := appliedDoc.DNS.NameserverPolicy[k]; got != "system" {
+			t.Fatalf("dns.nameserver-policy[%q] = %q, want \"system\"", k, got)
+		}
+	}
+	if len(appliedDoc.Rules) == 0 || appliedDoc.Rules[0] != "RULE-SET,"+profile.InternalDirectRuleProviderName+",DIRECT" {
+		t.Fatalf("expected %s at rules[0], got %v", profile.InternalDirectRuleProviderName, appliedDoc.Rules)
+	}
+	foundCaptiveDirect := false
+	for _, r := range appliedDoc.Rules {
+		if r == "DOMAIN,captive.apple.com,DIRECT" {
+			foundCaptiveDirect = true
+			break
+		}
+	}
+	if !foundCaptiveDirect {
+		t.Fatalf("expected DOMAIN,captive.apple.com,DIRECT in rules, got %v", appliedDoc.Rules)
 	}
 	wantInternal := []string{"PROCESS-NAME,mihomo_core.exe", "PROCESS-NAME,mihomo_core"}
 	gotInternal := appliedDoc.RuleProviders[profile.InternalDirectRuleProviderName].Payload

@@ -215,11 +215,7 @@ func (m *Manager) Remove(name string, deleteFile bool) error {
 	return nil
 }
 
-// Refresh downloads a managed subscription, converts share links if necessary,
-// validates the resulting YAML, and atomically writes the profile file.
-// When directProxyPort > 0, traffic is pinned through 127.0.0.1:<directProxyPort>
-// (ClashFX's internal DIRECT listener) and never falls back to system proxy.
-func (m *Manager) Refresh(ctx context.Context, name string, directProxyPort int) (ManagedSubscription, error) {
+func (m *Manager) acquireRefresh(name string) (ManagedSubscription, func(), error) {
 	m.mu.Lock()
 	var target *ManagedSubscription
 	for i := range m.subs {
@@ -230,23 +226,97 @@ func (m *Manager) Refresh(ctx context.Context, name string, directProxyPort int)
 	}
 	if target == nil {
 		m.mu.Unlock()
-		return ManagedSubscription{}, fmt.Errorf("managed subscription %q not found", name)
+		return ManagedSubscription{}, nil, fmt.Errorf("managed subscription %q not found", name)
 	}
 	if m.updatingSet[name] {
 		m.mu.Unlock()
-		return ManagedSubscription{}, fmt.Errorf("subscription %q is already updating", name)
+		return ManagedSubscription{}, nil, fmt.Errorf("subscription %q is already updating", name)
 	}
 	subCopy := *target
 	m.updatingSet[name] = true
 	m.mu.Unlock()
 
-	defer func() {
+	release := func() {
 		m.mu.Lock()
 		delete(m.updatingSet, name)
 		m.mu.Unlock()
-	}()
+	}
+	return subCopy, release, nil
+}
 
-	client, err := newSubscriptionHTTPClient(directProxyPort, 60*time.Second)
+// Refresh downloads a managed subscription, converts share links if necessary,
+// validates the resulting YAML, and atomically writes the profile file.
+// When directProxyPort > 0, traffic is pinned through 127.0.0.1:<directProxyPort>
+// (ClashFX's internal DIRECT listener) and never falls back to system proxy.
+func (m *Manager) Refresh(ctx context.Context, name string, directProxyPort int) (ManagedSubscription, error) {
+	subCopy, release, err := m.acquireRefresh(name)
+	if err != nil {
+		return ManagedSubscription{}, err
+	}
+	defer release()
+	return m.refreshAttempt(ctx, subCopy, directProxyPort, 60*time.Second)
+}
+
+// RefreshWithFallback downloads a managed subscription via primaryProxyPort first
+// (e.g. local mixed-port through the active node for GFW-blocked URLs), falls
+// back to directFallbackPort (internal DIRECT listener bypassing TUN/dead nodes),
+// and finally falls back to direct transport (0) if needed.
+func (m *Manager) RefreshWithFallback(ctx context.Context, name string, primaryProxyPort, directFallbackPort int) (ManagedSubscription, error) {
+	subCopy, release, err := m.acquireRefresh(name)
+	if err != nil {
+		return ManagedSubscription{}, err
+	}
+	defer release()
+
+	var ports []int
+	addPort := func(p int) {
+		if p < 0 {
+			return
+		}
+		for _, existing := range ports {
+			if existing == p {
+				return
+			}
+		}
+		ports = append(ports, p)
+	}
+	if primaryProxyPort > 0 {
+		addPort(primaryProxyPort)
+	}
+	if directFallbackPort > 0 {
+		addPort(directFallbackPort)
+	}
+	addPort(0)
+
+	var firstErr error
+	var lastErr error
+	for idx, p := range ports {
+		timeout := 25 * time.Second
+		if idx == len(ports)-1 {
+			timeout = 45 * time.Second
+		}
+		if len(ports) == 1 {
+			timeout = 60 * time.Second
+		}
+		updated, err := m.refreshAttempt(ctx, subCopy, p, timeout)
+		if err == nil || ctx.Err() != nil {
+			return updated, err
+		}
+		if firstErr == nil {
+			firstErr = err
+		} else {
+			lastErr = err
+		}
+	}
+	if lastErr != nil {
+		return ManagedSubscription{}, fmt.Errorf("%w (fallback failed: %v)", firstErr, lastErr)
+	}
+	return ManagedSubscription{}, firstErr
+}
+
+func (m *Manager) refreshAttempt(ctx context.Context, subCopy ManagedSubscription, proxyPort int, timeout time.Duration) (ManagedSubscription, error) {
+	name := subCopy.Name
+	client, err := newSubscriptionHTTPClient(proxyPort, timeout)
 	if err != nil {
 		return ManagedSubscription{}, err
 	}

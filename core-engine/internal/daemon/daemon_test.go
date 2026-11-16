@@ -867,6 +867,8 @@ func TestUpdateSettingsFrontendPayloadAndLaunchAtLogin(t *testing.T) {
 	cur.Language = "en_US"
 	cur.AutoUpdateSubs = false
 	cur.UpdateChannel = "lab"
+	cur.TrayIconPreset = "ocean"
+	cur.ShowTraySpeed = false
 	cur.BenchmarkURL = "https://example.com/generate_204"
 	cur.Hotkeys = profile.HotkeySettings{
 		ToggleSystemProxy:  "Cmd+Shift+P",
@@ -954,6 +956,9 @@ func TestUpdateSettingsFrontendPayloadAndLaunchAtLogin(t *testing.T) {
 	}
 	if got.TrayIconPreset != "monochrome" {
 		t.Fatalf("expected tray_icon_preset=monochrome, got %q", got.TrayIconPreset)
+	}
+	if got.ShowTraySpeed {
+		t.Fatalf("expected show_tray_speed=false preserved across partial update_settings payload")
 	}
 	if len(got.SuspendNetworks) != 1 || got.SuspendNetworks[0] != "CorpWiFi" {
 		t.Fatalf("unexpected suspend_networks: %+v", got.SuspendNetworks)

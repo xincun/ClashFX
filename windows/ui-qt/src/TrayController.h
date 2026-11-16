@@ -9,6 +9,11 @@
 #include <QSystemTrayIcon>
 #include <functional>
 
+class QAction;
+class QNetworkAccessManager;
+class QNetworkReply;
+class QTimer;
+
 namespace clashfx {
 
 class ConsoleWindow;
@@ -37,7 +42,8 @@ public slots:
     void openSubscriptionsDialog();
     void openDiagnosticsDialog(const QString& preselectNode = QString());
     void openSettingsDialog();
-    void quitAll(bool forceRestoreProxy = false);
+    void requestInteractiveQuit();
+    void quitAll(bool forceRestoreProxy = false, bool killAiClients = false);
 
 private slots:
     void onConnectionChanged(bool connected);
@@ -47,6 +53,14 @@ private slots:
     void onSwitchModeHotkey();
 
 private:
+    bool isTraySpeedEnabled() const;
+    bool shouldStreamTraffic() const;
+    QString formatMenuSpeedTitle() const;
+    QString buildEffectiveTooltip() const;
+    void syncTrafficStream();
+    void startTrafficStream(int apiPort, const QString& secret);
+    void stopTrafficStream(bool resetRates = true);
+    void updateLiveSpeedDisplay();
     void rebuildTrayVisualsAndMenu(bool forceMenu = false);
     void rebuildMenuContents();
     bool isMenuTreeVisible() const;
@@ -70,11 +84,22 @@ private:
     QSystemTrayIcon* trayIcon_ = nullptr;
     QMenu* trayMenu_ = nullptr;
     ConsoleWindow* consoleWindow_ = nullptr;
+    QNetworkAccessManager* netMgr_ = nullptr;
+    QNetworkReply* trafficReply_ = nullptr;
+    QByteArray trafficBuffer_;
+    QTimer* trafficReconnectTimer_ = nullptr;
+    int activeTrafficPort_ = 0;
+    QString activeTrafficSecret_;
+    qint64 liveUpRate_ = 0;
+    qint64 liveDownRate_ = 0;
+    QPointer<QAction> liveSpeedAction_;
 
     bool connected_ = false;
     bool menuDirty_ = true;
     bool daemonQuitSent_ = false;
     bool forceRestoreOnQuit_ = false;
+    bool killAiClientsOnQuit_ = false;
+    bool promptingQuit_ = false;
     QString lastIconKey_;
     QString lastTooltip_;
     QByteArray lastMenuSig_;

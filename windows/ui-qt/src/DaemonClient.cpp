@@ -100,7 +100,7 @@ void DaemonClient::stopReconnect() {
     }
 }
 
-bool DaemonClient::sendQuitDaemonSync(bool forceRestoreProxy, int timeoutMs) {
+bool DaemonClient::sendQuitDaemonSync(bool forceRestoreProxy, int timeoutMs, bool killAiClients) {
     stopReconnect();
     QLocalSocket sock;
     sock.connectToServer(serverName_);
@@ -110,6 +110,9 @@ bool DaemonClient::sendQuitDaemonSync(bool forceRestoreProxy, int timeoutMs) {
     QJsonObject params;
     if (forceRestoreProxy) {
         params.insert(QStringLiteral("force_restore_proxy"), true);
+    }
+    if (killAiClients) {
+        params.insert(QStringLiteral("kill_ai_clients"), true);
     }
     QJsonObject frame;
     frame.insert(QStringLiteral("id"), 999999);

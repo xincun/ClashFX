@@ -107,11 +107,14 @@ final class DaemonClient {
     }
 
     @discardableResult
-    func sendQuitDaemonSync(forceRestoreProxy: Bool = false, timeoutSeconds: Int = 2) -> Bool {
+    func sendQuitDaemonSync(forceRestoreProxy: Bool = false, killAiClients: Bool = false, timeoutSeconds: Int = 2) -> Bool {
         stopReconnect()
         var params: [String: Any] = [:]
         if forceRestoreProxy {
             params["force_restore_proxy"] = true
+        }
+        if killAiClients {
+            params["kill_ai_clients"] = true
         }
         let res = performBlockingRPC(method: "quit_daemon", params: params, timeoutSeconds: timeoutSeconds)
         return res.ok

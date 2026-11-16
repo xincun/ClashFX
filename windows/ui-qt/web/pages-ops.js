@@ -851,6 +851,10 @@ export function renderSettingsPage(root) {
           </div>
         </div>
         <div class="form-row">
+          <div class="form-label-col"><div class="form-label">${t('显示 ClashFX 代理速率', 'Show Proxy Speed in Tray')}</div><div class="form-desc">${t('仅显示经过 ClashFX 本地代理或增强模式的流量，不代表电脑整体网速', 'Shows traffic passing through ClashFX local proxy or TUN mode, not total system traffic')}</div></div>
+          <label class="switch"><input type="checkbox" id="set-tray-speed" ${d.show_tray_speed !== false ? 'checked' : ''} /><span class="switch-track"></span></label>
+        </div>
+        <div class="form-row">
           <div class="form-label-col"><div class="form-label">${t('开机自动启动', store.platform === 'darwin' ? 'Launch at Login' : 'Launch at Windows Login')}</div></div>
           <label class="switch"><input type="checkbox" id="set-autostart" ${d.launch_at_login ? 'checked' : ''} /><span class="switch-track"></span></label>
         </div>
@@ -1038,6 +1042,17 @@ export function renderSettingsPage(root) {
     await applyImmediateOrMarkDirty(
       () => { d.tray_icon_preset = prev; },
       t('托盘图标风格已更新', 'Tray icon style updated')
+    );
+  });
+
+  root.querySelector('#set-tray-speed')?.addEventListener('change', async (e) => {
+    const prev = d.show_tray_speed !== false;
+    d.show_tray_speed = e.target.checked;
+    await applyImmediateOrMarkDirty(
+      () => { d.show_tray_speed = prev; },
+      d.show_tray_speed
+        ? t('已开启托盘代理速率显示', 'Proxy speed indicator enabled')
+        : t('已关闭托盘代理速率显示', 'Proxy speed indicator disabled')
     );
   });
 

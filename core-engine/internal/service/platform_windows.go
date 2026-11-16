@@ -21,9 +21,17 @@ import (
 )
 
 var (
-	modkernel32                      = windows.NewLazySystemDLL("kernel32.dll")
-	procGetNamedPipeClientProcessId  = modkernel32.NewProc("GetNamedPipeClientProcessId")
+	modkernel32                     = windows.NewLazySystemDLL("kernel32.dll")
+	procGetNamedPipeClientProcessId = modkernel32.NewProc("GetNamedPipeClientProcessId")
+	moddnsapi                       = windows.NewLazySystemDLL("dnsapi.dll")
+	procDnsFlushResolverCache       = moddnsapi.NewProc("DnsFlushResolverCache")
 )
+
+func flushWindowsDNSCache() {
+	if moddnsapi.Load() == nil && procDnsFlushResolverCache.Find() == nil {
+		_, _, _ = procDnsFlushResolverCache.Call()
+	}
+}
 
 func configureChildProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -142,6 +150,7 @@ func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, _ time.Durati
 		case <-time.After(2 * time.Second):
 		}
 	}
+	flushWindowsDNSCache()
 	return stopErr
 }
 

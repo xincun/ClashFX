@@ -44,6 +44,8 @@ var defaultWindowsBypassTokens = []string{
 	"192.168.*",
 	"169.254.*",
 	"*.local",
+	"*.msftconnecttest.com",
+	"*.msftncsi.com",
 	"<local>",
 }
 
@@ -190,15 +192,11 @@ func (m *Manager) Restore() error {
 	return m.backend.WriteState(cur)
 }
 
-// Shutdown handles daemon termination: normally restores the user's pre-ClashFX
-// proxy settings, EXCEPT when AI Proxy Lock is active (per docs/AI-PROXY-LOCK.md:
-// quitting while AI Proxy Lock is enabled intentionally leaves system proxy
-// pointing at the stopped local port so protected AI clients fail closed).
-func (m *Manager) Shutdown(keepFailClosedForAILock bool) error {
-	if keepFailClosedForAILock {
-		return nil
-	}
-	return m.Restore()
+// Shutdown handles graceful daemon termination and restores pre-ClashFX proxy
+// settings (clearing any lingering loopback proxy if the snapshot is absent) so
+// exiting ClashFX never leaves the machine's browser or Captive Portal offline.
+func (m *Manager) Shutdown(_ bool) error {
+	return m.CleanupForUninstall()
 }
 
 // CleanupForUninstall unconditionally restores pre-ClashFX proxy settings (even if

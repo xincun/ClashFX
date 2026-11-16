@@ -15,9 +15,13 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-const DefaultWindowsProxyBypass = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*"
+const legacyDefaultWindowsProxyBypass = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*"
 
-const DefaultDarwinProxyBypass = "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,127.0.0.1,localhost,*.local,timestamp.apple.com,sequoia.apple.com,seed-sequoia.siri.apple.com"
+const DefaultWindowsProxyBypass = legacyDefaultWindowsProxyBypass + ";*.msftconnecttest.com;*.msftncsi.com"
+
+const legacyDefaultDarwinProxyBypass = "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,127.0.0.1,localhost,*.local,timestamp.apple.com,sequoia.apple.com,seed-sequoia.siri.apple.com"
+
+const DefaultDarwinProxyBypass = legacyDefaultDarwinProxyBypass + ",captive.apple.com"
 
 func DefaultProxyBypass() string {
 	if runtime.GOOS == "darwin" {
@@ -96,6 +100,7 @@ type AppSettings struct {
 	AILockTarget          string                       `json:"claudeProxyLockTarget"`
 	AILockSavedState      *AILockPreLockState          `json:"ai_lock_saved_state,omitempty"`
 	TrayIconPreset        string                       `json:"tray_icon_preset"`
+	ShowTraySpeed         bool                         `json:"show_tray_speed"`
 	Language              string                       `json:"language"`
 	LaunchAtLogin         bool                         `json:"launch_at_login"`
 	Hotkeys               HotkeySettings               `json:"hotkeys"`
@@ -122,6 +127,7 @@ func DefaultSettings() AppSettings {
 		AutoUpdateSubs:        true,
 		AutoUpdateIntervalSec: 7200,
 		TrayIconPreset:        "default",
+		ShowTraySpeed:         true,
 		Language:              "zh_CN",
 		UpdateChannel:         "stable",
 		BenchmarkURL:          "https://cp.cloudflare.com/generate_204",
@@ -275,6 +281,11 @@ func NormalizeAppSettings(s *AppSettings) {
 	s.TrayIconPreset = NormalizeTrayIconPreset(s.TrayIconPreset)
 	if s.AILockEnabled && strings.TrimSpace(s.AILockTarget) == "" {
 		s.AILockEnabled = false
+	}
+	if runtime.GOOS == "darwin" && s.ProxyBypassList == legacyDefaultDarwinProxyBypass {
+		s.ProxyBypassList = DefaultDarwinProxyBypass
+	} else if runtime.GOOS == "windows" && s.ProxyBypassList == legacyDefaultWindowsProxyBypass {
+		s.ProxyBypassList = DefaultWindowsProxyBypass
 	}
 }
 
@@ -611,10 +622,10 @@ func (s *Store) loadSettingsLocked() error {
 	if err := json.Unmarshal(data, &loaded); err != nil {
 		return fmt.Errorf("corrupt settings.json: %w", err)
 	}
-	beforeLang, beforeIcon, beforeAI := loaded.Language, loaded.TrayIconPreset, loaded.AILockEnabled
+	beforeLang, beforeIcon, beforeAI, beforeBypass := loaded.Language, loaded.TrayIconPreset, loaded.AILockEnabled, loaded.ProxyBypassList
 	NormalizeAppSettings(&loaded)
 	s.settings = loaded
-	if loaded.Language != beforeLang || loaded.TrayIconPreset != beforeIcon || loaded.AILockEnabled != beforeAI {
+	if loaded.Language != beforeLang || loaded.TrayIconPreset != beforeIcon || loaded.AILockEnabled != beforeAI || loaded.ProxyBypassList != beforeBypass {
 		_ = writeJSONAtomic(s.settingsPathLocked(), s.settings)
 	}
 	return nil

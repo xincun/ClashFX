@@ -109,10 +109,10 @@ func (s *Server) Wait() {
 }
 
 func (s *Server) Stop() {
-	s.StopWithOptions(false)
+	s.StopWithOptions(ShutdownOptions{})
 }
 
-func (s *Server) StopWithOptions(forceRestoreProxy bool) {
+func (s *Server) StopWithOptions(opts ShutdownOptions) {
 	s.quitOnce.Do(func() {
 		s.pushMu.Lock()
 		if s.pushTimer != nil {
@@ -131,7 +131,7 @@ func (s *Server) StopWithOptions(forceRestoreProxy bool) {
 		s.clients = map[*clientConn]struct{}{}
 		s.clientsMu.Unlock()
 
-		s.engine.ShutdownWithForceRestore(forceRestoreProxy)
+		s.engine.ShutdownWithOptions(opts)
 		close(s.quitCh)
 	})
 }
@@ -475,8 +475,10 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		s.engine.nodeCoord.CancelSpeedTest(false)
 		return okResp(s.engine.Snapshot())
 	case "update_settings":
-		var p struct {
+		p := struct {
 			Settings profile.AppSettings `json:"settings"`
+		}{
+			Settings: s.engine.store.Settings(),
 		}
 		if err := json.Unmarshal(req.Params, &p); err != nil {
 			return errResp(err)
@@ -594,17 +596,23 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			return errResp(err)
 		}
 		return okResp(info)
+	case "list_running_ai_clients":
+		return okResp(s.engine.ListRunningAIClients())
 	case "quit_daemon":
 		var p struct {
 			ForceRestoreProxy bool `json:"force_restore_proxy"`
+			KillAIClients     bool `json:"kill_ai_clients"`
 		}
 		if len(req.Params) > 0 {
 			_ = json.Unmarshal(req.Params, &p)
 		}
-		forceRestore := p.ForceRestoreProxy
+		opts := ShutdownOptions{
+			ForceRestoreProxy: p.ForceRestoreProxy,
+			KillAIClients:     p.KillAIClients,
+		}
 		go func() {
 			time.Sleep(80 * time.Millisecond)
-			s.StopWithOptions(forceRestore)
+			s.StopWithOptions(opts)
 		}()
 		return okResp(map[string]bool{"quitting": true})
 	default:

@@ -20,8 +20,10 @@ const (
 )
 
 var (
-	modwininet             = windows.NewLazySystemDLL("wininet.dll")
-	procInternetSetOptionW = modwininet.NewProc("InternetSetOptionW")
+	modwininet                = windows.NewLazySystemDLL("wininet.dll")
+	procInternetSetOptionW    = modwininet.NewProc("InternetSetOptionW")
+	moddnsapi                 = windows.NewLazySystemDLL("dnsapi.dll")
+	procDnsFlushResolverCache = moddnsapi.NewProc("DnsFlushResolverCache")
 )
 
 type windowsRegistryBackend struct{}
@@ -109,7 +111,13 @@ func (windowsRegistryBackend) WriteState(st OSProxyState) error {
 		_ = k.DeleteValue("AutoConfigURL")
 	}
 
-	return notifyWinINetRefresh()
+	if err := notifyWinINetRefresh(); err != nil {
+		return err
+	}
+	if st.ProxyEnable == 0 && moddnsapi.Load() == nil && procDnsFlushResolverCache.Find() == nil {
+		_, _, _ = procDnsFlushResolverCache.Call()
+	}
+	return nil
 }
 
 func notifyWinINetRefresh() error {

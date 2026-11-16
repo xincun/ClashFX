@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/clashfx/core-engine/internal/profile"
@@ -118,5 +122,89 @@ func TestParseUserinfoBodyAndCustomUserAgent(t *testing.T) {
 	merged := MergeUserInfo(hdr, parsed)
 	if *merged.Total != 100 || *merged.Upload != 10 || *merged.Download != 20 || merged.ExpireText != "2027-05-01" {
 		t.Fatalf("unexpected MergeUserInfo result: %+v", merged)
+	}
+}
+
+func TestRefreshWithFallbackProxyToDirect(t *testing.T) {
+	store, err := profile.NewStore(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const subYAML = "mixed-port: 7890\nproxies:\n  - name: JP-01\n    type: socks5\n    server: 127.0.0.1\n    port: 1080\nrules:\n  - MATCH,JP-01\n"
+	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, subYAML)
+	}))
+	defer targetSrv.Close()
+
+	var badHits atomic.Int32
+	badProxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		badHits.Add(1)
+		http.Error(w, "dead upstream proxy", http.StatusBadGateway)
+	}))
+	defer badProxySrv.Close()
+
+	var goodHits atomic.Int32
+	goodProxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		goodHits.Add(1)
+		resp, err := http.Get(targetSrv.URL)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer goodProxySrv.Close()
+
+	parsePort := func(raw string) int {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := strconv.Atoi(u.Port())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	badPort := parsePort(badProxySrv.URL)
+	goodPort := parsePort(goodProxySrv.URL)
+
+	mgr, err := NewManager(store, fakeCoreHelper{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.AddOrUpdate("FallbackSub", targetSrv.URL, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Primary dead proxy fails -> automatically retries via internal DIRECT listener
+	if _, err := mgr.RefreshWithFallback(context.Background(), "FallbackSub", badPort, goodPort); err != nil {
+		t.Fatalf("RefreshWithFallback(bad primary -> good direct) failed: %v", err)
+	}
+	if badHits.Load() != 1 || goodHits.Load() != 1 {
+		t.Fatalf("expected 1 bad hit + 1 direct hit, got bad=%d good=%d", badHits.Load(), goodHits.Load())
+	}
+
+	// 2. Healthy primary proxy succeeds -> does not touch direct fallback
+	badHits.Store(0)
+	goodHits.Store(0)
+	if _, err := mgr.RefreshWithFallback(context.Background(), "FallbackSub", goodPort, badPort); err != nil {
+		t.Fatalf("RefreshWithFallback(good primary -> bad direct) failed: %v", err)
+	}
+	if goodHits.Load() != 1 || badHits.Load() != 0 {
+		t.Fatalf("expected 1 primary hit + 0 fallback hits, got good=%d bad=%d", goodHits.Load(), badHits.Load())
+	}
+
+	// 3. Both proxy listeners unavailable -> falls back to direct transport (port 0)
+	badHits.Store(0)
+	if _, err := mgr.RefreshWithFallback(context.Background(), "FallbackSub", badPort, badPort); err != nil {
+		t.Fatalf("RefreshWithFallback(bad proxies -> transport 0) failed: %v", err)
+	}
+	if badHits.Load() != 1 {
+		t.Fatalf("expected deduplicated bad proxy hit count 1, got %d", badHits.Load())
 	}
 }
