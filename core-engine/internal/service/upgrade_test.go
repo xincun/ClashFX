@@ -4,10 +4,12 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -379,4 +381,103 @@ func TestRunnerUpgradeCoreSuccessAlreadyLatestDigestAndRollback(t *testing.T) {
 	if v := probeLiveHTTPVersion(t, ctrlAddr); v != "v1.19.34" {
 		t.Fatalf("expected rolled-back live /version v1.19.34, got %q", v)
 	}
+}
+
+func TestShouldPreserveInstalledCore(t *testing.T) {
+	dir := t.TempDir()
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	bundledV24 := filepath.Join(dir, "bundled_v24"+ext)
+	installedV24 := filepath.Join(dir, "installed_v24"+ext)
+	installedV34 := filepath.Join(dir, "installed_v34"+ext)
+	installedV20 := filepath.Join(dir, "installed_v20"+ext)
+	missingPath := filepath.Join(dir, "missing_core"+ext)
+
+	buildFakeMihomoBinary(t, bundledV24, "v1.19.24", false)
+	buildFakeMihomoBinary(t, installedV24, "v1.19.24", false)
+	buildFakeMihomoBinary(t, installedV34, "v1.19.34", false)
+	buildFakeMihomoBinary(t, installedV20, "v1.19.20", false)
+
+	if ShouldPreserveInstalledCore(bundledV24, missingPath) {
+		t.Fatal("expected missing installed core not to be preserved")
+	}
+	if ShouldPreserveInstalledCore(bundledV24, installedV24) {
+		t.Fatal("expected equal-version installed core (v1.19.24) to be refreshed cleanly")
+	}
+	if ShouldPreserveInstalledCore(bundledV24, installedV20) {
+		t.Fatal("expected older installed core (v1.19.20) to be upgraded by bundled v1.19.24")
+	}
+	if !ShouldPreserveInstalledCore(bundledV24, installedV34) {
+		t.Fatal("expected newer online-upgraded core (v1.19.34) to be preserved over bundled v1.19.24")
+	}
+	if !ShouldPreserveInstalledCore(missingPath, installedV34) {
+		t.Fatal("expected valid installed core to be preserved if bundled path is missing")
+	}
+}
+
+func TestLiveUpgradeCoreIntegration(t *testing.T) {
+	seedPath := strings.TrimSpace(os.Getenv("CLASHFX_LIVE_UPGRADE_VERIFY_SEED"))
+	if seedPath == "" {
+		t.Skip("CLASHFX_LIVE_UPGRADE_VERIFY_SEED not set; skipping live online mihomo_core upgrade test")
+	}
+
+	tmpDir := t.TempDir()
+	seedDir := t.TempDir()
+	exeName := "mihomo_core"
+	if runtime.GOOS == "windows" {
+		exeName = "mihomo_core.exe"
+	}
+	copyBin := func(src, dst string) {
+		in, err := os.Open(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer in.Close()
+		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(out, in); err != nil {
+			_ = out.Close()
+			t.Fatal(err)
+		}
+		if err := out.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	corePath := filepath.Join(tmpDir, exeName)
+	bundledPath := filepath.Join(seedDir, exeName)
+	copyBin(seedPath, corePath)
+	copyBin(seedPath, bundledPath)
+
+	prevVer := ProbeCoreVersion(corePath)
+	if prevVer == "" {
+		t.Fatalf("failed to probe seed core version at %s", corePath)
+	}
+
+	proxyPort := 7890
+	runner := NewRunner(tmpDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	info, _, err := runner.UpgradeCore(ctx, "stable", proxyPort)
+	if err != nil {
+		t.Fatalf("live UpgradeCore failed: %v (info=%+v)", err, info)
+	}
+	if !info.Updated {
+		t.Fatalf("expected live UpgradeCore Updated=true, got %+v", info)
+	}
+	if CompareCoreVersions(info.CurrentVersion, prevVer) <= 0 {
+		t.Fatalf("expected upgraded version > %q, got %q", prevVer, info.CurrentVersion)
+	}
+	if got := ProbeCoreVersion(corePath); got != info.CurrentVersion {
+		t.Fatalf("upgraded binary on disk reported %q, want %q", got, info.CurrentVersion)
+	}
+	if !ShouldPreserveInstalledCore(bundledPath, corePath) {
+		t.Fatalf("expected upgraded core %q to be preserved over bundled %q", info.CurrentVersion, prevVer)
+	}
+	t.Logf("Live UpgradeCore succeeded: %s -> %s", info.PreviousVersion, info.CurrentVersion)
 }

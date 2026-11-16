@@ -1172,20 +1172,30 @@ export function renderSettingsPage(root) {
   root.querySelector('#set-upgrade-core')?.addEventListener('click', async () => {
     settingsState.coreUpdBusy = true;
     renderSettingsPage(root);
-    const res = await rpc('upgrade_core', {});
-    settingsState.coreUpdBusy = false;
-    if (res.ok) {
-      const info = res.data || {};
-      if (info.already_latest) {
-        const ver = info.current_version || snap.core_version || '';
-        showToast(t(`当前核心已是最新版本 (${ver})`, `Core is already up to date (${ver})`), 'ok');
-      } else {
-        const ver = info.current_version || '';
-        showToast(t(`核心已更新至 ${ver} 并重启`, `Core upgraded to ${ver} and restarted`), 'ok');
-        await rpc('get_state', {}, { silent: true });
+    const dismissBusy = showToast(
+      t('正在下载并更新 Mihomo 核心，请稍候…', 'Downloading and upgrading Mihomo core, please wait…'),
+      'info',
+      0
+    );
+    try {
+      const res = await rpc('upgrade_core', {});
+      dismissBusy();
+      if (res.ok) {
+        const info = res.data || {};
+        if (info.already_latest) {
+          const ver = info.current_version || snap.core_version || '';
+          showToast(t(`当前核心已是最新版本 (${ver})`, `Core is already up to date (${ver})`), 'ok');
+        } else {
+          const ver = info.current_version || '';
+          showToast(t(`核心已更新至 ${ver} 并重启`, `Core upgraded to ${ver} and restarted`), 'ok');
+          await rpc('get_state', {}, { silent: true });
+        }
       }
+    } finally {
+      dismissBusy();
+      settingsState.coreUpdBusy = false;
+      renderSettingsPage(root);
     }
-    renderSettingsPage(root);
   });
 
   root.querySelector('#set-install-svc')?.addEventListener('click', async () => {

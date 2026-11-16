@@ -162,6 +162,30 @@ func resolveTrustedDir() (string, error) {
 	return filepath.Dir(exe), nil
 }
 
+// reconcileBundledWindowsCore promotes mihomo_core.bundled.exe staged by the installer
+// unless the already-installed mihomo_core.exe is strictly newer (online upgrade).
+func reconcileBundledWindowsCore(trustedDir string) error {
+	bundledPath := filepath.Join(trustedDir, "mihomo_core.bundled.exe")
+	if _, err := os.Stat(bundledPath); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	corePath := filepath.Join(trustedDir, "mihomo_core.exe")
+	if service.ShouldPreserveInstalledCore(bundledPath, corePath) {
+		_ = os.Remove(bundledPath)
+		return nil
+	}
+	if err := os.Remove(corePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove previous mihomo_core.exe: %w", err)
+	}
+	if err := os.Rename(bundledPath, corePath); err != nil {
+		return fmt.Errorf("promote bundled mihomo_core.exe: %w", err)
+	}
+	return nil
+}
+
 func installAndStartService() error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -170,6 +194,7 @@ func installAndStartService() error {
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = resolved
 	}
+	trustedDir := filepath.Dir(exe)
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("connect SCM (run as Administrator): %w", err)
@@ -207,7 +232,10 @@ func installAndStartService() error {
 			{Type: mgr.NoAction},
 		}, 86400)
 	}
-	ensureWindowsFirewallRules(filepath.Dir(exe))
+	if err := reconcileBundledWindowsCore(trustedDir); err != nil {
+		return err
+	}
+	ensureWindowsFirewallRules(trustedDir)
 	if err := s.Start(); err != nil {
 		st, qErr := s.Query()
 		if qErr != nil || (st.State != svc.Running && st.State != svc.StartPending) {

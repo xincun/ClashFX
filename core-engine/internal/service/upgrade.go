@@ -171,6 +171,21 @@ func CompareCoreVersions(a, b string) int {
 	return strings.Compare(ta, tb)
 }
 
+// ShouldPreserveInstalledCore reports whether an already-installed mihomo_core
+// binary should be preserved instead of being overwritten by a bundled binary
+// during app/service installation (i.e. when installed is valid and strictly newer).
+func ShouldPreserveInstalledCore(bundledPath, installedPath string) bool {
+	installedVer := ProbeCoreVersion(installedPath)
+	if installedVer == "" {
+		return false
+	}
+	bundledVer := ProbeCoreVersion(bundledPath)
+	if bundledVer == "" {
+		return true
+	}
+	return CompareCoreVersions(installedVer, bundledVer) > 0
+}
+
 func normalizeUpgradeChannel(ch string) string {
 	switch strings.ToLower(strings.TrimSpace(ch)) {
 	case "lab", "alpha", "prerelease":

@@ -497,16 +497,11 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		if settings.BypassCNApps && !settings.CustomConfigAsIs && root["find-process-mode"] == nil {
 			root["find-process-mode"] = "always"
 		}
-		// Prevent proxy loops from core/daemon executables under Windows & Darwin TUN via inline rule-set
+		// Keep only mihomo_core itself in the internal TUN loop-prevention rule-set so
+		// clashfx-service/clashfx-daemon can route core/GEO/app updates via local proxyPort.
 		profile.SetInlineClassicalRuleProvider(root, profile.InternalDirectRuleProviderName, []string{
 			"PROCESS-NAME,mihomo_core.exe",
-			"PROCESS-NAME,clashfx-daemon.exe",
-			"PROCESS-NAME,clashfx-service.exe",
-			"PROCESS-NAME,clashfx-ui.exe",
 			"PROCESS-NAME,mihomo_core",
-			"PROCESS-NAME,clashfx-daemon",
-			"PROCESS-NAME,clashfx-service",
-			"PROCESS-NAME,ClashFX",
 		})
 		PrependUniqueRules(root, []string{
 			"RULE-SET," + profile.InternalDirectRuleProviderName + ",DIRECT",

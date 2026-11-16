@@ -245,6 +245,12 @@ func installAndStartService(sourceDir string) error {
 	for _, name := range []string{"clashfx-service", "mihomo_core"} {
 		src := filepath.Join(srcDir, name)
 		dst := filepath.Join(service.DarwinPrivilegedBinDir, name)
+		if name == "mihomo_core" && service.ShouldPreserveInstalledCore(src, dst) {
+			_ = os.Chown(dst, 0, 0)
+			_ = os.Chmod(dst, 0755)
+			_ = exec.Command("/usr/bin/xattr", "-d", "com.apple.quarantine", dst).Run()
+			continue
+		}
 		if err := copyRootOwnedExecutable(src, dst); err != nil {
 			return fmt.Errorf("install %s: %w", name, err)
 		}

@@ -57,7 +57,8 @@ english.LaunchAppDesc=Launch ClashFX
 Name: "desktopicon"; Description: "{cm:CreateDesktopShortcut}"; GroupDescription: "{cm:AdditionalShortcuts}"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "mihomo_core.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\mihomo_core.exe"; DestDir: "{app}"; DestName: "mihomo_core.bundled.exe"; Flags: ignoreversion
 Source: "MicrosoftEdgeWebView2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsWebView2Runtime
 
 [Icons]
@@ -89,6 +90,11 @@ Filename: "{app}\clashfx-ui.exe"; Description: "{cm:LaunchAppDesc}"; Flags: nowa
 Filename: "{app}\clashfx-ui.exe"; Parameters: "--quit-uninstall"; RunOnceId: "QuitClashFXUI"; Flags: runhidden waituntilterminated skipifdoesntexist
 Filename: "{app}\clashfx-daemon.exe"; Parameters: "-cleanup-uninstall"; RunOnceId: "CleanupClashFXDaemon"; Flags: runhidden waituntilterminated skipifdoesntexist
 Filename: "{app}\clashfx-service.exe"; Parameters: "uninstall"; RunOnceId: "UninstallClashFXService"; Flags: runhidden waituntilterminated skipifdoesntexist
+
+[UninstallDelete]
+Type: files; Name: "{app}\mihomo_core.exe"
+Type: files; Name: "{app}\mihomo_core.bundled.exe"
+Type: files; Name: "{app}\mihomo_core.exe.bak*"
 
 [Code]
 function HasValidWebView2Version(RootKey: Integer; const Subkey: String): Boolean;

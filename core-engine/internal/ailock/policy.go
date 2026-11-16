@@ -231,8 +231,8 @@ func Apply(root map[string]any, target string, providers []ProviderSnapshot) App
 
 	existingRules, _ := extractStringListStrict(finalRoot["rules"])
 
-	// Keep ClashFX's own internal executables ahead of PROCESS-PATH/DOMAIN rules so
-	// mihomo_core.exe / clashfx-daemon.exe / clashfx-service.exe never self-loop.
+	// Keep ClashFX's internal mihomo_core loop guard ahead of PROCESS-PATH/DOMAIN rules so
+	// mihomo_core never self-loops under TUN while allowing daemon/service proxy downloads.
 	var leadingInternal []string
 	var remainder []string
 	for _, r := range existingRules {
@@ -353,13 +353,7 @@ func isInternalCoreDirectRule(rule string) bool {
 	switch strings.TrimSpace(rule) {
 	case "RULE-SET," + InternalDirectRuleProviderName + ",DIRECT",
 		"PROCESS-NAME,mihomo_core.exe,DIRECT",
-		"PROCESS-NAME,clashfx-daemon.exe,DIRECT",
-		"PROCESS-NAME,clashfx-service.exe,DIRECT",
-		"PROCESS-NAME,clashfx-ui.exe,DIRECT",
-		"PROCESS-NAME,mihomo_core,DIRECT",
-		"PROCESS-NAME,clashfx-daemon,DIRECT",
-		"PROCESS-NAME,clashfx-service,DIRECT",
-		"PROCESS-NAME,ClashFX,DIRECT":
+		"PROCESS-NAME,mihomo_core,DIRECT":
 		return true
 	default:
 		return false

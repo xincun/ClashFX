@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/clashfx/core-engine/internal/profile"
+	"gopkg.in/yaml.v3"
 )
 
 type mockApplier struct {
@@ -99,6 +100,19 @@ rules:
 	}
 	if !strings.Contains(applier.appliedData, "msftconnecttest.com") {
 		t.Fatalf("expected default Windows NCSI fake-ip-filter in managed TUN config:\n%s", applier.appliedData)
+	}
+	var appliedDoc struct {
+		RuleProviders map[string]struct {
+			Payload []string `yaml:"payload"`
+		} `yaml:"rule-providers"`
+	}
+	if err := yaml.Unmarshal([]byte(applier.appliedData), &appliedDoc); err != nil {
+		t.Fatalf("unmarshal applied runtime yaml: %v", err)
+	}
+	wantInternal := []string{"PROCESS-NAME,mihomo_core.exe", "PROCESS-NAME,mihomo_core"}
+	gotInternal := appliedDoc.RuleProviders[profile.InternalDirectRuleProviderName].Payload
+	if len(gotInternal) != len(wantInternal) || gotInternal[0] != wantInternal[0] || gotInternal[1] != wantInternal[1] {
+		t.Fatalf("clashfx-internal-direct payload = %v, want %v (daemon/service must not bypass active proxy)", gotInternal, wantInternal)
 	}
 
 	// Switch to a broken profile -> preflight validation fails BEFORE touching active runtime!

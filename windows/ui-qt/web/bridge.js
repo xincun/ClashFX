@@ -270,17 +270,24 @@ export function buildSparklineSvg(history) {
 
 export function showToast(message, tone = 'info', durationMs = 3400) {
   const container = document.getElementById('toast-container');
-  if (!container) return;
+  if (!container) return () => {};
   const el = document.createElement('div');
   el.className = `toast ${tone}`;
   el.textContent = String(message || '');
   container.appendChild(el);
-  setTimeout(() => {
+  let dismissed = false;
+  const dismiss = () => {
+    if (dismissed) return;
+    dismissed = true;
     el.style.opacity = '0';
     el.style.transform = 'translateY(6px)';
     el.style.transition = 'all 0.16s ease';
     setTimeout(() => el.remove(), 180);
-  }, durationMs);
+  };
+  if (durationMs > 0) {
+    setTimeout(dismiss, durationMs);
+  }
+  return dismiss;
 }
 
 export function showConfirm({ title, message, confirmText, cancelText, danger = false }) {

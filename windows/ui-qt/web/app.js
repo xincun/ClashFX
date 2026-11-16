@@ -51,6 +51,7 @@ let sidebarDockBuilt = false;
 let dockProfileSig = '';
 let lastPageSig = '';
 let startupUpdateChecked = false;
+let coreUpgradeInFlight = false;
 
 function ensureSidebarNavBuilt(navEl) {
   if (!navEl || sidebarNavBuilt) return;
@@ -441,7 +442,16 @@ function syncConsoleHost(forceReload = false) {
   const subsCount = Array.isArray(snap.subscriptions) ? snap.subscriptions.length : 0;
 
   if (consoleBanner) {
-    if (snap.last_error) {
+    if (coreUpgradeInFlight) {
+      consoleBanner.hidden = false;
+      consoleBanner.className = 'console-banner';
+      consoleBanner.innerHTML = `<span>${esc(
+        t(
+          '正在下载并更新 Mihomo 核心，请稍候（约 10–30 秒，完成后将自动重启并刷新面板）…',
+          'Downloading and upgrading Mihomo core, please wait (10–30s; console will refresh automatically)…'
+        )
+      )}</span>`;
+    } else if (snap.last_error) {
       consoleBanner.hidden = false;
       consoleBanner.className = 'console-banner err';
       consoleBanner.innerHTML = `
@@ -551,7 +561,7 @@ function syncConsoleHost(forceReload = false) {
   if (consoleStandby) consoleStandby.hidden = true;
   if (consoleFrame) consoleFrame.hidden = false;
 
-  const nextKey = `${runtime.api_port || 0}|${runtime.api_secret || ''}|${snap.dashboard_url}`;
+  const nextKey = `${runtime.api_port || 0}|${runtime.api_secret || ''}|${snap.dashboard_url}|${snap.core_version || ''}`;
   if (forceReload || loadedConsoleKey !== nextKey) {
     const langParam = store.language === 'en_US' ? 'en' : 'zh';
     const sep = snap.dashboard_url.includes('?') ? '&' : '?';
@@ -669,15 +679,22 @@ function wireWindowControls() {
       return;
     }
 
-    showToast(
+    if (method === 'upgrade_core') {
+      coreUpgradeInFlight = true;
+      syncConsoleHost(false);
+    }
+
+    const dismissBusy = showToast(
       method === 'upgrade_core'
-        ? t('正在检查并更新 Mihomo 核心…', 'Checking and upgrading Mihomo core…')
+        ? t('正在下载并更新 Mihomo 核心，请稍候…', 'Downloading and upgrading Mihomo core, please wait…')
         : t('正在重启 Mihomo 核心…', 'Restarting Mihomo core…'),
-      'info'
+      'info',
+      0
     );
 
     const reqPromise = rpc(method, d.params && typeof d.params === 'object' ? d.params : {}, { silent: true })
       .then((res) => {
+        dismissBusy();
         if (method === 'upgrade_core') {
           if (!res.ok) {
             showToast(`${t('更新核心失败', 'Core upgrade failed')}: ${res.error || ''}`, 'err');
@@ -700,6 +717,11 @@ function wireWindowControls() {
         return res;
       })
       .finally(() => {
+        dismissBusy();
+        if (method === 'upgrade_core') {
+          coreUpgradeInFlight = false;
+          syncConsoleHost(false);
+        }
         delete inFlightIframeRpc[method];
       });
 
