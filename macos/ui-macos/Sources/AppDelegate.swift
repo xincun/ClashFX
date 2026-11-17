@@ -58,7 +58,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let client = DaemonClient(config: config)
         let showInitially = (!backgroundStart || smokeTestMs > 0) && startupCmd != "--quit" && startupCmd != "--quit-uninstall"
         let console = ConsoleWindowController(client: client)
-        let tray = TrayController(client: client, consoleWindow: console, showConsoleInitially: showInitially)
+        let tray = TrayController(
+            client: client,
+            consoleWindow: console,
+            showConsoleInitially: showInitially,
+            smokeMode: smokeTestMs > 0
+        )
 
         self.daemonClient = client
         self.consoleWindow = console

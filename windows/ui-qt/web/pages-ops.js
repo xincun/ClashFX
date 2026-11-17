@@ -765,7 +765,7 @@ function formatKeyEventToChord(e) {
   const code = e.code || '';
   if (
     /^(Control|Alt|Shift|Meta)(Left|Right)$/.test(code) ||
-    ['Control', 'Alt', 'Shift', 'Meta', 'OS'].includes(e.key)
+    ['Control', 'Alt', 'Shift', 'Meta', 'OS', 'Fn'].includes(e.key)
   ) {
     return null;
   }
@@ -774,14 +774,15 @@ function formatKeyEventToChord(e) {
   if (e.altKey) mods.push('Alt');
   if (e.shiftKey) mods.push('Shift');
   if (e.metaKey) mods.push(store.platform === 'darwin' ? 'Cmd' : 'Win');
-  if (!mods.length) return null;
+  const isFnKey = /^F([1-9]|1[0-9]|2[0-4])$/.test(code);
+  if (!mods.length && !isFnKey) return null;
 
   let mainKey = '';
   if (/^Key([A-Z])$/.test(code)) {
     mainKey = code.slice(3);
   } else if (/^Digit([0-9])$/.test(code)) {
     mainKey = code.slice(5);
-  } else if (/^F([1-9]|1[0-9]|20)$/.test(code)) {
+  } else if (isFnKey) {
     mainKey = code;
   } else if (CODE_KEY_MAP[code]) {
     mainKey = CODE_KEY_MAP[code];
@@ -789,10 +790,14 @@ function formatKeyEventToChord(e) {
     mainKey = e.key === ' ' ? 'Space' : e.key.length === 1 ? e.key.toUpperCase() : e.key;
   }
   if (!mainKey) return null;
+  if (!mods.length && isFnKey) {
+    return store.platform === 'darwin' ? `Fn+${mainKey}` : mainKey;
+  }
   return `${mods.join('+')}+${mainKey}`;
 }
 
 export function renderSettingsPage(root) {
+  const defaultOpenHk = store.platform === 'darwin' ? 'Fn+F12' : 'Ctrl+Shift+F12';
   const snap = store.snapshot || {};
   const srcSettings = snap.settings || {};
   const hash = JSON.stringify(srcSettings);
@@ -800,6 +805,9 @@ export function renderSettingsPage(root) {
     settingsState.loadedHash = hash;
     settingsState.draft = JSON.parse(hash || '{}');
     if (!settingsState.draft.hotkeys) settingsState.draft.hotkeys = {};
+    if (settingsState.draft.hotkeys.open_main_window === undefined) {
+      settingsState.draft.hotkeys.open_main_window = defaultOpenHk;
+    }
     if (!Array.isArray(settingsState.draft.suspend_networks)) settingsState.draft.suspend_networks = [];
     if (Array.isArray(settingsState.draft.tun_route_excludes)) {
       settingsState.draft.tun_route_excludes = settingsState.draft.tun_route_excludes.join(', ');
@@ -931,6 +939,14 @@ export function renderSettingsPage(root) {
 
       <div class="card">
         <div class="card-head"><div class="card-title">${ICONS.aiLock} ${t('快捷键与环境挂起', 'Hotkeys & Auto-Suspend')}</div></div>
+        <div class="form-row">
+          <div class="form-label-col"><div class="form-label">${t('打开主窗口快捷键', 'Open Main Window Hotkey')}</div><div class="form-desc">${t(`默认 ${defaultOpenHk}，点击输入框按键即可修改`, `Default ${defaultOpenHk}; click box and press keys to customize`)}</div></div>
+          <div class="form-control" style="width:240px;">
+            <input type="text" readonly class="input mono hotkey-input ${settingsState.recordingKey === 'open_main_window' ? 'recording' : ''}" data-hk-rec="open_main_window" value="${esc(settingsState.recordingKey === 'open_main_window' ? t('请按键…', 'Press keys…') : hk.open_main_window ?? defaultOpenHk)}" placeholder="${t('未设置', 'None')}" />
+            ${(hk.open_main_window ?? defaultOpenHk) !== defaultOpenHk ? `<button type="button" class="btn btn-sm" data-hk-reset="open_main_window" title="${t('恢复默认', 'Reset to default')}">↺</button>` : ''}
+            <button type="button" class="btn btn-sm" data-hk-clear="open_main_window" title="${t('清空', 'Clear')}">×</button>
+          </div>
+        </div>
         <div class="form-row">
           <div class="form-label-col"><div class="form-label">${t('切换系统代理快捷键', 'Toggle System Proxy Hotkey')}</div><div class="form-desc">${t(`点击输入框后按下组合键 (如 ${store.platform === 'darwin' ? 'Cmd+Shift+P' : 'Ctrl+Alt+P'})`, `Click box and press key chord (e.g. ${store.platform === 'darwin' ? 'Cmd+Shift+P' : 'Ctrl+Alt+P'})`)}</div></div>
           <div class="form-control">
@@ -1106,17 +1122,27 @@ export function renderSettingsPage(root) {
   root.querySelectorAll('[data-hk-rec]').forEach((inp) => {
     const field = inp.getAttribute('data-hk-rec');
     inp.addEventListener('click', () => {
+      if (settingsState.recordingKey === field) return;
+      root.querySelectorAll('[data-hk-rec]').forEach((other) => {
+        const f = other.getAttribute('data-hk-rec');
+        other.classList.remove('recording');
+        other.value = d.hotkeys?.[f] ?? '';
+      });
       settingsState.recordingKey = field;
-      renderSettingsPage(root);
-      const ref = root.querySelector(`[data-hk-rec="${field}"]`);
-      ref?.focus();
+      inp.classList.add('recording');
+      inp.value = t('请按键…', 'Press keys…');
+      inp.focus();
+      native('set_hotkey_recording', { active: true }).catch(() => {});
     });
     inp.addEventListener('keydown', (e) => {
       if (settingsState.recordingKey !== field) return;
       e.preventDefault();
+      e.stopPropagation();
       if (e.key === 'Escape') {
         settingsState.recordingKey = '';
-        renderSettingsPage(root);
+        inp.classList.remove('recording');
+        inp.value = d.hotkeys?.[field] ?? '';
+        native('set_hotkey_recording', { active: false }).catch(() => {});
         return;
       }
       const chord = formatKeyEventToChord(e);
@@ -1125,6 +1151,7 @@ export function renderSettingsPage(root) {
         d.hotkeys[field] = chord;
         settingsState.recordingKey = '';
         settingsState.dirty = true;
+        native('set_hotkey_recording', { active: false }).catch(() => {});
         renderSettingsPage(root);
       }
     });
@@ -1132,8 +1159,19 @@ export function renderSettingsPage(root) {
       if (settingsState.recordingKey === field) {
         settingsState.recordingKey = '';
         inp.classList.remove('recording');
-        inp.value = d.hotkeys?.[field] || '';
+        inp.value = d.hotkeys?.[field] ?? '';
+        native('set_hotkey_recording', { active: false }).catch(() => {});
       }
+    });
+  });
+
+  root.querySelectorAll('[data-hk-reset]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (!d.hotkeys) d.hotkeys = {};
+      d.hotkeys[btn.getAttribute('data-hk-reset')] = defaultOpenHk;
+      settingsState.recordingKey = '';
+      settingsState.dirty = true;
+      renderSettingsPage(root);
     });
   });
 
@@ -1141,6 +1179,7 @@ export function renderSettingsPage(root) {
     btn.addEventListener('click', () => {
       if (!d.hotkeys) d.hotkeys = {};
       d.hotkeys[btn.getAttribute('data-hk-clear')] = '';
+      settingsState.recordingKey = '';
       settingsState.dirty = true;
       renderSettingsPage(root);
     });

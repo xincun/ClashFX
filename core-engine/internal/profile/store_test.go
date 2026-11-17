@@ -239,8 +239,11 @@ func TestOutOfTheBoxDefaultSettingsAndMixin(t *testing.T) {
 	if strings.TrimSpace(st.ProxyBypassList) == "" {
 		t.Fatalf("expected non-empty default ProxyBypassList")
 	}
+	if st.Hotkeys.OpenMainWindow != DefaultOpenMainWindowHotkey() {
+		t.Fatalf("expected default OpenMainWindow=%q, got %q", DefaultOpenMainWindowHotkey(), st.Hotkeys.OpenMainWindow)
+	}
 
-	// Loading an existing settings.json that omits show_tray_speed must default ShowTraySpeed=true.
+	// Loading an existing settings.json that omits show_tray_speed or open_main_window must apply defaults.
 	legacyJSONDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(legacyJSONDir, "settings.json"), []byte(`{"selected_profile":"config"}`), 0600); err != nil {
 		t.Fatal(err)
@@ -252,6 +255,40 @@ func TestOutOfTheBoxDefaultSettingsAndMixin(t *testing.T) {
 	defer legacyStore.Close()
 	if !legacyStore.Settings().ShowTraySpeed {
 		t.Fatalf("expected missing show_tray_speed in existing settings.json to default true")
+	}
+	if legacyStore.Settings().Hotkeys.OpenMainWindow != DefaultOpenMainWindowHotkey() {
+		t.Fatalf("expected missing open_main_window in legacy settings.json to default %q, got %q", DefaultOpenMainWindowHotkey(), legacyStore.Settings().Hotkeys.OpenMainWindow)
+	}
+
+	// Loading an existing settings.json with custom hotkeys but no open_main_window must also default and persist it.
+	legacyHotkeysDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(legacyHotkeysDir, "settings.json"), []byte(`{"selected_profile":"config","hotkeys":{"toggle_system_proxy":"Cmd+Shift+P"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	legacyHotkeysStore, err := NewStore(legacyHotkeysDir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyHotkeysStore.Close()
+	if legacyHotkeysStore.Settings().Hotkeys.OpenMainWindow != DefaultOpenMainWindowHotkey() {
+		t.Fatalf("expected missing open_main_window alongside custom hotkeys to default %q, got %q", DefaultOpenMainWindowHotkey(), legacyHotkeysStore.Settings().Hotkeys.OpenMainWindow)
+	}
+	if legacyHotkeysStore.Settings().Hotkeys.ToggleSystemProxy != "Cmd+Shift+P" {
+		t.Fatalf("expected existing toggle_system_proxy preserved, got %q", legacyHotkeysStore.Settings().Hotkeys.ToggleSystemProxy)
+	}
+
+	// Loading settings.json where open_main_window was explicitly cleared ("") must preserve disabled state.
+	clearedHotkeysDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(clearedHotkeysDir, "settings.json"), []byte(`{"selected_profile":"config","hotkeys":{"open_main_window":""}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	clearedStore, err := NewStore(clearedHotkeysDir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearedStore.Close()
+	if clearedStore.Settings().Hotkeys.OpenMainWindow != "" {
+		t.Fatalf("expected explicitly cleared open_main_window to stay empty, got %q", clearedStore.Settings().Hotkeys.OpenMainWindow)
 	}
 
 	rawMixin, err := store.ReadProfileMixinBytes()

@@ -39,6 +39,9 @@ public:
     ConsolePage currentPage() const { return currentPage_; }
     void presentWindow();
 
+signals:
+    void hotkeyRecordingChanged(bool active);
+
 protected:
     void showEvent(QShowEvent* event) override;
     void hideEvent(QHideEvent* event) override;

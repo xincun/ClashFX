@@ -220,7 +220,7 @@ int main(int argc, char* argv[]) {
 
     const bool showInitially = (!backgroundStart || smokeTestMs > 0);
     auto* client = new clashfx::DaemonClient(customDaemonPipe, customDataDir, &app);
-    clashfx::TrayController controller(client, uiServerName, showInitially, &app);
+    clashfx::TrayController controller(client, uiServerName, showInitially, smokeTestMs > 0, &app);
     controller.startSingleInstanceServer();
     client->start();
 

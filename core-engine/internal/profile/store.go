@@ -30,6 +30,20 @@ func DefaultProxyBypass() string {
 	return DefaultWindowsProxyBypass
 }
 
+const (
+	DefaultDarwinOpenMainWindowHotkey  = "Fn+F12"
+	DefaultWindowsOpenMainWindowHotkey = "Ctrl+Shift+F12"
+)
+
+// DefaultOpenMainWindowHotkey returns the platform-default global shortcut
+// for opening the main ClashFX window.
+func DefaultOpenMainWindowHotkey() string {
+	if runtime.GOOS == "darwin" {
+		return DefaultDarwinOpenMainWindowHotkey
+	}
+	return DefaultWindowsOpenMainWindowHotkey
+}
+
 const DefaultStarterConfigYAML = `mixed-port: 7890
 allow-lan: false
 mode: rule
@@ -65,6 +79,7 @@ rules:
 `
 
 type HotkeySettings struct {
+	OpenMainWindow     string `json:"open_main_window"`
 	ToggleSystemProxy  string `json:"toggle_system_proxy"`
 	SwitchOutboundMode string `json:"switch_outbound_mode"`
 }
@@ -129,6 +144,9 @@ func DefaultSettings() AppSettings {
 		TrayIconPreset:        "default",
 		ShowTraySpeed:         true,
 		Language:              "zh_CN",
+		Hotkeys: HotkeySettings{
+			OpenMainWindow: DefaultOpenMainWindowHotkey(),
+		},
 		UpdateChannel:         "stable",
 		BenchmarkURL:          "https://cp.cloudflare.com/generate_204",
 		MMDBDownloadURL:       "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb",
@@ -608,6 +626,17 @@ func (s *Store) settingsPathLocked() string {
 	return filepath.Join(s.appDataDir, "settings.json")
 }
 
+func hasExplicitOpenMainWindowKey(data []byte) bool {
+	var probe struct {
+		Hotkeys map[string]json.RawMessage `json:"hotkeys"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil || probe.Hotkeys == nil {
+		return false
+	}
+	_, ok := probe.Hotkeys["open_main_window"]
+	return ok
+}
+
 func (s *Store) loadSettingsLocked() error {
 	data, err := os.ReadFile(s.settingsPathLocked())
 	if os.IsNotExist(err) {
@@ -625,7 +654,7 @@ func (s *Store) loadSettingsLocked() error {
 	beforeLang, beforeIcon, beforeAI, beforeBypass := loaded.Language, loaded.TrayIconPreset, loaded.AILockEnabled, loaded.ProxyBypassList
 	NormalizeAppSettings(&loaded)
 	s.settings = loaded
-	if loaded.Language != beforeLang || loaded.TrayIconPreset != beforeIcon || loaded.AILockEnabled != beforeAI || loaded.ProxyBypassList != beforeBypass {
+	if loaded.Language != beforeLang || loaded.TrayIconPreset != beforeIcon || loaded.AILockEnabled != beforeAI || loaded.ProxyBypassList != beforeBypass || !hasExplicitOpenMainWindowKey(data) {
 		_ = writeJSONAtomic(s.settingsPathLocked(), s.settings)
 	}
 	return nil

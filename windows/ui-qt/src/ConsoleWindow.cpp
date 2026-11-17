@@ -161,6 +161,7 @@ void ConsoleWindow::applySnapshot(bool connected, const QJsonObject& snapshot) {
 }
 
 void ConsoleWindow::navigateTo(ConsolePage page, int subTab, const QString& diagNode) {
+    emit hotkeyRecordingChanged(false);
     currentPage_ = page;
     pendingSubTab_ = subTab;
     pendingDiagNode_ = diagNode;
@@ -184,6 +185,14 @@ void ConsoleWindow::presentWindow() {
     show();
     raise();
     activateWindow();
+#ifdef Q_OS_WIN
+    if (HWND hwnd = reinterpret_cast<HWND>(winId())) {
+        if (IsIconic(hwnd)) {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd);
+    }
+#endif
     Win11Dwm::applyFramelessRoundedChrome(this, theme_ == QLatin1String("dark"));
     webView_->setPageActive(true);
     pushWindowState();
@@ -199,6 +208,7 @@ void ConsoleWindow::showEvent(QShowEvent* event) {
 }
 
 void ConsoleWindow::hideEvent(QHideEvent* event) {
+    emit hotkeyRecordingChanged(false);
     QMainWindow::hideEvent(event);
     webView_->setPageActive(false);
     stopTrafficStream();
@@ -595,6 +605,13 @@ void ConsoleWindow::handleNativeAction(const QJsonObject& msg) {
     if (action == QLatin1String("reload_ui")) {
         webView_->reloadApp();
         reply(true);
+        return;
+    }
+
+    if (action == QLatin1String("set_hotkey_recording")) {
+        const bool active = msg.value(QStringLiteral("active")).toBool(false);
+        emit hotkeyRecordingChanged(active);
+        reply(true, QJsonObject{{QStringLiteral("active"), active}});
         return;
     }
 

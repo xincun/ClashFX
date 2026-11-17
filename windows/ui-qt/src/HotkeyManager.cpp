@@ -13,8 +13,9 @@
 namespace clashfx {
 
 namespace {
-constexpr int kHotkeyIdToggleSystemProxy = 0xCF01;
-constexpr int kHotkeyIdSwitchOutboundMode = 0xCF02;
+constexpr int kHotkeyIdOpenMainWindow = 0x0F01;
+constexpr int kHotkeyIdToggleSystemProxy = 0x0F02;
+constexpr int kHotkeyIdSwitchOutboundMode = 0x0F03;
 } // namespace
 
 HotkeyManager::HotkeyManager(QObject* parent)
@@ -33,6 +34,10 @@ HotkeyManager::~HotkeyManager() {
 
 void HotkeyManager::unregisterAll() {
 #ifdef Q_OS_WIN
+    if (openRegistered_) {
+        UnregisterHotKey(nullptr, kHotkeyIdOpenMainWindow);
+        openRegistered_ = false;
+    }
     if (sysProxyRegistered_) {
         UnregisterHotKey(nullptr, kHotkeyIdToggleSystemProxy);
         sysProxyRegistered_ = false;
@@ -69,6 +74,8 @@ bool HotkeyManager::parseChord(const QString& text, unsigned int& outModifiers, 
                    p == QStringLiteral("CMD") || p == QStringLiteral("COMMAND") ||
                    p == QStringLiteral("SUPER")) {
             outModifiers |= MOD_WIN;
+        } else if (p == QStringLiteral("FN") || p == QStringLiteral("FUNCTION")) {
+            // Hardware Fn key has no Win32 RegisterHotKey modifier bit.
         } else if (p.size() == 1 && p[0].unicode() >= 'A' && p[0].unicode() <= 'Z') {
             outVk = static_cast<unsigned int>(p[0].unicode());
         } else if (p.size() == 1 && p[0].unicode() >= '0' && p[0].unicode() <= '9') {
@@ -133,7 +140,8 @@ bool HotkeyManager::parseChord(const QString& text, unsigned int& outModifiers, 
             outVk = VK_OEM_3;
         }
     }
-    if (outModifiers == 0 || outVk == 0) {
+    const bool isFnKey = (outVk >= VK_F1 && outVk <= VK_F24);
+    if (outVk == 0 || (outModifiers == 0 && !isFnKey)) {
         return false;
     }
     outModifiers |= MOD_NOREPEAT;
@@ -144,38 +152,69 @@ bool HotkeyManager::parseChord(const QString& text, unsigned int& outModifiers, 
 #endif
 }
 
-QStringList HotkeyManager::applyHotkeys(const QString& toggleSystemProxy,
+QStringList HotkeyManager::applyHotkeys(const QString& openMainWindow,
+                                        const QString& toggleSystemProxy,
                                         const QString& switchOutboundMode) {
-    QStringList failed;
-    if (toggleSystemProxy.trimmed() == currentSysProxyChord_ &&
-        switchOutboundMode.trimmed() == currentModeChord_) {
-        return failed;
+    const QString normOpen = openMainWindow.trimmed();
+    const QString normToggle = toggleSystemProxy.trimmed();
+    const QString normMode = switchOutboundMode.trimmed();
+    if (hasAppliedOnce_ &&
+        normOpen == currentOpenChord_ &&
+        normToggle == currentSysProxyChord_ &&
+        normMode == currentModeChord_) {
+        return {};
     }
-    unregisterAll();
-    currentSysProxyChord_ = toggleSystemProxy.trimmed();
-    currentModeChord_ = switchOutboundMode.trimmed();
+    hasAppliedOnce_ = true;
+    currentOpenChord_ = normOpen;
+    currentSysProxyChord_ = normToggle;
+    currentModeChord_ = normMode;
 
-#ifdef Q_OS_WIN
-    unsigned int mods = 0;
-    unsigned int vk = 0;
-    if (!currentSysProxyChord_.isEmpty()) {
-        if (parseChord(currentSysProxyChord_, mods, vk)) {
-            sysProxyRegistered_ = (RegisterHotKey(nullptr, kHotkeyIdToggleSystemProxy, mods, vk) != FALSE);
-        } else {
-            sysProxyRegistered_ = false;
-        }
-        if (!sysProxyRegistered_) {
-            failed.append(currentSysProxyChord_);
-        }
+    if (suspended_) {
+        unregisterAll();
+        return {};
     }
-    if (!currentModeChord_.isEmpty()) {
-        if (parseChord(currentModeChord_, mods, vk)) {
-            modeRegistered_ = (RegisterHotKey(nullptr, kHotkeyIdSwitchOutboundMode, mods, vk) != FALSE);
-        } else {
-            modeRegistered_ = false;
+    return registerConfiguredHotkeys();
+}
+
+void HotkeyManager::setSuspended(bool suspended) {
+    if (suspended_ == suspended) {
+        return;
+    }
+    suspended_ = suspended;
+    if (suspended_) {
+        unregisterAll();
+    } else if (hasAppliedOnce_) {
+        registerConfiguredHotkeys();
+    }
+}
+
+QStringList HotkeyManager::registerConfiguredHotkeys() {
+    unregisterAll();
+    QStringList failed;
+#ifdef Q_OS_WIN
+    struct HotkeyEntry {
+        int id;
+        const QString& chord;
+        bool& registered;
+    };
+    const HotkeyEntry entries[] = {
+        {kHotkeyIdOpenMainWindow, currentOpenChord_, openRegistered_},
+        {kHotkeyIdToggleSystemProxy, currentSysProxyChord_, sysProxyRegistered_},
+        {kHotkeyIdSwitchOutboundMode, currentModeChord_, modeRegistered_},
+    };
+    for (const HotkeyEntry& entry : entries) {
+        if (entry.chord.isEmpty()) {
+            continue;
         }
-        if (!modeRegistered_) {
-            failed.append(currentModeChord_);
+        unsigned int mods = 0;
+        unsigned int vk = 0;
+        if (parseChord(entry.chord, mods, vk)) {
+            entry.registered = (RegisterHotKey(nullptr, entry.id, mods, vk) != FALSE);
+        } else {
+            entry.registered = false;
+        }
+        if (!entry.registered) {
+            failed.append(entry.chord);
         }
     }
 #endif
@@ -189,6 +228,10 @@ bool HotkeyManager::nativeEventFilter(const QByteArray& eventType,
     if (eventType == "windows_generic_MSG" || eventType == "windows_dispatcher_MSG") {
         const MSG* msg = static_cast<const MSG*>(message);
         if (msg && msg->message == WM_HOTKEY) {
+            if (msg->wParam == kHotkeyIdOpenMainWindow) {
+                emit openMainWindowTriggered();
+                return true;
+            }
             if (msg->wParam == kHotkeyIdToggleSystemProxy) {
                 emit toggleSystemProxyTriggered();
                 return true;

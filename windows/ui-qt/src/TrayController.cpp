@@ -133,15 +133,25 @@ QString buildTopSubscriptionStatusText(const QString& profileName, const QJsonOb
     return parts.join(QStringLiteral(" · "));
 }
 
+QString resolveOpenMainWindowChord(const QJsonObject& settings) {
+    const QJsonObject hk = settings.value(QStringLiteral("hotkeys")).toObject();
+    if (hk.contains(QStringLiteral("open_main_window"))) {
+        return hk.value(QStringLiteral("open_main_window")).toString().trimmed();
+    }
+    return QStringLiteral("Ctrl+Shift+F12");
+}
+
 } // namespace
 
 TrayController::TrayController(DaemonClient* client,
                                const QString& uiServerName,
                                bool showConsoleInitially,
+                               bool smokeMode,
                                QObject* parent)
     : QObject(parent)
     , client_(client)
-    , uiServerName_(uiServerName) {
+    , uiServerName_(uiServerName)
+    , smokeMode_(smokeMode) {
     hotkeys_ = new HotkeyManager(this);
     consoleWindow_ = new ConsoleWindow(client_);
     netMgr_ = new QNetworkAccessManager(this);
@@ -172,8 +182,10 @@ TrayController::TrayController(DaemonClient* client,
             });
         }
     });
+    connect(hotkeys_, &HotkeyManager::openMainWindowTriggered, this, &TrayController::onOpenMainWindowHotkey);
     connect(hotkeys_, &HotkeyManager::toggleSystemProxyTriggered, this, &TrayController::onToggleSystemProxyHotkey);
     connect(hotkeys_, &HotkeyManager::switchOutboundModeTriggered, this, &TrayController::onSwitchModeHotkey);
+    connect(consoleWindow_, &ConsoleWindow::hotkeyRecordingChanged, hotkeys_, &HotkeyManager::setSuspended);
 
     connect(&I18n::instance(), &I18n::languageChanged, this, [this]() { rebuildTrayVisualsAndMenu(true); });
 
@@ -268,6 +280,9 @@ void TrayController::handleExternalCommand(const QString& message) {
 
 void TrayController::onConnectionChanged(bool connected) {
     connected_ = connected;
+    if (!connected && snapshot_.isEmpty() && !smokeMode_) {
+        hotkeys_->applyHotkeys(QStringLiteral("Ctrl+Shift+F12"), QString(), QString());
+    }
     consoleWindow_->applySnapshot(connected_, snapshot_);
     rebuildTrayVisualsAndMenu();
 }
@@ -281,15 +296,18 @@ void TrayController::onStateChanged(const QJsonObject& snapshot) {
     I18n::instance().setLanguage(lang);
 
     const QJsonObject hk = settings.value(QStringLiteral("hotkeys")).toObject();
-    const QStringList failedChords = hotkeys_->applyHotkeys(
-        hk.value(QStringLiteral("toggle_system_proxy")).toString(),
-        hk.value(QStringLiteral("switch_outbound_mode")).toString());
-    if (!failedChords.isEmpty() && trayIcon_) {
-        trayIcon_->showMessage(
-            QStringLiteral("ClashFX"),
-            L("全局快捷键已被其他程序占用或格式无效: ", "Global hotkey unavailable or already in use: ") +
-                failedChords.join(QStringLiteral(", ")),
-            QSystemTrayIcon::Warning);
+    if (!smokeMode_) {
+        const QStringList failedChords = hotkeys_->applyHotkeys(
+            resolveOpenMainWindowChord(settings),
+            hk.value(QStringLiteral("toggle_system_proxy")).toString(),
+            hk.value(QStringLiteral("switch_outbound_mode")).toString());
+        if (!failedChords.isEmpty() && trayIcon_) {
+            trayIcon_->showMessage(
+                QStringLiteral("ClashFX"),
+                L("全局快捷键已被其他程序占用或格式无效: ", "Global hotkey unavailable or already in use: ") +
+                    failedChords.join(QStringLiteral(", ")),
+                QSystemTrayIcon::Warning);
+        }
     }
 
     consoleWindow_->applySnapshot(connected_, snapshot_);
@@ -299,6 +317,12 @@ void TrayController::onStateChanged(const QJsonObject& snapshot) {
 void TrayController::onTrayActivated(QSystemTrayIcon::ActivationReason reason) {
     if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick) {
         openConsole();
+    }
+}
+
+void TrayController::onOpenMainWindowHotkey() {
+    if (consoleWindow_) {
+        consoleWindow_->presentWindow();
     }
 }
 
@@ -385,6 +409,7 @@ QByteArray TrayController::buildMenuSignature() const {
     sig.insert(QStringLiteral("groups"), snapshot_.value(QStringLiteral("proxy_groups")));
     sig.insert(QStringLiteral("sub_info"), snapshot_.value(QStringLiteral("active_subscription_info")));
     sig.insert(QStringLiteral("custom_rules"), settings.value(QStringLiteral("custom_rules")));
+    sig.insert(QStringLiteral("hk_open"), resolveOpenMainWindowChord(settings));
     return QJsonDocument(sig).toJson(QJsonDocument::Compact);
 }
 
@@ -672,7 +697,12 @@ void TrayController::rebuildMenuContents() {
     }
 
     // 1. Open Console
-    QAction* openAct = trayMenu_->addAction(L("打开控制台 (MetaCubeXD)", "Open Console (MetaCubeXD)"),
+    const QString openChord = resolveOpenMainWindowChord(settings);
+    QString openTitle = L("打开控制台 (MetaCubeXD)", "Open Console (MetaCubeXD)");
+    if (!openChord.isEmpty()) {
+        openTitle += QLatin1Char('\t') + openChord;
+    }
+    QAction* openAct = trayMenu_->addAction(openTitle,
                                             this,
                                             &TrayController::openConsole);
     QFont boldFont = openAct->font();

@@ -4,6 +4,7 @@ import Foundation
 final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
     private let client: DaemonClient
     private let consoleWindow: ConsoleWindowController
+    private let smokeMode: Bool
     private let hotkeys = HotkeyManager()
     private let statusItem: NSStatusItem
     private let trayMenu = NSMenu()
@@ -45,14 +46,19 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
     private static let speedFont = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .medium)
     private static let speedSampleText = "999.9KB/s"
 
-    init(client: DaemonClient, consoleWindow: ConsoleWindowController, showConsoleInitially: Bool) {
+    init(client: DaemonClient, consoleWindow: ConsoleWindowController, showConsoleInitially: Bool, smokeMode: Bool = false) {
         self.client = client
         self.consoleWindow = consoleWindow
+        self.smokeMode = smokeMode
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
         trayMenu.delegate = self
         statusItem.menu = trayMenu
+
+        consoleWindow.onHotkeyRecordingChanged = { [weak self] active in
+            self?.hotkeys.setSuspended(active)
+        }
 
         i18nObserverID = I18n.shared.addObserver { [weak self] _ in
             self?.rebuildVisualsAndMenu(forceMenu: true)
@@ -97,8 +103,24 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
 
     // MARK: - Daemon & Navigation Entry Points
 
+    private func resolveOpenMainWindowChord(_ settings: [String: Any]) -> String {
+        let hk = (settings["hotkeys"] as? [String: Any]) ?? [:]
+        return ((hk["open_main_window"] as? String) ?? "Fn+F12")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     func onConnectionChanged(_ conn: Bool) {
         connected = conn
+        if !conn && snapshot.isEmpty && !smokeMode {
+            _ = hotkeys.applyHotkeys(
+                openMainWindow: "Fn+F12",
+                toggleSystemProxy: "",
+                switchOutboundMode: "",
+                onOpenMainWindow: { [weak self] in self?.onOpenMainWindowHotkey() },
+                onToggleSystemProxy: { [weak self] in self?.onToggleSystemProxyHotkey() },
+                onSwitchOutboundMode: { [weak self] in self?.onSwitchModeHotkey() }
+            )
+        }
         consoleWindow.applySnapshot(connected: conn, snapshot: snapshot)
         rebuildVisualsAndMenu()
     }
@@ -112,21 +134,26 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
         I18n.shared.setLanguage(lang)
 
         let hk = (settings["hotkeys"] as? [String: Any]) ?? [:]
+        let openChord = resolveOpenMainWindowChord(settings)
         let toggleChord = (hk["toggle_system_proxy"] as? String) ?? ""
         let modeChord = (hk["switch_outbound_mode"] as? String) ?? ""
-        let failed = hotkeys.applyHotkeys(
-            toggleSystemProxy: toggleChord,
-            switchOutboundMode: modeChord,
-            onToggleSystemProxy: { [weak self] in self?.onToggleSystemProxyHotkey() },
-            onSwitchOutboundMode: { [weak self] in self?.onSwitchModeHotkey() }
-        )
-        if !failed.isEmpty {
-            showAlert(
-                title: "ClashFX",
-                message: L("全局快捷键已被其他程序占用或格式无效: ", "Global hotkey unavailable or already in use: ")
-                    + failed.joined(separator: ", "),
-                warning: true
+        if !smokeMode {
+            let failed = hotkeys.applyHotkeys(
+                openMainWindow: openChord,
+                toggleSystemProxy: toggleChord,
+                switchOutboundMode: modeChord,
+                onOpenMainWindow: { [weak self] in self?.onOpenMainWindowHotkey() },
+                onToggleSystemProxy: { [weak self] in self?.onToggleSystemProxyHotkey() },
+                onSwitchOutboundMode: { [weak self] in self?.onSwitchModeHotkey() }
             )
+            if !failed.isEmpty {
+                showAlert(
+                    title: "ClashFX",
+                    message: L("全局快捷键已被其他程序占用或格式无效: ", "Global hotkey unavailable or already in use: ")
+                        + failed.joined(separator: ", "),
+                    warning: true
+                )
+            }
         }
 
         consoleWindow.applySnapshot(connected: true, snapshot: snap)
@@ -248,6 +275,13 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
     }
 
     // MARK: - Hotkeys
+
+    private func onOpenMainWindowHotkey() {
+        if isMenuOpen {
+            trayMenu.cancelTracking()
+        }
+        consoleWindow.presentWindow()
+    }
 
     private func onToggleSystemProxyHotkey() {
         guard !snapshot.isEmpty else { return }
@@ -714,6 +748,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
             "groups": snapshot["proxy_groups"] ?? [],
             "sub_info": snapshot["active_subscription_info"] ?? [:],
             "custom_rules": settings["custom_rules"] ?? [],
+            "hk_open": resolveOpenMainWindowChord(settings),
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: sigObj, options: [.sortedKeys]),
               let s = String(data: data, encoding: .utf8) else {
@@ -802,7 +837,12 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
             trayMenu.addItem(.separator())
         }
 
-        addItem(to: trayMenu, title: L("打开控制台 (MetaCubeXD)", "Open Console (MetaCubeXD)"), bold: true) { [weak self] in
+        let openChord = resolveOpenMainWindowChord(settings)
+        var openTitle = L("打开控制台 (MetaCubeXD)", "Open Console (MetaCubeXD)")
+        if !openChord.isEmpty {
+            openTitle += "  [\(openChord)]"
+        }
+        addItem(to: trayMenu, title: openTitle, bold: true) { [weak self] in
             self?.openConsole()
         }
         trayMenu.addItem(.separator())

@@ -7,8 +7,14 @@ final class HotkeyManager {
     private var eventHandlerRef: EventHandlerRef?
     private var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
     private var callbacks: [UInt32: () -> Void] = [:]
+    private var lastOpenChord = ""
     private var lastToggleChord = ""
     private var lastModeChord = ""
+    private var lastOnOpen: (() -> Void)?
+    private var lastOnToggle: (() -> Void)?
+    private var lastOnMode: (() -> Void)?
+    private var hasAppliedOnce = false
+    private var isSuspended = false
 
     init() {
         HotkeyManager.activeInstance = self
@@ -27,29 +33,58 @@ final class HotkeyManager {
     }
 
     func applyHotkeys(
+        openMainWindow: String,
         toggleSystemProxy: String,
         switchOutboundMode: String,
+        onOpenMainWindow: @escaping () -> Void,
         onToggleSystemProxy: @escaping () -> Void,
         onSwitchOutboundMode: @escaping () -> Void
     ) -> [String] {
+        let normOpen = openMainWindow.trimmingCharacters(in: .whitespacesAndNewlines)
         let normToggle = toggleSystemProxy.trimmingCharacters(in: .whitespacesAndNewlines)
         let normMode = switchOutboundMode.trimmingCharacters(in: .whitespacesAndNewlines)
-        if normToggle == lastToggleChord && normMode == lastModeChord {
+
+        lastOnOpen = onOpenMainWindow
+        lastOnToggle = onToggleSystemProxy
+        lastOnMode = onSwitchOutboundMode
+
+        if hasAppliedOnce && normOpen == lastOpenChord && normToggle == lastToggleChord && normMode == lastModeChord {
             return []
         }
+        hasAppliedOnce = true
+        lastOpenChord = normOpen
         lastToggleChord = normToggle
         lastModeChord = normMode
 
+        if isSuspended {
+            unregisterAll()
+            return []
+        }
+        return registerConfiguredHotkeys()
+    }
+
+    func setSuspended(_ suspended: Bool) {
+        guard suspended != isSuspended else { return }
+        isSuspended = suspended
+        if suspended {
+            unregisterAll()
+        } else if hasAppliedOnce {
+            _ = registerConfiguredHotkeys()
+        }
+    }
+
+    private func registerConfiguredHotkeys() -> [String] {
         unregisterAll()
         var failed: [String] = []
-        if !normToggle.isEmpty {
-            if !register(id: 1, chord: normToggle, action: onToggleSystemProxy) {
-                failed.append(normToggle)
-            }
-        }
-        if !normMode.isEmpty {
-            if !register(id: 2, chord: normMode, action: onSwitchOutboundMode) {
-                failed.append(normMode)
+        let slots: [(id: UInt32, chord: String, action: (() -> Void)?)] = [
+            (1, lastOpenChord, lastOnOpen),
+            (2, lastToggleChord, lastOnToggle),
+            (3, lastModeChord, lastOnMode),
+        ]
+        for slot in slots where !slot.chord.isEmpty {
+            guard let action = slot.action else { continue }
+            if !register(id: slot.id, chord: slot.chord, action: action) {
+                failed.append(slot.chord)
             }
         }
         return failed
@@ -118,7 +153,7 @@ final class HotkeyManager {
         )
     }
 
-    private func parseChord(_ raw: String) -> (keyCode: UInt32, modifiers: UInt32)? {
+    func parseChord(_ raw: String) -> (keyCode: UInt32, modifiers: UInt32)? {
         var source = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         var forcedPlusKey = false
         if source.hasSuffix("++") {
@@ -132,6 +167,7 @@ final class HotkeyManager {
         guard !parts.isEmpty else { return nil }
 
         var mods: UInt32 = 0
+        var hasFn = false
         var keyName = forcedPlusKey ? "=" : ""
 
         for part in parts {
@@ -144,14 +180,33 @@ final class HotkeyManager {
                 mods |= UInt32(optionKey)
             case "shift":
                 mods |= UInt32(shiftKey)
+            case "fn", "function":
+                hasFn = true
             default:
                 keyName = part
             }
         }
-        guard !keyName.isEmpty, mods != 0, let code = keyCodeForName(keyName) else {
+        guard !keyName.isEmpty, let code = keyCodeForName(keyName) else {
             return nil
         }
+        // macOS synthesizes kEventKeyModifierFnMask on F1..F20 and treats Fn+F12 and F12
+        // as the same Carbon hotkey slot (mods=0). Keep explicit non-Fn modifiers if provided.
+        if !isFunctionKeyName(keyName) {
+            if hasFn {
+                mods |= UInt32(kEventKeyModifierFnMask)
+            }
+            guard mods != 0 else {
+                return nil
+            }
+        }
         return (code, mods)
+    }
+
+    private func isFunctionKeyName(_ key: String) -> Bool {
+        guard key.hasPrefix("f"), let num = Int(key.dropFirst()) else {
+            return false
+        }
+        return num >= 1 && num <= 20
     }
 
     private func keyCodeForName(_ key: String) -> UInt32? {

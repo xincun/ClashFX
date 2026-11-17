@@ -263,6 +263,7 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
 
     var isUiReady: Bool { uiReady }
     var isVisible: Bool { window.isVisible }
+    var onHotkeyRecordingChanged: ((Bool) -> Void)?
 
     init(client: DaemonClient) {
         self.client = client
@@ -330,6 +331,7 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
     }
 
     func navigateTo(page: Int, subTab: Int = -1, diagNode: String = "") {
+        onHotkeyRecordingChanged?(false)
         currentPage = max(0, min(6, page))
         pendingSubTab = subTab
         pendingDiagNode = diagNode
@@ -353,8 +355,10 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
         if window.isMiniaturized {
             window.deminiaturize(nil)
         }
+        window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         if activateApp {
+            NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
             NSApp.activate(ignoringOtherApps: true)
         }
         pushWindowState()
@@ -392,6 +396,7 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
     // MARK: - NSWindowDelegate
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        onHotkeyRecordingChanged?(false)
         if allowClose {
             return true
         }
@@ -843,6 +848,11 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
         case "reload_ui":
             webView.reload()
             replyOk([:])
+
+        case "set_hotkey_recording":
+            let active = (msg["active"] as? Bool) ?? false
+            onHotkeyRecordingChanged?(active)
+            replyOk(["active": active])
 
         default:
             replyErr("Unknown native action")

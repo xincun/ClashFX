@@ -13,25 +13,33 @@ public:
     explicit HotkeyManager(QObject* parent = nullptr);
     ~HotkeyManager() override;
 
-    QStringList applyHotkeys(const QString& toggleSystemProxy,
+    QStringList applyHotkeys(const QString& openMainWindow,
+                             const QString& toggleSystemProxy,
                              const QString& switchOutboundMode);
+    void setSuspended(bool suspended);
 
     bool nativeEventFilter(const QByteArray& eventType,
                            void* message,
                            qintptr* result) override;
 
 signals:
+    void openMainWindowTriggered();
     void toggleSystemProxyTriggered();
     void switchOutboundModeTriggered();
 
 private:
     void unregisterAll();
+    QStringList registerConfiguredHotkeys();
     static bool parseChord(const QString& text, unsigned int& outModifiers, unsigned int& outVk);
 
+    QString currentOpenChord_;
     QString currentSysProxyChord_;
     QString currentModeChord_;
+    bool openRegistered_ = false;
     bool sysProxyRegistered_ = false;
     bool modeRegistered_ = false;
+    bool hasAppliedOnce_ = false;
+    bool suspended_ = false;
 };
 
 } // namespace clashfx

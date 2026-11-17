@@ -862,6 +862,9 @@ func TestUpdateSettingsFrontendPayloadAndLaunchAtLogin(t *testing.T) {
 
 	// 1) Fast-path desktop settings update (must succeed with zero core restart / validation).
 	cur := eng.store.Settings()
+	if cur.Hotkeys.OpenMainWindow != profile.DefaultOpenMainWindowHotkey() {
+		t.Fatalf("expected initial OpenMainWindow=%q, got %q", profile.DefaultOpenMainWindowHotkey(), cur.Hotkeys.OpenMainWindow)
+	}
 	cur.LaunchAtLogin = true
 	cur.TrayIconPreset = "monochrome"
 	cur.Language = "en_US"
@@ -871,6 +874,7 @@ func TestUpdateSettingsFrontendPayloadAndLaunchAtLogin(t *testing.T) {
 	cur.ShowTraySpeed = false
 	cur.BenchmarkURL = "https://example.com/generate_204"
 	cur.Hotkeys = profile.HotkeySettings{
+		OpenMainWindow:     "Cmd+Shift+O",
 		ToggleSystemProxy:  "Cmd+Shift+P",
 		SwitchOutboundMode: "Cmd+Shift+M",
 	}
@@ -962,6 +966,37 @@ func TestUpdateSettingsFrontendPayloadAndLaunchAtLogin(t *testing.T) {
 	}
 	if len(got.SuspendNetworks) != 1 || got.SuspendNetworks[0] != "CorpWiFi" {
 		t.Fatalf("unexpected suspend_networks: %+v", got.SuspendNetworks)
+	}
+	if got.Hotkeys.OpenMainWindow != "Cmd+Shift+O" {
+		t.Fatalf("expected partial hotkeys update to preserve open_main_window=\"Cmd+Shift+O\", got %q", got.Hotkeys.OpenMainWindow)
+	}
+
+	// 3) Explicitly clearing open_main_window via "" must persist and succeed on fast path.
+	clearSettings := `{"settings":{"hotkeys":{"open_main_window":"","toggle_system_proxy":"Cmd+Shift+P","switch_outbound_mode":"Cmd+Shift+M"}}}`
+	clearFrame, _ := json.Marshal(RPCRequest{
+		ID:     43,
+		Method: "update_settings",
+		Params: json.RawMessage(clearSettings),
+	})
+	clearFrame = append(clearFrame, '\n')
+	_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write(clearFrame); err != nil {
+		t.Fatalf("write clear update_settings failed: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	clearLine, err := bufio.NewReader(conn).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read clear update_settings reply failed: %v", err)
+	}
+	var clearResp RPCResponse
+	if err := json.Unmarshal(clearLine, &clearResp); err != nil {
+		t.Fatalf("unmarshal clear update_settings reply: %v", err)
+	}
+	if !clearResp.OK {
+		t.Fatalf("expected clear open_main_window update_settings OK, got error=%q", clearResp.Error)
+	}
+	if gotCleared := eng.store.Settings().Hotkeys.OpenMainWindow; gotCleared != "" {
+		t.Fatalf("expected cleared OpenMainWindow=\"\", got %q", gotCleared)
 	}
 
 	if runtime.GOOS == "darwin" {

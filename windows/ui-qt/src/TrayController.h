@@ -26,6 +26,7 @@ public:
     explicit TrayController(DaemonClient* client,
                             const QString& uiServerName,
                             bool showConsoleInitially,
+                            bool smokeMode = false,
                             QObject* parent = nullptr);
     ~TrayController() override;
 
@@ -49,6 +50,7 @@ private slots:
     void onConnectionChanged(bool connected);
     void onStateChanged(const QJsonObject& snapshot);
     void onTrayActivated(QSystemTrayIcon::ActivationReason reason);
+    void onOpenMainWindowHotkey();
     void onToggleSystemProxyHotkey();
     void onSwitchModeHotkey();
 
@@ -95,6 +97,7 @@ private:
     QPointer<QAction> liveSpeedAction_;
 
     bool connected_ = false;
+    bool smokeMode_ = false;
     bool menuDirty_ = true;
     bool daemonQuitSent_ = false;
     bool forceRestoreOnQuit_ = false;
