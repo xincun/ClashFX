@@ -223,13 +223,20 @@ rules:
 	if effView.DefaultTarget != "Proxy" || len(effView.Rules) < 2 {
 		t.Fatalf("unexpected effective rules view: %+v", effView)
 	}
-	if effView.Rules[0].Payload != "scholar.org" || effView.Rules[0].Proxy != "Proxy" || effView.Rules[0].Source != "mixin" {
-		t.Fatalf("expected mixin rule #0 -> Proxy, got %+v", effView.Rules[0])
+	scholarIdx := -1
+	for _, r := range effView.Rules {
+		if r.Payload == "scholar.org" && r.Proxy == "Proxy" && r.Source == "mixin" {
+			scholarIdx = r.Index
+			break
+		}
+	}
+	if scholarIdx < 0 {
+		t.Fatalf("expected mixin rule scholar.org -> Proxy in effective rules, got %+v", effView.Rules)
 	}
 
 	// 7. Live top-level rule disable/enable (PATCH /rules/disable) + editable ruleset save/reset
 	disResp := callRPC(8, "set_rule_disabled", map[string]any{
-		"indices":  []int{0},
+		"indices":  []int{scholarIdx},
 		"disabled": true,
 	})
 	if !disResp.OK {
@@ -238,12 +245,19 @@ rules:
 	var disView EffectiveRulesView
 	rawDis, _ := json.Marshal(disResp.Data)
 	_ = json.Unmarshal(rawDis, &disView)
-	if !disView.Rules[0].Disabled {
-		t.Fatalf("expected rule #0 Disabled=true, got %+v", disView.Rules[0])
+	scholarDisabled := false
+	for _, r := range disView.Rules {
+		if r.Index == scholarIdx && r.Disabled {
+			scholarDisabled = true
+			break
+		}
+	}
+	if !scholarDisabled {
+		t.Fatalf("expected rule #%d Disabled=true, got %+v", scholarIdx, disView.Rules)
 	}
 
 	enResp := callRPC(9, "set_rule_disabled", map[string]any{
-		"indices":  []int{0},
+		"indices":  []int{scholarIdx},
 		"disabled": false,
 	})
 	if !enResp.OK {

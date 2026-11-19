@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/clashfx/core-engine/internal/ailock"
 	"github.com/clashfx/core-engine/internal/profile"
 	"gopkg.in/yaml.v3"
 )
@@ -113,13 +114,16 @@ rules:
 	if err := yaml.Unmarshal([]byte(applier.appliedData), &appliedDoc); err != nil {
 		t.Fatalf("unmarshal applied runtime yaml: %v", err)
 	}
-	for _, k := range []string{"captive.apple.com", "+.msftconnecttest.com", "+.msftncsi.com"} {
+	for _, k := range []string{"*", "+.test", "+.local", "+.internal", "captive.apple.com", "+.msftconnecttest.com", "+.msftncsi.com"} {
 		if got := appliedDoc.DNS.NameserverPolicy[k]; got != "system" {
 			t.Fatalf("dns.nameserver-policy[%q] = %q, want \"system\"", k, got)
 		}
 	}
-	if len(appliedDoc.Rules) == 0 || appliedDoc.Rules[0] != "RULE-SET,"+profile.InternalDirectRuleProviderName+",DIRECT" {
-		t.Fatalf("expected %s at rules[0], got %v", profile.InternalDirectRuleProviderName, appliedDoc.Rules)
+	if len(appliedDoc.Rules) < 2 ||
+		appliedDoc.Rules[0] != "RULE-SET,"+profile.InternalDirectRuleProviderName+",DIRECT" ||
+		appliedDoc.Rules[1] != "RULE-SET,"+profile.PrivateDirectRuleProviderName+",DIRECT" {
+		t.Fatalf("expected %s then %s at top of rules, got %v",
+			profile.InternalDirectRuleProviderName, profile.PrivateDirectRuleProviderName, appliedDoc.Rules)
 	}
 	foundCaptiveDirect := false
 	for _, r := range appliedDoc.Rules {
@@ -167,5 +171,274 @@ rules:
 	}
 	if !strings.Contains(applier.appliedData, "GoodNode") {
 		t.Fatalf("expected automatic rollback to restore GoodNode, got:\n%s", applier.appliedData)
+	}
+}
+
+func TestPrivateIntranetDNSFakeIPFilterAndAILockDirectPrecedence(t *testing.T) {
+	store, err := profile.NewStore(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Disable GEOSITE rules in mixin so real Mihomo config parsing requires no external geosite.dat.
+	if err := profile.WriteFileAtomic(store.ProfileMixinPath(), []byte(profile.DisabledProfileMixinTemplate), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	profileYAML := `mixed-port: 17890
+proxies:
+  - name: GeneralHK
+    type: socks5
+    server: 127.0.0.1
+    port: 1081
+  - name: LockedUS
+    type: socks5
+    server: 198.51.100.10
+    port: 1082
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [GeneralHK]
+rules:
+  - MATCH,Proxy
+`
+	if err := profile.WriteFileAtomic(store.ProfilePath("config"), []byte(profileYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.EnhancedMode = true
+		s.AILockEnabled = true
+		s.AILockTarget = "LockedUS"
+		s.TunRouteExcludes = "30.0.0.0/8, 30.1.2.3, *.alibaba-inc.com, conan.custom.org"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applier := &mockApplier{}
+	ctrl := NewController(store, applier, "", ailock.TransformHookForController(nil))
+	ctrl.SetPortProbeForTest(func(int, bool) (bool, bool) { return true, false })
+
+	if _, err := ctrl.Apply(context.Background(), false); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	var doc struct {
+		DNS struct {
+			EnhancedMode     string            `yaml:"enhanced-mode"`
+			FakeIPFilter     []string          `yaml:"fake-ip-filter"`
+			NameserverPolicy map[string]string `yaml:"nameserver-policy"`
+		} `yaml:"dns"`
+		Tun struct {
+			RouteExcludeAddress []string `yaml:"route-exclude-address"`
+		} `yaml:"tun"`
+		Rules         []string `yaml:"rules"`
+		RuleProviders map[string]struct {
+			Type     string   `yaml:"type"`
+			Behavior string   `yaml:"behavior"`
+			Payload  []string `yaml:"payload"`
+		} `yaml:"rule-providers"`
+	}
+	if err := yaml.Unmarshal([]byte(applier.appliedData), &doc); err != nil {
+		t.Fatalf("unmarshal applied runtime YAML failed: %v", err)
+	}
+
+	// 1. Verify Fake-IP filter includes dotless "*", multi-level private TLDs (+.<tld>),
+	// and normalized TunRouteExcludes domains.
+	hasItem := func(list []string, want string) bool {
+		for _, v := range list {
+			if v == want {
+				return true
+			}
+		}
+		return false
+	}
+	for _, want := range []string{
+		"*",
+		"+.test",
+		"+.local",
+		"+.lan",
+		"+.localdomain",
+		"+.localhost",
+		"+.home.arpa",
+		"+.internal",
+		"+.corp",
+		"+.intranet",
+		"+.private",
+		"+.alibaba-inc.com",
+		"conan.custom.org",
+	} {
+		if !hasItem(doc.DNS.FakeIPFilter, want) {
+			t.Fatalf("expected %q in dns.fake-ip-filter, got %v", want, doc.DNS.FakeIPFilter)
+		}
+	}
+
+	// 2. Verify nameserver-policy routes dotless, private TLDs, and TunRouteExcludes domains to system DNS.
+	for _, want := range []string{
+		"*",
+		"+.test",
+		"+.local",
+		"+.internal",
+		"+.corp",
+		"+.alibaba-inc.com",
+		"conan.custom.org",
+		"captive.apple.com",
+	} {
+		if got := doc.DNS.NameserverPolicy[want]; got != "system" {
+			t.Fatalf("dns.nameserver-policy[%q] = %q, want \"system\"", want, got)
+		}
+	}
+
+	// 3. Verify TUN route-exclude-address captures both CIDRs and bare IPs normalized to /32.
+	for _, wantCIDR := range []string{"30.0.0.0/8", "30.1.2.3/32"} {
+		if !hasItem(doc.Tun.RouteExcludeAddress, wantCIDR) {
+			t.Fatalf("expected %q in tun.route-exclude-address, got %v", wantCIDR, doc.Tun.RouteExcludeAddress)
+		}
+	}
+
+	// 4. Verify rule ordering places clashfx-internal-direct and clashfx-private-direct BEFORE clashfx-ai-lock.
+	wantLeading := []string{
+		"RULE-SET," + profile.InternalDirectRuleProviderName + ",DIRECT",
+		"RULE-SET," + profile.PrivateDirectRuleProviderName + ",DIRECT",
+		"RULE-SET," + profile.AILockRuleProviderName + ",LockedUS",
+		"RULE-SET," + profile.AILockRuleProviderName + ",REJECT",
+	}
+	if len(doc.Rules) < len(wantLeading) {
+		t.Fatalf("rules too short: %v", doc.Rules)
+	}
+	for i, want := range wantLeading {
+		if doc.Rules[i] != want {
+			t.Fatalf("rules[%d] = %q, want %q (all rules: %v)", i, doc.Rules[i], want, doc.Rules)
+		}
+	}
+
+	// 5. Verify clashfx-private-direct inline provider contains LAN CIDRs, private TLDs, dotless regex, and TunRouteExcludes.
+	privProv := doc.RuleProviders[profile.PrivateDirectRuleProviderName]
+	if privProv.Type != "inline" || privProv.Behavior != "classical" {
+		t.Fatalf("unexpected %s provider definition: %+v", profile.PrivateDirectRuleProviderName, privProv)
+	}
+	for _, wantRule := range []string{
+		"IP-CIDR,127.0.0.0/8,no-resolve",
+		"IP-CIDR,10.0.0.0/8,no-resolve",
+		"IP-CIDR,192.168.0.0/16,no-resolve",
+		"IP-CIDR,30.0.0.0/8,no-resolve",
+		"IP-CIDR,30.1.2.3/32,no-resolve",
+		"DOMAIN-SUFFIX,test",
+		"DOMAIN-SUFFIX,local",
+		"DOMAIN-SUFFIX,internal",
+		"DOMAIN-SUFFIX,alibaba-inc.com",
+		"DOMAIN,conan.custom.org",
+		"DOMAIN-REGEX," + profile.DotlessHostnameRegex,
+	} {
+		if !hasItem(privProv.Payload, wantRule) {
+			t.Fatalf("expected %q in %s payload, got %v", wantRule, profile.PrivateDirectRuleProviderName, privProv.Payload)
+		}
+	}
+
+	// 6. Verify partial subscription fake-ip-filter + direct-nameserver + custom nameserver-policy preservation
+	partialSubYAML := `mixed-port: 17890
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - "*.lan"
+    - "custom.keep.org"
+  direct-nameserver:
+    - 223.5.5.5
+  nameserver-policy:
+    "+.test": "10.0.0.53"
+proxies:
+  - name: LockedUS
+    type: socks5
+    server: 198.51.100.10
+    port: 1082
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [LockedUS]
+rules:
+  - MATCH,Proxy
+`
+	if err := profile.WriteFileAtomic(store.ProfilePath("partial"), []byte(partialSubYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.SelectedProfile = "partial"
+		s.AILockEnabled = false
+		s.TunRouteExcludes = ""
+		return nil
+	})
+	if _, err := ctrl.Apply(context.Background(), false); err != nil {
+		t.Fatalf("Apply partial profile failed: %v", err)
+	}
+	var partialDoc struct {
+		DNS struct {
+			FakeIPFilter                 []string          `yaml:"fake-ip-filter"`
+			NameserverPolicy             map[string]string `yaml:"nameserver-policy"`
+			DirectNameserverFollowPolicy bool              `yaml:"direct-nameserver-follow-policy"`
+		} `yaml:"dns"`
+	}
+	if err := yaml.Unmarshal([]byte(applier.appliedData), &partialDoc); err != nil {
+		t.Fatal(err)
+	}
+	filterJoined := strings.Join(partialDoc.DNS.FakeIPFilter, ",")
+	for _, want := range []string{"custom.keep.org", "+.test", "+.local", "+.internal", "*"} {
+		if !strings.Contains(filterJoined, want) {
+			t.Fatalf("expected %q merged into partial fake-ip-filter, got %v", want, partialDoc.DNS.FakeIPFilter)
+		}
+	}
+	if partialDoc.DNS.NameserverPolicy["+.test"] != "10.0.0.53" {
+		t.Fatalf("expected user nameserver-policy[+.test] preserved, got %q", partialDoc.DNS.NameserverPolicy["+.test"])
+	}
+	if partialDoc.DNS.NameserverPolicy["+.internal"] != "system" {
+		t.Fatalf("expected missing +.internal defaulted to system, got %q", partialDoc.DNS.NameserverPolicy["+.internal"])
+	}
+	if !partialDoc.DNS.DirectNameserverFollowPolicy {
+		t.Fatal("expected direct-nameserver-follow-policy=true when profile specifies direct-nameserver")
+	}
+
+	// 5. Verify whitelist fake-ip-filter-mode is NOT corrupted by blacklist injections
+	whitelistYAML := `mixed-port: 17890
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-filter-mode: whitelist
+  fake-ip-filter:
+    - "+.openai.com"
+proxies:
+  - name: LockedUS
+    type: socks5
+    server: 198.51.100.10
+    port: 1082
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [LockedUS]
+rules:
+  - MATCH,Proxy
+`
+	if err := profile.WriteFileAtomic(store.ProfilePath("whitelist"), []byte(whitelistYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.SelectedProfile = "whitelist"
+		return nil
+	})
+	if _, err := ctrl.Apply(context.Background(), false); err != nil {
+		t.Fatalf("Apply whitelist profile failed: %v", err)
+	}
+	var wlDoc struct {
+		DNS struct {
+			FakeIPFilter []string `yaml:"fake-ip-filter"`
+		} `yaml:"dns"`
+	}
+	if err := yaml.Unmarshal([]byte(applier.appliedData), &wlDoc); err != nil {
+		t.Fatal(err)
+	}
+	if len(wlDoc.DNS.FakeIPFilter) != 1 || wlDoc.DNS.FakeIPFilter[0] != "+.openai.com" {
+		t.Fatalf("whitelist fake-ip-filter must stay untouched, got %v", wlDoc.DNS.FakeIPFilter)
 	}
 }

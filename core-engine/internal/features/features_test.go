@@ -60,6 +60,7 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 	existing := profile.ExtractStringRules(root["rules"])
 	root["rules"] = append([]string{
 		"RULE-SET,clashfx-internal-direct,DIRECT",
+		"RULE-SET,clashfx-private-direct,DIRECT",
 		"RULE-SET,clashfx-ai-lock,LockedNode",
 		"RULE-SET,clashfx-ai-lock,REJECT",
 	}, existing...)
@@ -74,6 +75,7 @@ func TestCNAppsProbeDiagnosticsNetEnvAndUpdater(t *testing.T) {
 	rules := profile.ExtractStringRules(root["rules"])
 	wantOrder := []string{
 		"RULE-SET,clashfx-internal-direct,DIRECT",
+		"RULE-SET,clashfx-private-direct,DIRECT",
 		"RULE-SET,clashfx-ai-lock,LockedNode",
 		"RULE-SET,clashfx-ai-lock,REJECT",
 		"RULE-SET,clashfx-cn-apps-direct,DIRECT",

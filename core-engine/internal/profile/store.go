@@ -17,11 +17,15 @@ import (
 
 const legacyDefaultWindowsProxyBypass = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*"
 
-const DefaultWindowsProxyBypass = legacyDefaultWindowsProxyBypass + ";*.msftconnecttest.com;*.msftncsi.com"
+const legacyCaptiveDefaultWindowsProxyBypass = legacyDefaultWindowsProxyBypass + ";*.msftconnecttest.com;*.msftncsi.com"
+
+const DefaultWindowsProxyBypass = legacyCaptiveDefaultWindowsProxyBypass + ";*.local;*.lan;*.localdomain;*.home.arpa;*.internal;*.test;*.corp;*.intranet;*.private"
 
 const legacyDefaultDarwinProxyBypass = "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,127.0.0.1,localhost,*.local,timestamp.apple.com,sequoia.apple.com,seed-sequoia.siri.apple.com"
 
-const DefaultDarwinProxyBypass = legacyDefaultDarwinProxyBypass + ",captive.apple.com"
+const legacyCaptiveDefaultDarwinProxyBypass = legacyDefaultDarwinProxyBypass + ",captive.apple.com"
+
+const DefaultDarwinProxyBypass = legacyCaptiveDefaultDarwinProxyBypass + ",*.lan,*.localdomain,*.home.arpa,*.internal,*.test,*.corp,*.intranet,*.private"
 
 func DefaultProxyBypass() string {
 	if runtime.GOOS == "darwin" {
@@ -300,9 +304,9 @@ func NormalizeAppSettings(s *AppSettings) {
 	if s.AILockEnabled && strings.TrimSpace(s.AILockTarget) == "" {
 		s.AILockEnabled = false
 	}
-	if runtime.GOOS == "darwin" && s.ProxyBypassList == legacyDefaultDarwinProxyBypass {
+	if runtime.GOOS == "darwin" && (s.ProxyBypassList == legacyDefaultDarwinProxyBypass || s.ProxyBypassList == legacyCaptiveDefaultDarwinProxyBypass) {
 		s.ProxyBypassList = DefaultDarwinProxyBypass
-	} else if runtime.GOOS == "windows" && s.ProxyBypassList == legacyDefaultWindowsProxyBypass {
+	} else if runtime.GOOS == "windows" && (s.ProxyBypassList == legacyDefaultWindowsProxyBypass || s.ProxyBypassList == legacyCaptiveDefaultWindowsProxyBypass) {
 		s.ProxyBypassList = DefaultWindowsProxyBypass
 	}
 }

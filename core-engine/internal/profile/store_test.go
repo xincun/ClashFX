@@ -239,6 +239,9 @@ func TestOutOfTheBoxDefaultSettingsAndMixin(t *testing.T) {
 	if strings.TrimSpace(st.ProxyBypassList) == "" {
 		t.Fatalf("expected non-empty default ProxyBypassList")
 	}
+	if !strings.Contains(st.ProxyBypassList, "*.test") || !strings.Contains(st.ProxyBypassList, "*.internal") {
+		t.Fatalf("expected default ProxyBypassList to include *.test and *.internal, got %q", st.ProxyBypassList)
+	}
 	if st.Hotkeys.OpenMainWindow != DefaultOpenMainWindowHotkey() {
 		t.Fatalf("expected default OpenMainWindow=%q, got %q", DefaultOpenMainWindowHotkey(), st.Hotkeys.OpenMainWindow)
 	}

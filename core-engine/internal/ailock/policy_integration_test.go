@@ -71,7 +71,31 @@ func TestRealMihomoCoreAILockRoutingAndFailClosed(t *testing.T) {
 	}
 	defer store.Close()
 
+	// Disable GEOSITE rules in mixin so the offline integration test needs no external geosite.dat.
+	if err := profile.WriteFileAtomic(store.ProfileMixinPath(), []byte(profile.DisabledProfileMixinTemplate), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Local mock UDP DNS server to prove conan.dingtalk.test bypasses Fake-IP and routes DIRECT!
+	mockDNSAddr, stopMockDNS := startLocalMockDNSServer(t, map[string][4]byte{
+		"conan.dingtalk.test": {127, 0, 0, 1},
+		"app.clashfx.local":   {127, 0, 0, 1},
+		"buildbox":            {127, 0, 0, 1},
+	})
+	defer stopMockDNS()
+
 	cfgYAML := fmt.Sprintf(`mixed-port: 17992
+dns:
+  enable: true
+  listen: 127.0.0.1:10553
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - %s
+  nameserver-policy:
+    "+.test": %s
+    "+.local": %s
+    "*": %s
 proxies:
   - name: GeneralNode
     type: socks5
@@ -87,7 +111,7 @@ proxy-groups:
     proxies: [GeneralNode, LockedAINode]
 rules:
   - MATCH,Proxy
-`, generalPort, lockedPort)
+`, mockDNSAddr, mockDNSAddr, mockDNSAddr, mockDNSAddr, generalPort, lockedPort)
 
 	if err := profile.WriteFileAtomic(store.ProfilePath("config"), []byte(cfgYAML), 0600); err != nil {
 		t.Fatal(err)
@@ -135,6 +159,27 @@ rules:
 	}
 	if lockedHits.Load() < 5 {
 		t.Fatalf("expected >= 5 hits on LockedAINode, got %d", lockedHits.Load())
+	}
+
+	// 1b. Private/intranet domains MUST skip Fake-IP (returning real IP, never 198.18.x.x)
+	// and route DIRECT even while AI Proxy Lock is active!
+	dnsListenAddr := fmt.Sprintf("127.0.0.1:%d", state.DNSPort)
+	for _, privHost := range []string{"conan.dingtalk.test", "app.clashfx.local", "buildbox"} {
+		ip, qErr := queryUDPTypeA(dnsListenAddr, privHost)
+		if qErr != nil {
+			t.Fatalf("DNS A query for private host %s via mihomo_core (%s) failed: %v", privHost, dnsListenAddr, qErr)
+		}
+		if ip != "127.0.0.1" {
+			t.Fatalf("private host %s resolved to %s (expected real IP 127.0.0.1, NOT Fake-IP 198.18.x.x)", privHost, ip)
+		}
+	}
+	if aiIP, qErr := queryUDPTypeA(dnsListenAddr, "api.anthropic.com"); qErr != nil || !strings.HasPrefix(aiIP, "198.18.") {
+		t.Fatalf("expected public AI host api.anthropic.com to receive Fake-IP 198.18.x.x, got %q (err=%v)", aiIP, qErr)
+	}
+	directBeforePriv := directHits.Load()
+	privBody, privErr := fetchViaProxy(client, fmt.Sprintf("http://conan.dingtalk.test:%d/v1/conan", echoPort))
+	if privErr != nil || !strings.Contains(privBody, "via=DIRECT_LEAK") || directHits.Load() <= directBeforePriv {
+		t.Fatalf("expected conan.dingtalk.test to route DIRECT ahead of AI Lock, got body=%q err=%v", privBody, privErr)
 	}
 
 	// 2. Unrelated domain (github.com & perplexity.ai) is NOT captured initially -> follows MATCH,Proxy (GeneralNode)!
@@ -313,4 +358,117 @@ func startTaggedSOCKS5Mock(t *testing.T, echoPort int, tag string) (int, func(),
 	}()
 
 	return ln.Addr().(*net.TCPAddr).Port, stop, &hits
+}
+
+// startLocalMockDNSServer serves minimal RFC1035 A records on 127.0.0.1:0 for offline real-core DNS tests.
+func startLocalMockDNSServer(t *testing.T, records map[string][4]byte) (string, func()) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, addr, rErr := pc.ReadFrom(buf)
+			if rErr != nil {
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			name, qEnd := decodeDNSName(buf[:n], 12)
+			if qEnd+4 > n {
+				continue
+			}
+			qType := binary.BigEndian.Uint16(buf[qEnd : qEnd+2])
+			resp := make([]byte, 0, n+16)
+			resp = append(resp, buf[0], buf[1]) // ID
+			ip, found := records[strings.ToLower(strings.TrimSuffix(name, "."))]
+			if found && qType == 1 {
+				resp = append(resp, 0x81, 0x80) // standard response, NOERROR
+				resp = append(resp, 0, 1, 0, 1, 0, 0, 0, 0)
+				resp = append(resp, buf[12:qEnd+4]...)
+				resp = append(resp, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, ip[0], ip[1], ip[2], ip[3])
+			} else {
+				resp = append(resp, 0x81, 0x83) // NXDOMAIN
+				resp = append(resp, 0, 1, 0, 0, 0, 0, 0, 0)
+				resp = append(resp, buf[12:qEnd+4]...)
+			}
+			_, _ = pc.WriteTo(resp, addr)
+		}
+	}()
+	return pc.LocalAddr().String(), func() { _ = pc.Close() }
+}
+
+func decodeDNSName(pkt []byte, offset int) (string, int) {
+	var labels []string
+	i := offset
+	for i < len(pkt) {
+		l := int(pkt[i])
+		i++
+		if l == 0 {
+			break
+		}
+		if i+l > len(pkt) {
+			break
+		}
+		labels = append(labels, string(pkt[i:i+l]))
+		i += l
+	}
+	return strings.Join(labels, "."), i
+}
+
+func queryUDPTypeA(serverAddr, host string) (string, error) {
+	conn, err := net.DialTimeout("udp", serverAddr, 2*time.Second)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	pkt := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	for _, label := range strings.Split(strings.TrimSuffix(host, "."), ".") {
+		pkt = append(pkt, byte(len(label)))
+		pkt = append(pkt, []byte(label)...)
+	}
+	pkt = append(pkt, 0x00, 0x00, 0x01, 0x00, 0x01) // QTYPE=A, QCLASS=IN
+	if _, err := conn.Write(pkt); err != nil {
+		return "", err
+	}
+	resp := make([]byte, 1500)
+	n, err := conn.Read(resp)
+	if err != nil {
+		return "", err
+	}
+	if n < 12 {
+		return "", fmt.Errorf("short DNS response (%d bytes)", n)
+	}
+	ancount := binary.BigEndian.Uint16(resp[6:8])
+	if ancount == 0 {
+		return "", fmt.Errorf("no answer records (rcode=%d)", resp[3]&0x0f)
+	}
+	_, pos := decodeDNSName(resp[:n], 12)
+	pos += 4 // skip QTYPE + QCLASS
+	for i := 0; i < int(ancount) && pos < n; i++ {
+		if resp[pos]&0xc0 == 0xc0 {
+			pos += 2
+		} else {
+			_, pos = decodeDNSName(resp[:n], pos)
+		}
+		if pos+10 > n {
+			break
+		}
+		rType := binary.BigEndian.Uint16(resp[pos : pos+2])
+		rdLen := int(binary.BigEndian.Uint16(resp[pos+8 : pos+10]))
+		pos += 10
+		if pos+rdLen > n {
+			break
+		}
+		if rType == 1 && rdLen == 4 {
+			return fmt.Sprintf("%d.%d.%d.%d", resp[pos], resp[pos+1], resp[pos+2], resp[pos+3]), nil
+		}
+		pos += rdLen
+	}
+	return "", fmt.Errorf("no A record in DNS answer")
 }

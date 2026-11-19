@@ -13,10 +13,70 @@ const (
 	ProfileMixinNamedFile          = "Profile Mixin.yaml"
 	RecoverySelectionsKey          = "x-clashfx-recovery-selections"
 	InternalDirectRuleProviderName = "clashfx-internal-direct"
+	PrivateDirectRuleProviderName  = "clashfx-private-direct"
 	AILockRuleProviderName         = "clashfx-ai-lock"
 	CNAppsRuleProviderName         = "clashfx-cn-apps-direct"
 	ProxyTargetPlaceholder         = "PROXY"
 )
+
+// PrivateDomainSuffixes lists RFC 2606 / RFC 6761 / RFC 6762 / RFC 8375 / ICANN-reserved
+// and standard non-public intranet TLDs that cannot exist on the public Internet.
+// These domains must resolve via OS/system DNS (never Fake-IP or public DoH) and route DIRECT
+// even ahead of AI Proxy Lock process rules.
+var PrivateDomainSuffixes = []string{
+	"localhost",
+	"local",
+	"lan",
+	"localdomain",
+	"home.arpa",
+	"internal",
+	"test",
+	"invalid",
+	"example",
+	"corp",
+	"intranet",
+	"private",
+	"home",
+}
+
+// DotlessHostnameRegex matches single-label intranet hostnames without dots (e.g. localhost, nas, buildbox).
+const DotlessHostnameRegex = `^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`
+
+// PrivateIPCIDRs and PrivateIPv6CIDRs cover loopback, RFC 1918 LAN, link-local,
+// CGNAT/shared address space, and IPv6 ULA/link-local ranges.
+var (
+	PrivateIPCIDRs = []string{
+		"127.0.0.0/8",
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"169.254.0.0/16",
+		"100.64.0.0/10",
+	}
+	PrivateIPv6CIDRs = []string{
+		"::1/128",
+		"fc00::/7",
+		"fe80::/10",
+	}
+)
+
+// DefaultPrivateDirectRulePayload returns the target-less classical rule-provider entries
+// for local/LAN IPs and non-public private domains routed DIRECT ahead of AI Proxy Lock.
+func DefaultPrivateDirectRulePayload() []string {
+	out := make([]string, 0, len(PrivateIPCIDRs)+len(PrivateIPv6CIDRs)+len(PrivateDomainSuffixes)+2)
+	for _, cidr := range PrivateIPCIDRs {
+		out = append(out, "IP-CIDR,"+cidr+",no-resolve")
+	}
+	for _, cidr := range PrivateIPv6CIDRs {
+		out = append(out, "IP-CIDR6,"+cidr+",no-resolve")
+	}
+	out = append(out, "DOMAIN,localhost")
+	for _, suffix := range PrivateDomainSuffixes {
+		out = append(out, "DOMAIN-SUFFIX,"+suffix)
+	}
+	out = append(out, "DOMAIN-REGEX,"+DotlessHostnameRegex)
+	return out
+}
 
 const LegacyEmptyProfileMixinTemplate = `# Profile Mixin is merged into the selected profile at runtime.
 # Example:
@@ -351,12 +411,13 @@ func SetInlineClassicalRuleProvider(root map[string]any, name string, payload []
 }
 
 // SystemGuardPrefixCount returns how many leading top-level rules belong to
-// ClashFX's system guards (internal core loop bypass + AI Proxy Lock).
+// ClashFX's system guards (internal core loop bypass + private/LAN direct + AI Proxy Lock).
 func SystemGuardPrefixCount(rules []string) int {
 	idx := 0
 	for idx < len(rules) {
 		trimmed := strings.TrimSpace(rules[idx])
 		if trimmed == "RULE-SET,"+InternalDirectRuleProviderName+",DIRECT" ||
+			trimmed == "RULE-SET,"+PrivateDirectRuleProviderName+",DIRECT" ||
 			strings.HasPrefix(trimmed, "RULE-SET,"+AILockRuleProviderName+",") ||
 			trimmed == "PROCESS-NAME,mihomo_core.exe,DIRECT" ||
 			trimmed == "PROCESS-NAME,mihomo_core,DIRECT" {

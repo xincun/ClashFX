@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,14 +20,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var defaultWindowsFakeIPFilter = []any{
-	"*.lan",
-	"*.local",
-	"*.localdomain",
-	"+.msftconnecttest.com",
-	"+.msftncsi.com",
-	"dns.msftncsi.com",
-	"captive.apple.com",
+var defaultOSExtraFakeIPFilter = []string{
 	"time.apple.com",
 	"time-ios.apple.com",
 	"sequoia.apple.com",
@@ -42,6 +36,43 @@ var defaultWindowsFakeIPFilter = []any{
 	"+.srv.nintendo.net",
 	"+.stun.playstation.net",
 	"xbox.*.microsoft.com",
+}
+
+func mandatoryPrivateAndCaptiveFakeIPFilter() []string {
+	out := make([]string, 0, len(profile.PrivateDomainSuffixes)+5)
+	out = append(out, "*")
+	for _, suffix := range profile.PrivateDomainSuffixes {
+		out = append(out, "+."+suffix)
+	}
+	out = append(out,
+		"+.msftconnecttest.com",
+		"+.msftncsi.com",
+		"dns.msftncsi.com",
+		"captive.apple.com",
+	)
+	return out
+}
+
+func defaultFakeIPFilter() []string {
+	mandatory := mandatoryPrivateAndCaptiveFakeIPFilter()
+	out := make([]string, 0, len(mandatory)+len(defaultOSExtraFakeIPFilter))
+	out = append(out, mandatory...)
+	out = append(out, defaultOSExtraFakeIPFilter...)
+	return out
+}
+
+func mandatorySystemDNSPolicyKeys() []string {
+	out := make([]string, 0, len(profile.PrivateDomainSuffixes)+4)
+	out = append(out, "*")
+	for _, suffix := range profile.PrivateDomainSuffixes {
+		out = append(out, "+."+suffix)
+	}
+	out = append(out,
+		"captive.apple.com",
+		"+.msftconnecttest.com",
+		"+.msftncsi.com",
+	)
+	return out
 }
 
 // TransformHook mutates the candidate runtime YAML map before validation (e.g.
@@ -453,6 +484,8 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 	profMap["store-selected"] = true
 	root["profile"] = profMap
 
+	excludeCIDRs, excludeDomains := parseTunRouteExcludes(settings.TunRouteExcludes)
+
 	// DNS + TUN configuration
 	dnsMap, _ := root["dns"].(map[string]any)
 	if dnsMap == nil {
@@ -485,8 +518,21 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		if fir, _ := dnsMap["fake-ip-range"].(string); fir == "" {
 			dnsMap["fake-ip-range"] = "198.18.0.1/16"
 		}
-		if strings.EqualFold(fmt.Sprint(dnsMap["enhanced-mode"]), "fake-ip") && dnsMap["fake-ip-filter"] == nil {
-			dnsMap["fake-ip-filter"] = append([]any(nil), defaultWindowsFakeIPFilter...)
+		if strings.EqualFold(fmt.Sprint(dnsMap["enhanced-mode"]), "fake-ip") {
+			filterMode, _ := dnsMap["fake-ip-filter-mode"].(string)
+			filterMode = strings.ToLower(strings.TrimSpace(filterMode))
+			if filterMode == "" || filterMode == "blacklist" {
+				var additions []string
+				if dnsMap["fake-ip-filter"] == nil {
+					additions = defaultFakeIPFilter()
+				} else {
+					additions = mandatoryPrivateAndCaptiveFakeIPFilter()
+				}
+				for _, d := range excludeDomains {
+					additions = append(additions, d.dnsPattern)
+				}
+				dnsMap["fake-ip-filter"] = mergeUniqueStringsFold(dnsMap["fake-ip-filter"], additions)
+			}
 		}
 		if dnsMap["default-nameserver"] == nil {
 			dnsMap["default-nameserver"] = []string{"114.114.114.114", "223.5.5.5", "119.29.29.29", "system"}
@@ -502,14 +548,25 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 				policyMap = map[string]any{}
 			}
 		}
-		for _, k := range []string{"captive.apple.com", "+.msftconnecttest.com", "+.msftncsi.com"} {
-			if _, exists := policyMap[k]; !exists {
+		for _, k := range mandatorySystemDNSPolicyKeys() {
+			if !hasMapKeyFold(policyMap, k) {
 				policyMap[k] = "system"
 			}
 		}
+		for _, d := range excludeDomains {
+			if !hasMapKeyFold(policyMap, d.dnsPattern) {
+				policyMap[d.dnsPattern] = "system"
+			}
+		}
 		dnsMap["nameserver-policy"] = policyMap
+		if dnsMap["direct-nameserver"] != nil && dnsMap["direct-nameserver-follow-policy"] == nil {
+			dnsMap["direct-nameserver-follow-policy"] = true
+		}
 		root["dns"] = dnsMap
 	}
+
+	privateDirectPayload := buildPrivateDirectPayload(excludeCIDRs, excludeDomains)
+	profile.SetInlineClassicalRuleProvider(root, profile.PrivateDirectRuleProviderName, privateDirectPayload)
 
 	captiveDirectRules := []string{
 		"DOMAIN,captive.apple.com,DIRECT",
@@ -543,26 +600,8 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		if iface != "" {
 			root["interface-name"] = iface
 		}
-		if excludes := splitTrimmedCSV(settings.TunRouteExcludes); len(excludes) > 0 {
-			var cidrs, domains []string
-			for _, item := range excludes {
-				if strings.Contains(item, "/") {
-					cidrs = append(cidrs, item)
-				} else {
-					domains = append(domains, item)
-				}
-			}
-			if len(cidrs) > 0 {
-				tunMap["route-exclude-address"] = cidrs
-			}
-			if len(domains) > 0 {
-				existingFilter, _ := dnsMap["fake-ip-filter"].([]any)
-				for _, d := range domains {
-					existingFilter = append(existingFilter, d)
-				}
-				dnsMap["fake-ip-filter"] = existingFilter
-				root["dns"] = dnsMap
-			}
+		if len(excludeCIDRs) > 0 {
+			tunMap["route-exclude-address"] = excludeCIDRs
 		}
 		root["tun"] = tunMap
 		if !settings.CustomConfigAsIs && root["find-process-mode"] == nil {
@@ -581,18 +620,22 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 			}, captiveDirectRules...)
 		}
 		PrependUniqueRules(root, tunCaptiveRules)
-		// Keep only mihomo_core itself in the internal TUN loop-prevention rule-set so
-		// clashfx-service/clashfx-daemon can route core/GEO/app updates via local proxyPort.
+		// Keep mihomo_core loop guard and private/LAN/intranet direct rules at the top
+		// (ahead of AI Proxy Lock) so local/private domains never get Fake-IP or remote proxied.
 		profile.SetInlineClassicalRuleProvider(root, profile.InternalDirectRuleProviderName, []string{
 			"PROCESS-NAME,mihomo_core.exe",
 			"PROCESS-NAME,mihomo_core",
 		})
 		PrependUniqueRules(root, []string{
 			"RULE-SET," + profile.InternalDirectRuleProviderName + ",DIRECT",
+			"RULE-SET," + profile.PrivateDirectRuleProviderName + ",DIRECT",
 		})
 	} else {
 		root["tun"] = map[string]any{"enable": false}
 		PrependUniqueRules(root, captiveDirectRules)
+		PrependUniqueRules(root, []string{
+			"RULE-SET," + profile.PrivateDirectRuleProviderName + ",DIRECT",
+		})
 	}
 
 	// Strip any legacy custom recovery key; stock Mihomo persists selections via profile.store-selected + REST replay.
@@ -705,4 +748,161 @@ func splitTrimmedCSV(raw string) []string {
 		}
 	}
 	return out
+}
+
+type excludedDomainSpec struct {
+	dnsPattern    string
+	classicalRule string
+}
+
+func parseTunRouteExcludes(raw string) (cidrs []string, domains []excludedDomainSpec) {
+	seenCIDR := map[string]bool{}
+	seenDomain := map[string]bool{}
+	for _, item := range splitTrimmedCSV(raw) {
+		if pfx, err := netip.ParsePrefix(item); err == nil {
+			norm := pfx.Masked().String()
+			if !seenCIDR[norm] {
+				seenCIDR[norm] = true
+				cidrs = append(cidrs, norm)
+			}
+			continue
+		}
+		if addr, err := netip.ParseAddr(item); err == nil {
+			addr = addr.Unmap()
+			bits := 128
+			if addr.Is4() {
+				bits = 32
+			}
+			norm := netip.PrefixFrom(addr, bits).String()
+			if !seenCIDR[norm] {
+				seenCIDR[norm] = true
+				cidrs = append(cidrs, norm)
+			}
+			continue
+		}
+		if spec, ok := normalizeExcludeDomain(item); ok {
+			key := strings.ToLower(spec.dnsPattern)
+			if !seenDomain[key] {
+				seenDomain[key] = true
+				domains = append(domains, spec)
+			}
+		}
+	}
+	return cidrs, domains
+}
+
+func normalizeExcludeDomain(raw string) (excludedDomainSpec, bool) {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimRight(s, ".")
+	if s == "" || s == "*" || s == "+" || strings.ContainsAny(s, " \t\r\n,/:") || strings.Contains(s, "..") {
+		return excludedDomainSpec{}, false
+	}
+	if strings.HasPrefix(s, "*.") {
+		rest := strings.TrimLeft(strings.TrimPrefix(s, "*."), ".")
+		if rest == "" {
+			return excludedDomainSpec{}, false
+		}
+		if !strings.Contains(rest, "*") {
+			return excludedDomainSpec{
+				dnsPattern:    "+." + rest,
+				classicalRule: "DOMAIN-SUFFIX," + rest,
+			}, true
+		}
+		return excludedDomainSpec{
+			dnsPattern:    s,
+			classicalRule: "DOMAIN-WILDCARD," + s,
+		}, true
+	}
+	if strings.HasPrefix(s, "+.") || strings.HasPrefix(s, ".") {
+		rest := strings.TrimLeft(s, "+.")
+		if rest == "" || strings.Contains(rest, "*") {
+			return excludedDomainSpec{}, false
+		}
+		return excludedDomainSpec{
+			dnsPattern:    "+." + rest,
+			classicalRule: "DOMAIN-SUFFIX," + rest,
+		}, true
+	}
+	if strings.Contains(s, "*") {
+		return excludedDomainSpec{
+			dnsPattern:    s,
+			classicalRule: "DOMAIN-WILDCARD," + s,
+		}, true
+	}
+	return excludedDomainSpec{
+		dnsPattern:    s,
+		classicalRule: "DOMAIN," + s,
+	}, true
+}
+
+func buildPrivateDirectPayload(excludeCIDRs []string, excludeDomains []excludedDomainSpec) []string {
+	base := profile.DefaultPrivateDirectRulePayload()
+	seen := make(map[string]bool, len(base)+len(excludeCIDRs)+len(excludeDomains))
+	out := make([]string, 0, len(base)+len(excludeCIDRs)+len(excludeDomains))
+	add := func(line string) {
+		key := strings.ToLower(strings.TrimSpace(line))
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, line)
+	}
+	for _, r := range base {
+		add(r)
+	}
+	for _, c := range excludeCIDRs {
+		if strings.Contains(c, ":") {
+			add("IP-CIDR6," + c + ",no-resolve")
+		} else {
+			add("IP-CIDR," + c + ",no-resolve")
+		}
+	}
+	for _, d := range excludeDomains {
+		add(d.classicalRule)
+	}
+	return out
+}
+
+func mergeUniqueStringsFold(existing any, additions []string) []any {
+	var cur []string
+	switch v := existing.(type) {
+	case []string:
+		cur = v
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				cur = append(cur, s)
+			}
+		}
+	}
+	seen := make(map[string]bool, len(cur)+len(additions))
+	out := make([]any, 0, len(cur)+len(additions))
+	add := func(s string) {
+		trimmed := strings.TrimSpace(s)
+		if trimmed == "" {
+			return
+		}
+		key := strings.ToLower(trimmed)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, trimmed)
+	}
+	for _, s := range cur {
+		add(s)
+	}
+	for _, s := range additions {
+		add(s)
+	}
+	return out
+}
+
+func hasMapKeyFold(m map[string]any, key string) bool {
+	for k := range m {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
 }

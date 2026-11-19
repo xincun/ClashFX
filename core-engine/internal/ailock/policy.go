@@ -13,6 +13,7 @@ import (
 const (
 	InlineRuleProviderName         = "clashfx-ai-lock"
 	InternalDirectRuleProviderName = "clashfx-internal-direct"
+	PrivateDirectRuleProviderName  = profile.PrivateDirectRuleProviderName
 )
 
 const ProcessNamePattern = profile.AILockProcessNamePattern
@@ -352,6 +353,7 @@ func TransformHookForController(providerLoader func() []ProviderSnapshot) func(r
 func isInternalCoreDirectRule(rule string) bool {
 	switch strings.TrimSpace(rule) {
 	case "RULE-SET," + InternalDirectRuleProviderName + ",DIRECT",
+		"RULE-SET," + PrivateDirectRuleProviderName + ",DIRECT",
 		"PROCESS-NAME,mihomo_core.exe,DIRECT",
 		"PROCESS-NAME,mihomo_core,DIRECT":
 		return true

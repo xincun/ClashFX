@@ -2475,7 +2475,7 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 
 	classifySource := func(tp, payload, proxy string) string {
 		switch strings.TrimSpace(payload) {
-		case profile.InternalDirectRuleProviderName:
+		case profile.InternalDirectRuleProviderName, profile.PrivateDirectRuleProviderName:
 			return "system"
 		case profile.AILockRuleProviderName:
 			return "ai_lock"
@@ -2824,8 +2824,8 @@ func (e *Engine) SetRuleDisabled(ctx context.Context, indices []int, disabled bo
 		if !exists {
 			return EffectiveRulesView{}, fmt.Errorf("规则索引 #%d 已失效，请先刷新规则列表", idx+1)
 		}
-		if r.Source == "system" || strings.TrimSpace(r.Payload) == profile.InternalDirectRuleProviderName {
-			return EffectiveRulesView{}, errors.New("系统防环回守护规则 (clashfx-internal-direct) 不可禁用")
+		if r.Source == "system" || strings.TrimSpace(r.Payload) == profile.InternalDirectRuleProviderName || strings.TrimSpace(r.Payload) == profile.PrivateDirectRuleProviderName {
+			return EffectiveRulesView{}, errors.New("系统守护规则 (clashfx-internal-direct / clashfx-private-direct) 不可禁用")
 		}
 		patchMap[fmt.Sprintf("%d", idx)] = disabled
 		if strings.TrimSpace(r.Payload) == profile.AILockRuleProviderName {

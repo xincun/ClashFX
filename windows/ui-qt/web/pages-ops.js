@@ -971,8 +971,8 @@ export function renderSettingsPage(root) {
           </div>
         </div>
         <div class="form-row">
-          <div class="form-label-col"><div class="form-label">${t('TUN 排除路由段 (Route Excludes)', 'TUN Route Excludes')}</div><div class="form-desc">${t('逗号分隔的 CIDR 网段，不经由 TUN 虚拟网卡接管', 'Comma-separated CIDRs excluded from TUN capture')}</div></div>
-          <div class="form-control" style="width:240px;"><input type="text" class="input mono" id="set-tun-excludes" data-set-str="tun_route_excludes" value="${esc(d.tun_route_excludes || '')}" placeholder="192.168.0.0/16, 10.0.0.0/8" /></div>
+          <div class="form-label-col"><div class="form-label">${t('TUN 排除路由段 / 内网域名', 'TUN Route & Domain Excludes')}</div><div class="form-desc">${t('逗号分隔的 CIDR 网段或内网域名（自动绕过 Fake-IP、走系统 DNS 并直连）', 'Comma-separated CIDRs or intranet domains (bypass Fake-IP, use system DNS & DIRECT)')}</div></div>
+          <div class="form-control" style="width:240px;"><input type="text" class="input mono" id="set-tun-excludes" data-set-str="tun_route_excludes" value="${esc(d.tun_route_excludes || '')}" placeholder="192.168.0.0/16, *.corp.example.com" /></div>
         </div>
         <div class="form-row">
           <div class="form-label-col"><div class="form-label">${t('内核日志级别', 'Core Log Level')}</div></div>

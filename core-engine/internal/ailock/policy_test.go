@@ -134,10 +134,30 @@ func TestWindowsProcessAndPathMatchersAndDependencySafety(t *testing.T) {
 		"proxy-groups": []any{
 			map[string]any{"name": "Proxy", "type": "select", "proxies": []any{"GeneralHK"}},
 		},
-		"rules": []any{"MATCH,Proxy"},
+		"rules": []any{
+			"RULE-SET,clashfx-internal-direct,DIRECT",
+			"RULE-SET,clashfx-private-direct,DIRECT",
+			"MATCH,Proxy",
+		},
 	}
 	outNoRelay := Apply(cyclicRoot, "GeneralHK", nil)
 	if !outNoRelay.Applied || outNoRelay.RelayProxy != "" {
 		t.Fatalf("expected Apply without cyclic relay, got %+v", outNoRelay)
+	}
+	cyclicRules, _ := extractStringListStrict(cyclicRoot["rules"])
+	wantCyclicRules := []string{
+		"RULE-SET,clashfx-internal-direct,DIRECT",
+		"RULE-SET,clashfx-private-direct,DIRECT",
+		"RULE-SET,clashfx-ai-lock,GeneralHK",
+		"RULE-SET,clashfx-ai-lock,REJECT",
+		"MATCH,Proxy",
+	}
+	if len(cyclicRules) != len(wantCyclicRules) {
+		t.Fatalf("cyclicRules = %v, want %v", cyclicRules, wantCyclicRules)
+	}
+	for i := range wantCyclicRules {
+		if cyclicRules[i] != wantCyclicRules[i] {
+			t.Fatalf("cyclicRules[%d] = %q, want %q", i, cyclicRules[i], wantCyclicRules[i])
+		}
 	}
 }
