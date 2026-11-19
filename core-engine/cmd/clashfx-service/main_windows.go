@@ -25,15 +25,21 @@ type clashFXWinService struct {
 }
 
 func (s *clashFXWinService) Execute(_ []string, requests <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
-	const accepted = svc.AcceptStop | svc.AcceptShutdown
+	const accepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPowerEvent
+	const (
+		pbtApmResumeSuspend = 0x0007
+		pbtApmResumeAuto    = 0x0012
+	)
 	changes <- svc.Status{State: svc.StartPending}
 
+	s.runner.InitPrivilegedService("")
 	ln, err := service.ListenSecurePipe()
 	if err != nil {
+		_ = s.runner.ShutdownService()
 		return false, 1
 	}
 	defer ln.Close()
-	defer func() { _ = s.runner.Stop() }()
+	defer func() { _ = s.runner.ShutdownService() }()
 
 	go acceptLoop(ln, s.runner)
 	changes <- svc.Status{State: svc.Running, Accepts: accepted}
@@ -42,10 +48,14 @@ func (s *clashFXWinService) Execute(_ []string, requests <-chan svc.ChangeReques
 		switch req.Cmd {
 		case svc.Interrogate:
 			changes <- req.CurrentStatus
+		case svc.PowerEvent:
+			if req.EventType == pbtApmResumeAuto || req.EventType == pbtApmResumeSuspend {
+				s.runner.HandlePowerResume()
+			}
 		case svc.Stop, svc.Shutdown:
 			changes <- svc.Status{State: svc.StopPending}
 			_ = ln.Close()
-			_ = s.runner.Stop()
+			_ = s.runner.ShutdownService()
 			return false, 0
 		}
 	}
@@ -255,8 +265,10 @@ func installAndStartService() error {
 
 func uninstallService() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, _ = service.Call(ctx, service.Request{Action: "disarm_ai_guard"})
 	_, _ = service.Call(ctx, service.Request{Action: "stop_core"})
 	cancel()
+	service.ClearPersistedServiceState("")
 
 	removeWindowsFirewallRules()
 
@@ -346,12 +358,13 @@ func main() {
 			ln, err = service.ListenSecurePipe()
 			if err == nil {
 				runner := service.NewRunner(dir)
+				runner.InitPrivilegedService("")
 				go acceptLoop(ln, runner)
 				sigCh := make(chan os.Signal, 1)
 				signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 				<-sigCh
 				_ = ln.Close()
-				_ = runner.Stop()
+				_ = runner.ShutdownService()
 			}
 		}
 	case "version":

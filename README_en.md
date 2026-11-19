@@ -20,13 +20,14 @@ ClashFX is built on a **unified Go control engine + shared Control Center Web SP
 - **Consistent Native + Web Control Center Across macOS & Windows**:
   - Unified 7-section Control Center (**MetaCubeXD `v1.266.1`** console, **Subscriptions & Profiles**, **Routing & Rules Studio**, **AI Proxy Lock**, **Multi-Node Services**, **Node Diagnostics**, and **Preferences**) alongside native system tray menus and customizable global hotkeys (default open-main-window shortcut: `Fn+F12` on macOS, `Ctrl+Shift+F12` on Windows, customizable in Preferences).
   - Supports **Obsidian Dark** / **Alabaster Light** themes and live **简体中文 / English** switching.
-- **Fail-Closed AI Proxy Lock**:
-  - Pins traffic for **Claude**, **Codex**, and **Antigravity (`agy`)** desktop apps, CLIs, and API endpoints to a specific node with hard `REJECT` fallback rules so AI traffic never leaks to `DIRECT` or unintended proxies. See [docs/AI-PROXY-LOCK.md](docs/AI-PROXY-LOCK.md).
+- **Fail-Closed AI Proxy Lock (Core + OS-Level Guard)**:
+  - Pins traffic for **Claude**, **Codex**, and **Antigravity (`agy` & language servers)** desktop apps, CLIs, and API endpoints to a specific node with hard `REJECT` fallback rules.
+  - Backed by an independent **OS-level Fail-Closed Guard** owned by `clashfx-service` (app-scoped dynamic Windows WFP session / macOS `pf` outage anchor) so protected AI clients never leak to direct public egress even if `mihomo_core` crashes, Wintun disappears, or during core upgrades/boot windows. See [docs/AI-PROXY-LOCK.md](docs/AI-PROXY-LOCK.md).
 - **Multi-Node Fixed Ports & Health Watchdog**:
   - Assigns persistent `127.0.0.1:21000+` mixed HTTP + SOCKS5 listeners per proxy node, supports sequential 20 MB Cloudflare speed tests, runs 60s connectivity health probes, and auto-refreshes managed subscriptions through a `DIRECT`-pinned listener on consecutive failures. See [docs/NODE-SERVICES.md](docs/NODE-SERVICES.md).
-- **Unmodified Upstream Core & Transactional Safety**:
+- **Unmodified Upstream Core, Crash Self-Healing & Persistent Rotating Logs**:
   - Runs 100% unmodified upstream `github.com/metacubex/mihomo` (`-tags with_gvisor`) with in-app zero-prompt core updates.
-  - Profile reloads, Mixins, and synthetic rules pass preflight validation before atomic switch-over, backed by `.runtime-last-good.yaml` automatic rollback and Wi-Fi/network auto-suspend.
+  - Profile reloads, Mixins, and synthetic rules pass preflight validation before atomic switch-over with `.runtime-last-good.yaml` rollback; paired with automatic core crash backoff supervision, 12s deep health checks, high-visibility outage alerts, persistent rotating logs under `<ConfigDir>/logs/` (10 MiB × 5), and Wi-Fi/network auto-suspend.
 - **Automated CI Releases & In-App Updates**:
   - Supports **Stable** and **Lab** update channels; installed clients automatically check [GitHub Releases](https://github.com/xincun/ClashFX/releases) and select the matching OS/architecture installer.
 

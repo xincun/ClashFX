@@ -23,6 +23,7 @@ import (
 var (
 	modkernel32                     = windows.NewLazySystemDLL("kernel32.dll")
 	procGetNamedPipeClientProcessId = modkernel32.NewProc("GetNamedPipeClientProcessId")
+	procGenerateConsoleCtrlEvent    = modkernel32.NewProc("GenerateConsoleCtrlEvent")
 	moddnsapi                       = windows.NewLazySystemDLL("dnsapi.dll")
 	procDnsFlushResolverCache       = moddnsapi.NewProc("DnsFlushResolverCache")
 )
@@ -36,7 +37,7 @@ func flushWindowsDNSCache() {
 func configureChildProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
-		CreationFlags: windows.CREATE_NO_WINDOW,
+		CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP,
 	}
 }
 
@@ -131,7 +132,30 @@ func (g *childGuard) closeHandles() {
 	}
 }
 
-func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, _ time.Duration) error {
+func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, stopTimeout time.Duration) error {
+	// Best-effort graceful CTRL_BREAK_EVENT to the child's own process group so
+	// mihomo_core can close Wintun cleanly (preventing Event ID 1010 surprise removal)
+	// before falling back to hard Job Object termination.
+	if cmd != nil && cmd.Process != nil && cmd.Process.Pid > 0 && procGenerateConsoleCtrlEvent.Find() == nil {
+		r1, _, _ := procGenerateConsoleCtrlEvent.Call(
+			uintptr(windows.CTRL_BREAK_EVENT),
+			uintptr(uint32(cmd.Process.Pid)),
+		)
+		if r1 != 0 && doneCh != nil {
+			grace := 2500 * time.Millisecond
+			if stopTimeout > 0 && stopTimeout < grace {
+				grace = stopTimeout
+			}
+			select {
+			case <-doneCh:
+				g.closeHandles()
+				flushWindowsDNSCache()
+				return nil
+			case <-time.After(grace):
+			}
+		}
+	}
+
 	var stopErr error
 	if g != nil && g.job != 0 {
 		if err := windows.TerminateJobObject(g.job, 0); err != nil && !errors.Is(err, windows.ERROR_ACCESS_DENIED) {

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/clashfx/core-engine/internal/ailock"
+	"github.com/clashfx/core-engine/internal/applog"
 	"github.com/clashfx/core-engine/internal/features"
 	"github.com/clashfx/core-engine/internal/nodeservices"
 	"github.com/clashfx/core-engine/internal/profile"
@@ -95,8 +96,13 @@ type DaemonSnapshot struct {
 	Platform               string                             `json:"platform"`
 	Arch                   string                             `json:"arch"`
 	CoreRunning            bool                               `json:"core_running"`
+	CoreHealth             string                             `json:"core_health,omitempty"`
+	CoreRestartCount       int                                `json:"core_restart_count,omitempty"`
+	LastCrashAt            string                             `json:"last_crash_at,omitempty"`
+	LastCrashReason        string                             `json:"last_crash_reason,omitempty"`
 	CoreViaService         bool                               `json:"core_via_service"`
 	ServiceInstalled       bool                               `json:"service_installed"`
+	AIGuard                service.AIGuardStatus              `json:"ai_guard"`
 	Settings               profile.AppSettings                `json:"settings"`
 	Runtime                transaction.AppliedRuntimeState    `json:"runtime"`
 	DashboardURL           string                             `json:"dashboard_url"`
@@ -104,6 +110,9 @@ type DaemonSnapshot struct {
 	ProfileMixinPath       string                             `json:"profile_mixin_path"`
 	ConfigDir              string                             `json:"config_dir"`
 	LogsDir                string                             `json:"logs_dir"`
+	CoreLogFile            string                             `json:"core_log_file,omitempty"`
+	DaemonLogFile          string                             `json:"daemon_log_file,omitempty"`
+	ServiceLogFile         string                             `json:"service_log_file,omitempty"`
 	ProxyGroups            []ProxyGroupView                   `json:"proxy_groups"`
 	DefaultRuleTarget      string                             `json:"default_rule_target,omitempty"`
 	AILockCandidates       []ailock.CandidateNode             `json:"ai_lock_candidates"`
@@ -135,6 +144,15 @@ type Engine struct {
 	coreVersion       string
 	suspendedByNet    string
 	lastApplyErr      string
+	desiredCoreActive bool
+	lastCoreRunning   bool
+	lastCoreHealth    string
+	lastRestartCount  int
+	lastAIGuardMode   string
+	lastAIGuardSig    string
+	coreDownSince     time.Time
+	healthFailCount   int
+	lastRecoveryTryAt time.Time
 	cachedNetSig      features.ActiveNetworkSignature
 	cachedNetSigAt    time.Time
 	proxyGroupsMu     sync.RWMutex
@@ -144,6 +162,7 @@ type Engine struct {
 	aiRelay           string
 	providerSubInfo   *subscription.UserInfo
 	logsDir           string
+	daemonLog         *applog.RotatingFile
 
 	stopBgCh   chan struct{}
 	stopPower  func()
@@ -183,7 +202,8 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 	nodeStore := nodeservices.NewStore(store.AppDataDir())
 	localRunner := service.NewRunner(cfg.BinDir)
 	logsDir := filepath.Join(store.AppDataDir(), "logs")
-	_ = os.MkdirAll(logsDir, 0700)
+	_ = os.MkdirAll(logsDir, 0755)
+	daemonLog, _ := applog.NewRotatingFile(filepath.Join(logsDir, "clashfx-daemon.log"), applog.DefaultMaxBytes, applog.DefaultMaxBackups)
 
 	eng := &Engine{
 		cfg:         cfg,
@@ -194,6 +214,7 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 		localRunner: localRunner,
 		coreHelper:  helper,
 		logsDir:     logsDir,
+		daemonLog:   daemonLog,
 		stopBgCh:    make(chan struct{}),
 		onPush:      onPush,
 	}
@@ -245,9 +266,22 @@ func NewEngine(cfg Config, onPush func()) (*Engine, error) {
 	return eng, nil
 }
 
+func (e *Engine) logf(level, format string, args ...any) {
+	if e.daemonLog != nil {
+		e.daemonLog.Logf("clashfx-daemon", level, format, args...)
+	}
+	upper := strings.ToUpper(strings.TrimSpace(level))
+	if upper == "ERROR" || upper == "WARN" {
+		fmt.Fprintf(os.Stderr, "[clashfx-daemon] [%s] %s\n", upper, fmt.Sprintf(format, args...))
+	}
+}
+
 // Start boots the proxy core, recovers any crashed system proxy snapshot, starts
 // file watchers, power-resume self-healing, subscription timers, and node watchdog.
 func (e *Engine) Start(ctx context.Context) error {
+	e.logf("INFO", "starting clashfx-daemon %s (%s/%s, appData=%s, logs=%s)",
+		AppVersion, runtime.GOOS, runtime.GOARCH, e.store.AppDataDir(), e.logsDir)
+
 	settings := e.store.Settings()
 	if settings.AILockEnabled {
 		_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
@@ -291,14 +325,31 @@ func (e *Engine) Start(ctx context.Context) error {
 		}
 	}
 
+	// Arm OS-level AI Guard BEFORE touching core so there is zero boot/startup leak window.
+	if settings.AILockEnabled {
+		e.syncAIGuard(true)
+	}
+
+	// Adopt an already-running ClashFXService mihomo_core if present (e.g. daemon respawned)
+	// so initial applyAndSync uses zero-downtime REST reload instead of killing TUN.
+	eff := e.effectiveRuntimeSettings(settings)
+	if eff.EnhancedMode && supportsPrivilegedService() && IsPrivilegedServiceInstalled(service.ServiceName) {
+		if resp, err := callService(2*time.Second, service.Request{Action: "status"}); err == nil && resp.OK && resp.Status != nil && resp.Status.Running {
+			if e.ctrl.SeedActiveStateFromDisk(resp.Status.ConfigFile) {
+				e.setCoreViaService(true)
+				e.logf("INFO", "adopted running ClashFXService mihomo_core (pid=%d, config=%s)", resp.Status.PID, resp.Status.ConfigFile)
+			}
+		}
+	}
+
 	if _, err := e.applyAndSync(ctx, true, false); err != nil {
 		// Log/expose startup error in state without crashing daemon IPC so UI can still open & fix config!
-		fmt.Fprintf(os.Stderr, "[clashfx-daemon] initial core apply warning: %v\n", err)
+		e.logf("WARN", "initial core apply warning: %v", err)
 	}
 
 	e.watchActiveConfigDir()
 	e.stopPower = StartPowerResumeMonitor(func() {
-		time.Sleep(1200 * time.Millisecond)
+		time.Sleep(1500 * time.Millisecond)
 		e.handleWakeOrNetworkCheck()
 	})
 	e.nodeCoord.StartBackgroundLoop()
@@ -328,6 +379,11 @@ func (e *Engine) ShutdownWithOptions(opts ShutdownOptions) {
 		close(e.stopBgCh)
 	}
 
+	e.logf("INFO", "shutting down clashfx-daemon (force_restore=%v, kill_ai_clients=%v)", opts.ForceRestoreProxy, opts.KillAIClients)
+	e.statusMu.Lock()
+	e.desiredCoreActive = false
+	e.statusMu.Unlock()
+
 	if e.stopPower != nil {
 		e.stopPower()
 	}
@@ -336,11 +392,15 @@ func (e *Engine) ShutdownWithOptions(opts ShutdownOptions) {
 	cfgDir := e.store.ActiveConfigDir()
 	e.store.Close()
 
-	// Terminate protected AI clients BEFORE restoring OS proxy or stopping TUN so
-	// they cannot leak onto a direct network connection during teardown.
+	// Terminate protected AI clients BEFORE disarming OS AI Guard, restoring OS proxy,
+	// or stopping TUN so they cannot leak onto a direct network connection during teardown.
 	if opts.KillAIClients {
-		_, _ = ailock.TerminateRunningAIClients(cfgDir)
+		killed, _ := ailock.TerminateRunningAIClients(cfgDir)
+		e.logf("INFO", "terminated %d protected AI client process(es) before teardown", killed)
 	}
+
+	// Clean user quit explicitly disarms OS-level AI Guard so normal network access resumes.
+	e.disarmAIGuard()
 
 	if opts.ForceRestoreProxy {
 		_ = e.sysProxy.CleanupForUninstall()
@@ -353,6 +413,9 @@ func (e *Engine) ShutdownWithOptions(opts ShutdownOptions) {
 	viaSvc := e.isCoreViaService()
 	if viaSvc {
 		_, _ = callService(5*time.Second, service.Request{Action: "stop_core"})
+	}
+	if e.daemonLog != nil {
+		_ = e.daemonLog.Close()
 	}
 }
 
@@ -480,6 +543,7 @@ func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSet
 			HomeDir:    homeDir,
 			ConfigFile: runtimeConfigPath,
 			ExtUI:      e.cfg.DashboardUIDir,
+			LogDir:     e.logsDir,
 		})
 		if err != nil {
 			return err
@@ -501,7 +565,7 @@ func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSet
 			return nil
 		}
 	}
-	_, err := e.localRunner.Start(homeDir, runtimeConfigPath, e.cfg.DashboardUIDir)
+	_, err := e.localRunner.StartWithOptions(homeDir, runtimeConfigPath, e.cfg.DashboardUIDir, e.logsDir, true)
 	return err
 }
 
@@ -517,16 +581,108 @@ func (e *Engine) setCoreViaService(v bool) {
 	e.statusMu.Unlock()
 }
 
-func (e *Engine) IsCoreRunning() bool {
+func (e *Engine) currentCoreStatus() service.Status {
 	if e.isCoreViaService() {
-		return e.isServiceCoreRunning()
+		if resp, err := callService(2*time.Second, service.Request{Action: "status"}); err == nil && resp.OK && resp.Status != nil {
+			return *resp.Status
+		}
+		return service.Status{Health: service.CoreHealthStopped}
 	}
-	return e.localRunner.Status().Running
+	return e.localRunner.Status()
+}
+
+func (e *Engine) IsCoreRunning() bool {
+	return e.currentCoreStatus().Running
 }
 
 func (e *Engine) isServiceCoreRunning() bool {
 	resp, err := callService(2*time.Second, service.Request{Action: "status"})
 	return err == nil && resp.OK && resp.Status != nil && resp.Status.Running
+}
+
+func extractCIDRsFromRouteExcludes(raw string) []string {
+	var out []string
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r'
+	}) {
+		s := strings.TrimSpace(part)
+		if s != "" && strings.Contains(s, "/") {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (e *Engine) syncAIGuard(force bool) {
+	settings := e.store.Settings()
+	if !settings.AILockEnabled {
+		e.disarmAIGuard()
+		return
+	}
+
+	cfgDir := e.store.ActiveConfigDir()
+	exes := ailock.DiscoverProtectedExecutables(cfgDir)
+	cidrs := extractCIDRsFromRouteExcludes(settings.TunRouteExcludes)
+	cfg := service.AIGuardConfig{
+		Enabled:           true,
+		ConfigDir:         cfgDir,
+		ProtectedExePaths: exes,
+		TunDeviceName:     "ClashFX",
+		AllowCIDRs:        cidrs,
+		AllowLAN:          true,
+		ConsoleUID:        uint32(os.Getuid()),
+	}
+
+	sigBytes, _ := json.Marshal(cfg)
+	sig := string(sigBytes)
+	e.statusMu.RLock()
+	prevSig := e.lastAIGuardSig
+	e.statusMu.RUnlock()
+	if !force && sig == prevSig {
+		return
+	}
+
+	if supportsPrivilegedService() && IsPrivilegedServiceInstalled(service.ServiceName) {
+		resp, err := callService(6*time.Second, service.Request{
+			Action:  "sync_ai_guard",
+			AIGuard: &cfg,
+		})
+		if err != nil {
+			e.logf("WARN", "sync_ai_guard RPC failed: %v", err)
+			return
+		}
+		if !resp.OK {
+			e.logf("WARN", "sync_ai_guard rejected: %s", resp.Message)
+			return
+		}
+		e.statusMu.Lock()
+		e.lastAIGuardSig = sig
+		e.statusMu.Unlock()
+		if resp.Status != nil && resp.Status.AIGuard != nil {
+			e.logf("INFO", "AI Guard synced via ClashFXService (mode=%s, armed=%v, protected=%d, tun_luid=%d)",
+				resp.Status.AIGuard.Mode, resp.Status.AIGuard.Armed, resp.Status.AIGuard.ProtectedCount, resp.Status.AIGuard.TunLUID)
+		}
+		return
+	}
+
+	st := e.localRunner.SyncAIGuard(cfg)
+	e.statusMu.Lock()
+	e.lastAIGuardSig = sig
+	e.statusMu.Unlock()
+	if st.AIGuard != nil {
+		e.logf("INFO", "AI Guard synced locally (mode=%s, armed=%v, protected=%d)",
+			st.AIGuard.Mode, st.AIGuard.Armed, st.AIGuard.ProtectedCount)
+	}
+}
+
+func (e *Engine) disarmAIGuard() {
+	e.statusMu.Lock()
+	e.lastAIGuardSig = ""
+	e.statusMu.Unlock()
+	if supportsPrivilegedService() && IsPrivilegedServiceInstalled(service.ServiceName) {
+		_, _ = callService(4*time.Second, service.Request{Action: "disarm_ai_guard"})
+	}
+	_ = e.localRunner.DisarmAIGuard()
 }
 
 func (e *Engine) hasUsableManagedSubscription() bool {
@@ -573,15 +729,25 @@ func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUA
 	e.opMu.Unlock()
 
 	if err != nil {
+		e.logf("ERROR", "applyAndSync failed: %v", err)
 		e.refreshLiveCoreMetadata(ctx)
 		e.notifyStateChanged()
 		return state, err
 	}
 
+	e.statusMu.Lock()
+	e.desiredCoreActive = true
+	e.coreDownSince = time.Time{}
+	e.healthFailCount = 0
+	e.lastCoreRunning = true
+	e.lastCoreHealth = service.CoreHealthHealthy
+	e.statusMu.Unlock()
+
 	if includeRecovery && state.APIPort > 0 && e.IsCoreRunning() {
 		e.replaySavedSelections(ctx, state.APIPort, state.APISecret, e.store.Settings().SelectedProfile)
 	}
 
+	e.syncAIGuard(true)
 	e.reconcileSystemProxy()
 	e.refreshLiveCoreMetadata(ctx)
 	e.notifyStateChanged()
@@ -656,11 +822,19 @@ func (e *Engine) reconcileSystemProxy() {
 		matchedRule = ""
 	}
 
+	coreRunning := e.IsCoreRunning()
 	e.statusMu.Lock()
 	e.suspendedByNet = matchedRule
+	downSince := e.coreDownSince
 	e.statusMu.Unlock()
 
-	if eff.SystemProxyEnabled && !shouldSuspend && rt.HTTPPort > 0 {
+	// If AI Lock is OFF and the core has been continuously down for >=15s, temporarily
+	// release OS system proxy so non-AI-Lock users are not left with a dead 127.0.0.1 proxy.
+	// When AI Lock is ON, ALWAYS keep system proxy pointing at 127.0.0.1 so browsers/Electron
+	// remain strictly fail-closed even while mihomo_core is restarting or crashed.
+	releaseDeadProxy := !settings.AILockEnabled && !coreRunning && !downSince.IsZero() && time.Since(downSince) >= 15*time.Second
+
+	if eff.SystemProxyEnabled && !shouldSuspend && !releaseDeadProxy && rt.HTTPPort > 0 {
 		_, _ = e.sysProxy.ReconcileIfExpected(true, rt.HTTPPort, settings.ProxyBypassList)
 	} else {
 		_ = e.sysProxy.Restore()
@@ -668,10 +842,30 @@ func (e *Engine) reconcileSystemProxy() {
 }
 
 func (e *Engine) handleWakeOrNetworkCheck() {
+	e.logf("INFO", "power resume / wake check triggered")
+	if e.isCoreViaService() {
+		_, _ = callService(3*time.Second, service.Request{Action: "power_resume"})
+	}
+	e.verifyCoreAfterWake()
+	go func() {
+		select {
+		case <-e.stopBgCh:
+			return
+		case <-time.After(5 * time.Second):
+		}
+		e.verifyCoreAfterWake()
+	}()
+}
+
+func (e *Engine) verifyCoreAfterWake() {
 	settings := e.store.Settings()
 	if !e.IsCoreRunning() {
+		e.logf("WARN", "core not running after power resume; triggering applyAndSync recovery")
 		_, _ = e.applyAndSync(context.Background(), true, false)
 		return
+	}
+	if settings.AILockEnabled {
+		e.syncAIGuard(true)
 	}
 	if e.effectiveRuntimeSettings(settings).SystemProxyEnabled {
 		e.reconcileSystemProxy()
@@ -688,12 +882,14 @@ func (e *Engine) backgroundMaintenanceLoop() {
 	defer subTicker.Stop()
 
 	var lastAutoSubAt time.Time
+	var syncTick uint64
 	for {
 		select {
 		case <-e.stopBgCh:
 			return
 		case <-coreSyncTicker.C:
-			e.syncFromLiveCore(context.Background())
+			syncTick++
+			e.syncFromLiveCore(context.Background(), syncTick)
 		case <-netTicker.C:
 			e.statusMu.RLock()
 			prevSuspended := e.suspendedByNet
@@ -722,20 +918,84 @@ func (e *Engine) backgroundMaintenanceLoop() {
 	}
 }
 
-func (e *Engine) syncFromLiveCore(ctx context.Context) {
+func (e *Engine) syncFromLiveCore(ctx context.Context, tick uint64) {
 	if !e.opMu.TryLock() {
 		return
 	}
 
 	rt := e.ctrl.LastState()
-	if rt.APIPort <= 0 || !e.IsCoreRunning() {
+	coreSt := e.currentCoreStatus()
+	coreRunning := coreSt.Running
+	coreHealth := coreSt.Health
+	aiGuardMode := ""
+	if coreSt.AIGuard != nil {
+		aiGuardMode = coreSt.AIGuard.Mode
+	}
+
+	e.statusMu.Lock()
+	prevRunning := e.lastCoreRunning
+	prevHealth := e.lastCoreHealth
+	prevRestarts := e.lastRestartCount
+	prevGuardMode := e.lastAIGuardMode
+	desiredActive := e.desiredCoreActive
+	lastTry := e.lastRecoveryTryAt
+
+	stateTransition := (coreRunning != prevRunning) || (coreHealth != prevHealth) || (coreSt.RestartCount != prevRestarts) || (aiGuardMode != prevGuardMode)
+	e.lastCoreRunning = coreRunning
+	e.lastCoreHealth = coreHealth
+	e.lastRestartCount = coreSt.RestartCount
+	e.lastAIGuardMode = aiGuardMode
+
+	if !coreRunning {
+		if e.coreDownSince.IsZero() {
+			e.coreDownSince = time.Now()
+		}
+	} else {
+		e.coreDownSince = time.Time{}
+	}
+	e.statusMu.Unlock()
+
+	if stateTransition {
+		e.logf("INFO", "core state transition: running=%v->%v health=%s->%s restarts=%d->%d ai_guard=%s->%s",
+			prevRunning, coreRunning, prevHealth, coreHealth, prevRestarts, coreSt.RestartCount, prevGuardMode, aiGuardMode)
+	}
+
+	if !coreRunning {
 		e.opMu.Unlock()
+		if stateTransition {
+			e.reconcileSystemProxy()
+			e.notifyStateChanged()
+		}
+		// If the core is expected to run and the privileged service itself is not already
+		// running its own backoff supervisor (e.g. SCM cold-restarted ClashFXService),
+		// proactively re-apply runtime config after a 5s cooldown.
+		if desiredActive &&
+			coreHealth != service.CoreHealthRestarting &&
+			coreHealth != service.CoreHealthCrashLoop &&
+			time.Since(lastTry) >= 5*time.Second {
+			e.statusMu.Lock()
+			e.lastRecoveryTryAt = time.Now()
+			e.statusMu.Unlock()
+			e.logf("WARN", "core unexpectedly down (health=%s); triggering daemon recovery applyAndSync", coreHealth)
+			_, _ = e.applyAndSync(ctx, true, false)
+		}
+		return
+	}
+
+	if rt.APIPort <= 0 {
+		e.opMu.Unlock()
+		if stateTransition {
+			e.notifyStateChanged()
+		}
 		return
 	}
 
 	settings := e.store.Settings()
-	anyChanged := false
+	anyChanged := stateTransition
 	needReconcileProxy := false
+
+	// If core recovered from an auto-restart inside ClashFXService, replay saved group selections.
+	recoveredFromRestart := (!prevRunning && coreRunning) || (coreSt.RestartCount > prevRestarts)
 
 	// 1. Reconcile outbound mode under opMu so concurrent user applyAndSync calls never race
 	if liveMode := fetchCoreOutboundMode(ctx, rt.APIPort, rt.APISecret); liveMode != "" {
@@ -754,7 +1014,50 @@ func (e *Engine) syncFromLiveCore(ctx context.Context) {
 			}
 		}
 	}
+
+	// 2. Deep data-plane health check every 4 ticks (~12s): verify controller /version
+	// AND (on Windows Enhanced Mode) Wintun "ClashFX" adapter liveness to catch wedged cores.
+	triggerForcedRestart := false
+	if tick%4 == 0 {
+		verOK := fetchCoreVersionFromCore(ctx, rt.APIPort, rt.APISecret) != ""
+		tunOK := true
+		eff := e.effectiveRuntimeSettings(settings)
+		if eff.EnhancedMode && e.isCoreViaService() && runtime.GOOS == "windows" {
+			tunOK = coreSt.TunHealthy
+		}
+		e.statusMu.Lock()
+		if verOK && tunOK {
+			e.healthFailCount = 0
+		} else {
+			e.healthFailCount++
+			fails := e.healthFailCount
+			e.logf("WARN", "deep health check failed (count=%d/3, api_ok=%v, tun_ok=%v)", fails, verOK, tunOK)
+			if fails >= 3 {
+				e.healthFailCount = 0
+				triggerForcedRestart = true
+			}
+		}
+		e.statusMu.Unlock()
+	}
 	e.opMu.Unlock()
+
+	if triggerForcedRestart {
+		e.logf("ERROR", "core failed 3 consecutive deep health checks (wedged API or missing Wintun); forcing clean core restart")
+		_ = e.RestartCore(ctx, false)
+		return
+	}
+
+	if recoveredFromRestart {
+		e.replaySavedSelections(ctx, rt.APIPort, rt.APISecret, settings.SelectedProfile)
+		if settings.AILockEnabled {
+			e.syncAIGuard(true)
+		}
+		needReconcileProxy = true
+		anyChanged = true
+	} else if settings.AILockEnabled && tick%10 == 0 {
+		// Periodically rescan running processes & install roots so newly updated/launched AI apps enter WFP.
+		e.syncAIGuard(false)
+	}
 
 	if needReconcileProxy {
 		e.reconcileSystemProxy()
@@ -988,8 +1291,35 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 		_ = os.MkdirAll(logsDir, 0700)
 	}
 
-	coreRunning := e.IsCoreRunning()
+	coreSt := e.currentCoreStatus()
+	coreRunning := coreSt.Running
 	svcInstalled := (viaSvc && coreRunning) || IsPrivilegedServiceInstalled(service.ServiceName)
+	coreHealth := coreSt.Health
+	if coreHealth == "" {
+		if coreRunning {
+			coreHealth = service.CoreHealthHealthy
+		} else {
+			coreHealth = service.CoreHealthStopped
+		}
+	}
+	var aiGuardSt service.AIGuardStatus
+	if coreSt.AIGuard != nil {
+		aiGuardSt = *coreSt.AIGuard
+	} else {
+		aiGuardSt.Mode = service.AIGuardModeInactive
+	}
+	coreLogFile := coreSt.CoreLogFile
+	if coreLogFile == "" {
+		coreLogFile = filepath.Join(logsDir, "mihomo-core.log")
+	}
+	daemonLogFile := filepath.Join(logsDir, "clashfx-daemon.log")
+	if e.daemonLog != nil && e.daemonLog.Path() != "" {
+		daemonLogFile = e.daemonLog.Path()
+	}
+	svcLogFile := coreSt.ServiceLogFile
+	if svcLogFile == "" {
+		svcLogFile = filepath.Join(logsDir, "clashfx-service-events.log")
+	}
 
 	return DaemonSnapshot{
 		Version:                AppVersion,
@@ -997,8 +1327,13 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 		Platform:               runtime.GOOS,
 		Arch:                   runtime.GOARCH,
 		CoreRunning:            coreRunning,
+		CoreHealth:             coreHealth,
+		CoreRestartCount:       coreSt.RestartCount,
+		LastCrashAt:            coreSt.LastCrashAt,
+		LastCrashReason:        coreSt.LastCrashReason,
 		CoreViaService:         viaSvc,
 		ServiceInstalled:       svcInstalled,
+		AIGuard:                aiGuardSt,
 		Settings:               settings,
 		Runtime:                rt,
 		DashboardURL:           buildDashboardURL(rt.APIPort, rt.APISecret),
@@ -1006,6 +1341,9 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 		ProfileMixinPath:       e.store.ProfileMixinPath(),
 		ConfigDir:              e.store.ActiveConfigDir(),
 		LogsDir:                logsDir,
+		CoreLogFile:            coreLogFile,
+		DaemonLogFile:          daemonLogFile,
+		ServiceLogFile:         svcLogFile,
 		ProxyGroups:            groups,
 		DefaultRuleTarget:      defTarget,
 		AILockCandidates:       cands,
@@ -1734,9 +2072,11 @@ func (e *Engine) SetAILock(ctx context.Context, enabled bool, target string, all
 			*s = prev
 			return nil
 		})
+		e.syncAIGuard(true)
 		_, _ = e.applyAndSync(ctx, false, false)
 		return err
 	}
+	e.syncAIGuard(true)
 	e.closeAllConnections(ctx)
 	return nil
 }
@@ -2441,6 +2781,9 @@ func (e *Engine) SaveRuleProvider(ctx context.Context, providerName, content str
 			return EffectiveRulesView{}, fmt.Errorf("内核规则集解析条数不一致（预期 %d 条，实际加载 %d 条），已自动回滚，请检查是否存在特殊语法错误", len(parsedRules), prov.RuleCount)
 		}
 	}
+	if providerName == profile.AILockRuleProviderName && e.store.Settings().AILockEnabled {
+		go e.syncAIGuard(true)
+	}
 	return view, nil
 }
 
@@ -2529,19 +2872,49 @@ func (e *Engine) DiagnosticInfo() string {
 	e.statusMu.RLock()
 	viaSvc := e.coreViaService
 	suspendedNet := e.suspendedByNet
+	logsDir := e.logsDir
 	e.statusMu.RUnlock()
 
-	var recentLogs []string
-	if viaSvc {
-		if resp, err := callService(2*time.Second, service.Request{Action: "status"}); err == nil && resp.Status != nil {
-			recentLogs = resp.Status.RecentLogs
-		}
-	} else {
-		recentLogs = e.localRunner.Status().RecentLogs
+	coreSt := e.currentCoreStatus()
+	coreLogFile := coreSt.CoreLogFile
+	if coreLogFile == "" && logsDir != "" {
+		coreLogFile = filepath.Join(logsDir, "mihomo-core.log")
 	}
+	daemonLogFile := ""
+	if e.daemonLog != nil {
+		daemonLogFile = e.daemonLog.Path()
+	} else if logsDir != "" {
+		daemonLogFile = filepath.Join(logsDir, "clashfx-daemon.log")
+	}
+	svcLogFile := coreSt.ServiceLogFile
+	if svcLogFile == "" && logsDir != "" {
+		svcLogFile = filepath.Join(logsDir, "clashfx-service-events.log")
+	}
+
+	recentCoreLogs := applog.TailFile(coreLogFile, 80)
+	if len(recentCoreLogs) == 0 {
+		recentCoreLogs = coreSt.RecentLogs
+	}
+	recentDaemonLogs := applog.TailFile(daemonLogFile, 50)
+
+	var guardMode, guardBackend, guardErr string
+	var guardArmed bool
+	var guardProtected int
+	if coreSt.AIGuard != nil {
+		guardMode = coreSt.AIGuard.Mode
+		guardBackend = coreSt.AIGuard.Backend
+		guardArmed = coreSt.AIGuard.Armed
+		guardProtected = coreSt.AIGuard.ProtectedCount
+		guardErr = coreSt.AIGuard.LastError
+	}
+
 	return features.BuildRedactedDiagnosticReport(features.DiagnosticBundleInput{
 		AppVersion:       AppVersion,
-		CoreRunning:      e.IsCoreRunning(),
+		CoreRunning:      coreSt.Running,
+		CoreHealth:       coreSt.Health,
+		CoreRestartCount: coreSt.RestartCount,
+		LastCrashAt:      coreSt.LastCrashAt,
+		LastCrashReason:  coreSt.LastCrashReason,
 		CoreViaService:   viaSvc,
 		ServiceInstalled: IsPrivilegedServiceInstalled(service.ServiceName),
 		MixedPort:        rt.MixedPort,
@@ -2551,7 +2924,17 @@ func (e *Engine) DiagnosticInfo() string {
 		SysProxyServer:   osState.ProxyServer,
 		SysProxyEnabled:  osState.ProxyEnable == 1,
 		SuspendedNet:     suspendedNet,
-		RecentCoreLogs:   recentLogs,
+		AIGuardMode:      guardMode,
+		AIGuardBackend:   guardBackend,
+		AIGuardArmed:     guardArmed,
+		AIGuardProtected: guardProtected,
+		AIGuardError:     guardErr,
+		LogsDir:          logsDir,
+		CoreLogFile:      coreLogFile,
+		DaemonLogFile:    daemonLogFile,
+		ServiceLogFile:   svcLogFile,
+		RecentCoreLogs:   recentCoreLogs,
+		RecentDaemonLogs: recentDaemonLogs,
 	})
 }
 

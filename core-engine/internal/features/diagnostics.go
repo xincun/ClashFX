@@ -270,6 +270,10 @@ func sanitizeDiagnosticURL(raw string) string {
 type DiagnosticBundleInput struct {
 	AppVersion       string
 	CoreRunning      bool
+	CoreHealth       string
+	CoreRestartCount int
+	LastCrashAt      string
+	LastCrashReason  string
 	CoreViaService   bool
 	ServiceInstalled bool
 	MixedPort        int
@@ -279,7 +283,17 @@ type DiagnosticBundleInput struct {
 	SysProxyServer   string
 	SysProxyEnabled  bool
 	SuspendedNet     string
+	AIGuardMode      string
+	AIGuardBackend   string
+	AIGuardArmed     bool
+	AIGuardProtected int
+	AIGuardError     string
+	LogsDir          string
+	CoreLogFile      string
+	DaemonLogFile    string
+	ServiceLogFile   string
 	RecentCoreLogs   []string
+	RecentDaemonLogs []string
 }
 
 // BuildRedactedDiagnosticReport creates a safe clipboard report with zero secrets,
@@ -293,7 +307,11 @@ func BuildRedactedDiagnosticReport(in DiagnosticBundleInput) string {
 	fmt.Fprintf(&b, "=== ClashFX %s Diagnostic Report ===\n", osTitle)
 	fmt.Fprintf(&b, "Timestamp: %s\n", time.Now().Format(time.RFC3339))
 	fmt.Fprintf(&b, "Version: %s (%s/%s)\n", in.AppVersion, runtime.GOOS, runtime.GOARCH)
-	fmt.Fprintf(&b, "Core Running: %v (via_service=%v, service_installed=%v)\n", in.CoreRunning, in.CoreViaService, in.ServiceInstalled)
+	fmt.Fprintf(&b, "Core Running: %v (health=%s, auto_restarts=%d, via_service=%v, service_installed=%v)\n",
+		in.CoreRunning, in.CoreHealth, in.CoreRestartCount, in.CoreViaService, in.ServiceInstalled)
+	if in.LastCrashAt != "" || in.LastCrashReason != "" {
+		fmt.Fprintf(&b, "Last Core Crash: at=%s reason=%s\n", in.LastCrashAt, redactLogLine(in.LastCrashReason))
+	}
 	fmt.Fprintf(&b, "Selected Profile: %s (custom_dir=%v)\n", in.Settings.SelectedProfile, strings.TrimSpace(in.Settings.CustomConfigDir) != "")
 	fmt.Fprintf(&b, "Outbound Mode: %s | Enhanced TUN: %v (stack=%s, mtu=%d, as_is=%v, bypass_cn=%v)\n",
 		in.Settings.OutboundMode, in.Settings.EnhancedMode, in.Settings.TunStack, in.Settings.TunMTU,
@@ -302,11 +320,33 @@ func BuildRedactedDiagnosticReport(in DiagnosticBundleInput) string {
 		in.MixedPort, in.APIPort, in.DNSPort, in.Settings.APISecret != "")
 	fmt.Fprintf(&b, "System Proxy: want=%v os_enabled=%v os_server=%s suspended_by_net=%q\n",
 		in.Settings.SystemProxyEnabled, in.SysProxyEnabled, in.SysProxyServer, in.SuspendedNet)
-	fmt.Fprintf(&b, "AI Proxy Lock: enabled=%v target_configured=%v\n",
-		in.Settings.AILockEnabled, strings.TrimSpace(in.Settings.AILockTarget) != "")
+	fmt.Fprintf(&b, "AI Proxy Lock: enabled=%v target_configured=%v | OS Guard: mode=%s backend=%s armed=%v protected_exes=%d\n",
+		in.Settings.AILockEnabled, strings.TrimSpace(in.Settings.AILockTarget) != "",
+		in.AIGuardMode, in.AIGuardBackend, in.AIGuardArmed, in.AIGuardProtected)
+	if in.AIGuardError != "" {
+		fmt.Fprintf(&b, "AI Guard Error: %s\n", redactLogLine(in.AIGuardError))
+	}
+	if in.LogsDir != "" {
+		fmt.Fprintf(&b, "Logs Dir: %s\n", in.LogsDir)
+		if in.CoreLogFile != "" {
+			fmt.Fprintf(&b, "  Core Log: %s\n", in.CoreLogFile)
+		}
+		if in.DaemonLogFile != "" {
+			fmt.Fprintf(&b, "  Daemon Log: %s\n", in.DaemonLogFile)
+		}
+		if in.ServiceLogFile != "" {
+			fmt.Fprintf(&b, "  Service Log: %s\n", in.ServiceLogFile)
+		}
+	}
 	if len(in.RecentCoreLogs) > 0 {
 		fmt.Fprintf(&b, "--- Recent Core Logs (Redacted, last %d lines) ---\n", len(in.RecentCoreLogs))
 		for _, line := range in.RecentCoreLogs {
+			fmt.Fprintf(&b, "%s\n", redactLogLine(line))
+		}
+	}
+	if len(in.RecentDaemonLogs) > 0 {
+		fmt.Fprintf(&b, "--- Recent Daemon Logs (Redacted, last %d lines) ---\n", len(in.RecentDaemonLogs))
+		for _, line := range in.RecentDaemonLogs {
 			fmt.Fprintf(&b, "%s\n", redactLogLine(line))
 		}
 	}

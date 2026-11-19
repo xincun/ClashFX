@@ -643,6 +643,13 @@ func (r *Runner) UpgradeCore(ctx context.Context, channel string, proxyPort int)
 	homeDir := r.homeDir
 	configFile := r.configFile
 	extUI := r.extUI
+	logDir := r.logDir
+	supervise := r.supervise
+
+	// Keep OS AI Guard in blocking mode while mihomo_core is stopped for binary replacement.
+	if r.aiGuardCfg.Enabled {
+		_ = r.syncAIGuardLocked(false)
+	}
 
 	if err := r.stopLocked(); err != nil {
 		return CoreUpgradeInfo{PreviousVersion: prevVer, CurrentVersion: prevVer, LatestVersion: rel.Version}, r.statusLocked(),
@@ -652,7 +659,7 @@ func (r *Runner) UpgradeCore(ctx context.Context, channel string, proxyPort int)
 	backupPath, bakErr := moveAsideBackup(corePath)
 	if bakErr != nil {
 		if wasRunning && homeDir != "" && configFile != "" {
-			_, _ = r.startLocked(homeDir, configFile, extUI)
+			_, _ = r.startLocked(homeDir, configFile, extUI, logDir, supervise, false)
 		}
 		return CoreUpgradeInfo{PreviousVersion: prevVer, CurrentVersion: prevVer, LatestVersion: rel.Version}, r.statusLocked(),
 			fmt.Errorf("backup previous core binary: %w", bakErr)
@@ -663,7 +670,7 @@ func (r *Runner) UpgradeCore(ctx context.Context, channel string, proxyPort int)
 			_ = renameWithRetry(backupPath, corePath)
 		}
 		if wasRunning && homeDir != "" && configFile != "" {
-			_, _ = r.startLocked(homeDir, configFile, extUI)
+			_, _ = r.startLocked(homeDir, configFile, extUI, logDir, supervise, false)
 		}
 		return CoreUpgradeInfo{PreviousVersion: prevVer, CurrentVersion: prevVer, LatestVersion: rel.Version}, r.statusLocked(),
 			fmt.Errorf("install upgraded core binary: %w", err)
@@ -672,14 +679,14 @@ func (r *Runner) UpgradeCore(ctx context.Context, channel string, proxyPort int)
 	refreshCorePlatformPostInstall(corePath)
 
 	if wasRunning && homeDir != "" && configFile != "" {
-		_, startErr := r.startLocked(homeDir, configFile, extUI)
+		_, startErr := r.startLocked(homeDir, configFile, extUI, logDir, supervise, false)
 		if startErr != nil {
 			_ = r.stopLocked()
 			_ = os.Remove(corePath)
 			rollbackNote := ""
 			if backupPath != "" {
 				if rbRenameErr := renameWithRetry(backupPath, corePath); rbRenameErr == nil {
-					if _, rbStartErr := r.startLocked(homeDir, configFile, extUI); rbStartErr != nil {
+					if _, rbStartErr := r.startLocked(homeDir, configFile, extUI, logDir, supervise, false); rbStartErr != nil {
 						rollbackNote = fmt.Sprintf("; rollback restart failed: %v", rbStartErr)
 					} else {
 						rollbackNote = "; rolled back to previous core"

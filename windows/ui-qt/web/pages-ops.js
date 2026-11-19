@@ -96,6 +96,31 @@ export function renderAiLockPage(root, handlers) {
   const candidates = Array.isArray(snap.ai_lock_candidates) ? snap.ai_lock_candidates : [];
   const delayMap = buildDelayLookup(snap);
   const q = aiState.search.trim().toLowerCase();
+  const guard = snap.ai_guard || {};
+  const guardMode = guard.mode || 'inactive';
+  const guardBackendLabel =
+    guard.backend === 'wfp'
+      ? t('Windows WFP 应用级内核护栏', 'Windows WFP App-Scoped Kernel Guard')
+      : guard.backend === 'pf'
+      ? t('macOS PF 断连防漏护栏', 'macOS PF Outage Leak Guard')
+      : t('OS 防漏网护栏', 'OS Leak Guard');
+  const guardPillClass =
+    guardMode === 'armed_normal'
+      ? 'pill-green'
+      : guardMode === 'blocking_leaks'
+      ? 'pill-red'
+      : guardMode === 'error'
+      ? 'pill-amber'
+      : '';
+  const guardPillText =
+    guardMode === 'armed_normal'
+      ? t(`已武装 · 保护 ${guard.protected_count || 0} 个 AI 程序`, `Armed · ${guard.protected_count || 0} AI binaries`)
+      : guardMode === 'blocking_leaks'
+      ? t('内核中断 · 正在阻断直连防漏网', 'Core Down · Blocking Direct Egress')
+      : guardMode === 'error'
+      ? t('护栏异常（请检查特权服务）', 'Guard Error (Check Service)')
+      : t('未开启', 'Inactive');
+  const mixedPort = snap.runtime?.mixed_port || settings.port_override || 7890;
 
   const candidateOptions = Array.from(new Set([target, ...candidates.map((c) => c.name)].filter(Boolean)));
   const filtered = candidates.filter(
@@ -191,6 +216,18 @@ export function renderAiLockPage(root, handlers) {
           <div class="metric-sub" style="margin-top:2px;">${t('可在规则页热更新 .list 域名列表', 'Customize domains live in Rules → .list Studio')}</div>
         </div>
       </div>
+
+      <div class="row-flex" style="justify-content:space-between;margin-top:12px;padding-top:10px;border-top:1px solid var(--border-subtle);flex-wrap:wrap;gap:8px;">
+        <div class="row-flex" style="gap:8px;flex-wrap:wrap;">
+          <span class="metric-sub" style="font-weight:600;">${esc(guardBackendLabel)}:</span>
+          <span class="pill ${guardPillClass}">${esc(guardPillText)}</span>
+          ${guard.last_error ? `<span class="metric-sub" style="color:var(--red);">${esc(guard.last_error)}</span>` : ''}
+        </div>
+        <div class="row-flex" style="gap:6px;">
+          <button type="button" class="btn btn-xs" id="ai-copy-env-ps">${ICONS.copy} ${t('复制 PowerShell 代理变量', 'Copy PowerShell Proxy Env')}</button>
+          <button type="button" class="btn btn-xs" id="ai-copy-env-sh">${ICONS.copy} ${t('复制 Bash/Zsh 代理变量', 'Copy Bash/Zsh Proxy Env')}</button>
+        </div>
+      </div>
     </div>
 
     <div class="row-flex" style="justify-content:space-between;">
@@ -235,6 +272,16 @@ export function renderAiLockPage(root, handlers) {
   root.querySelector('#ai-edit-rules')?.addEventListener('click', () => {
     store.preferredRuleProvider = 'clashfx-ai-lock';
     handlers.go(2, 2);
+  });
+  root.querySelector('#ai-copy-env-ps')?.addEventListener('click', async () => {
+    const cmd = `$env:HTTP_PROXY="http://127.0.0.1:${mixedPort}"; $env:HTTPS_PROXY="http://127.0.0.1:${mixedPort}"; $env:NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"`;
+    await native('copy_text', { text: cmd });
+    showToast(t('已复制 PowerShell 终端代理命令（不会污染全局系统环境）', 'Copied PowerShell proxy env snippet'), 'ok');
+  });
+  root.querySelector('#ai-copy-env-sh')?.addEventListener('click', async () => {
+    const cmd = `export HTTP_PROXY="http://127.0.0.1:${mixedPort}" HTTPS_PROXY="http://127.0.0.1:${mixedPort}" NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"`;
+    await native('copy_text', { text: cmd });
+    showToast(t('已复制 Bash/Zsh 终端代理命令', 'Copied Bash/Zsh proxy env snippet'), 'ok');
   });
   root.querySelector('#ai-diag-current')?.addEventListener('click', () => {
     const sel = root.querySelector('#ai-target-select')?.value || target;
@@ -625,6 +672,14 @@ export function renderDiagnosticsPage(root) {
                ${ICONS.bolt} ${diagState.probing ? t('探测中…', 'Probing…') : t('开始探测', 'Run Probe')}
              </button>
            </div>
+           ${
+             snap.logs_dir
+               ? `<div class="metric-sub mono" style="margin-top:8px;opacity:.85;word-break:break-all;">
+                    ${t('持久化日志目录:', 'Persistent Logs:')} ${esc(snap.logs_dir)}
+                    ${snap.core_restart_count > 0 ? ` · ${t(`自动恢复次数: ${snap.core_restart_count}`, `Auto-restarts: ${snap.core_restart_count}`)}` : ''}
+                  </div>`
+               : ''
+           }
          </div>
          ${verdictHtml}
          ${

@@ -233,7 +233,7 @@ func repairUserHomeOwnership(cleanHome string) {
 		return
 	}
 	uid, gid := int(st.Uid), int(st.Gid)
-	for _, name := range []string{"ruleset", "clashfx-rulesets", "proxies", "rules", "cache.db", ".mihomo_core.log", ".mihomo_core_logs"} {
+	for _, name := range []string{"logs", "ruleset", "clashfx-rulesets", "proxies", "rules", "cache.db", ".mihomo_core.log", ".mihomo_core_logs"} {
 		target := filepath.Join(cleanHome, name)
 		linfo, lerr := os.Lstat(target)
 		if lerr != nil {

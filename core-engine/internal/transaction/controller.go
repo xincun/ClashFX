@@ -127,6 +127,57 @@ func (c *Controller) ResetActiveState() {
 	c.setLastState(AppliedRuntimeState{})
 }
 
+// SeedActiveStateFromDisk populates lastState from an existing .runtime-config.yaml
+// when adopting an already-running ClashFXService core across daemon restarts so
+// subsequent Apply calls can use zero-downtime REST reload instead of hard-restarting TUN.
+func (c *Controller) SeedActiveStateFromDisk(configPath string) bool {
+	if strings.TrimSpace(configPath) == "" {
+		configPath = c.RuntimeConfigPath()
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return false
+	}
+	root, err := profile.UnmarshalYAMLMap(raw)
+	if err != nil || root == nil {
+		return false
+	}
+	settings := c.store.Settings()
+	apiPort := extractPortFromHostPort(fmt.Sprint(root["external-controller"]), 0)
+	if apiPort <= 0 {
+		return false
+	}
+	mixedPort := intFromYAML(root["mixed-port"])
+	httpPort := intFromYAML(root["port"])
+	if httpPort <= 0 {
+		httpPort = mixedPort
+	}
+	socksPort := intFromYAML(root["socks-port"])
+	if socksPort <= 0 {
+		socksPort = mixedPort
+	}
+	var dnsPort int
+	if dnsMap, ok := root["dns"].(map[string]any); ok && dnsMap != nil {
+		dnsPort = extractPortFromHostPort(fmt.Sprint(dnsMap["listen"]), 0)
+	}
+	var enhanced bool
+	if tunMap, ok := root["tun"].(map[string]any); ok && tunMap != nil {
+		enhanced = boolFromYAML(tunMap["enable"])
+	}
+	secret, _ := root["secret"].(string)
+	c.setLastState(AppliedRuntimeState{
+		ProfileName: settings.SelectedProfile,
+		MixedPort:   mixedPort,
+		SocksPort:   socksPort,
+		HTTPPort:    httpPort,
+		APIPort:     apiPort,
+		DNSPort:     dnsPort,
+		APISecret:   secret,
+		Enhanced:    enhanced,
+	})
+	return true
+}
+
 func (c *Controller) RuntimeConfigPath() string {
 	return filepath.Join(c.store.ActiveConfigDir(), ".runtime-config.yaml")
 }

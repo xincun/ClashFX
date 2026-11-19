@@ -67,6 +67,10 @@ QPixmap renderTrayFrame(int size,
             bgColor = QColor(20, 24, 28, 255);
             fgColor = QColor(99, 230, 190);
             break;
+        case TrayVisualState::Alert:
+            bgColor = QColor(220, 38, 38, 255);
+            fgColor = QColor(255, 255, 255);
+            break;
         }
     } else if (isOcean) {
         iconRes = (state == TrayVisualState::EnhancedTun)
@@ -85,6 +89,9 @@ QPixmap renderTrayFrame(int size,
         case TrayVisualState::EnhancedTun:
             bgColor = QColor(12, 133, 153, 255);
             break;
+        case TrayVisualState::Alert:
+            bgColor = QColor(220, 38, 38, 255);
+            break;
         }
     } else {
         iconRes = (state == TrayVisualState::Idle || state == TrayVisualState::Disconnected)
@@ -102,6 +109,9 @@ QPixmap renderTrayFrame(int size,
             break;
         case TrayVisualState::EnhancedTun:
             bgColor = QColor(16, 185, 129, 255); // Emerald TUN active
+            break;
+        case TrayVisualState::Alert:
+            bgColor = QColor(220, 38, 38, 255); // Crimson alert
             break;
         }
     }
@@ -166,11 +176,23 @@ QString TrayIconGenerator::buildTooltip(bool connected, const QJsonObject& snaps
     const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
     const QString aiTarget = settings.value(QStringLiteral("claudeProxyLockTarget")).toString();
     const QString suspendedNet = snapshot.value(QStringLiteral("suspended_by_network")).toString();
+    const QString coreHealth = snapshot.value(QStringLiteral("core_health")).toString();
+    const QJsonObject aiGuard = snapshot.value(QStringLiteral("ai_guard")).toObject();
+    const QString guardMode = aiGuard.value(QStringLiteral("mode")).toString();
 
     QStringList lines;
     lines << QStringLiteral("ClashFX (%1)").arg(snapshot.value(QStringLiteral("arch")).toString());
     if (!coreRunning) {
-        lines << L("状态: 内核未运行 (请检查配置)", "Status: Core Stopped (Check Config)");
+        if (coreHealth == QStringLiteral("restarting")) {
+            lines << L("状态: 内核自动恢复中…", "Status: Core Recovering…");
+        } else if (coreHealth == QStringLiteral("crash_loop")) {
+            lines << L("⚠ 内核异常停止 (请点击修复)", "⚠ Core Crash Loop (Click to Fix)");
+        } else {
+            lines << L("状态: 内核未运行 (请检查配置)", "Status: Core Stopped (Check Config)");
+        }
+    }
+    if (aiLocked && guardMode == QStringLiteral("blocking_leaks")) {
+        lines << L("🛡 AI 防漏网护栏: 已阻断直连", "🛡 AI Leak Guard: Blocking Direct");
     }
     lines << L("配置: ", "Profile: ") + profile + QStringLiteral("  |  ") +
                  L("模式: ", "Mode: ") + mode;

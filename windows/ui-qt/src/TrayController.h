@@ -103,6 +103,8 @@ private:
     bool forceRestoreOnQuit_ = false;
     bool killAiClientsOnQuit_ = false;
     bool promptingQuit_ = false;
+    QString lastAlertSig_;
+    bool wasInCoreAlert_ = false;
     QString lastIconKey_;
     QString lastTooltip_;
     QByteArray lastMenuSig_;

@@ -312,6 +312,40 @@ void TrayController::onStateChanged(const QJsonObject& snapshot) {
 
     consoleWindow_->applySnapshot(connected_, snapshot_);
     rebuildTrayVisualsAndMenu();
+
+    // High-visibility OS notification on core outage / crash loop / AI leak-guard blocking.
+    if (!smokeMode_ && trayIcon_) {
+        const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
+        const QString health = snapshot_.value(QStringLiteral("core_health")).toString();
+        const QJsonObject aiGuard = snapshot_.value(QStringLiteral("ai_guard")).toObject();
+        const QString guardMode = aiGuard.value(QStringLiteral("mode")).toString();
+        const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
+        const bool isCritical = (health == QStringLiteral("crash_loop")) ||
+                                (!coreRunning && aiLocked && guardMode == QStringLiteral("blocking_leaks") && health != QStringLiteral("restarting"));
+        if (isCritical) {
+            const QString sig = health + QLatin1Char('|') + guardMode + QLatin1Char('|') +
+                                snapshot_.value(QStringLiteral("last_crash_at")).toString();
+            if (sig != lastAlertSig_) {
+                lastAlertSig_ = sig;
+                wasInCoreAlert_ = true;
+                const QString msg = aiLocked
+                    ? L("代理内核异常中断，AI 防漏网护栏已自动阻断 AI 工具直连（防止暴露真实 IP）。请右键托盘点击「立即重启代理内核」或查看日志。",
+                        "Proxy core stopped unexpectedly. AI Leak Guard is blocking direct AI traffic to prevent real IP exposure. Click Restart Core in the tray menu.")
+                    : L("代理内核异常中断且自动恢复失败，请右键托盘点击「立即重启代理内核」或查看日志。",
+                        "Proxy core stopped unexpectedly and failed to auto-recover. Click Restart Core in the tray menu or inspect logs.");
+                trayIcon_->showMessage(L("ClashFX 代理内核告警", "ClashFX Core Alert"), msg, QSystemTrayIcon::Critical, 10000);
+            }
+        } else if (coreRunning && wasInCoreAlert_) {
+            wasInCoreAlert_ = false;
+            lastAlertSig_.clear();
+            trayIcon_->showMessage(
+                QStringLiteral("ClashFX"),
+                L("代理内核已恢复运行，代理与 AI 锁定保护正常在线。",
+                  "Proxy core recovered and protection is active."),
+                QSystemTrayIcon::Information,
+                4000);
+        }
+    }
 }
 
 void TrayController::onTrayActivated(QSystemTrayIcon::ActivationReason reason) {
@@ -390,6 +424,8 @@ QByteArray TrayController::buildMenuSignature() const {
     QJsonObject sig;
     sig.insert(QStringLiteral("connected"), connected_);
     sig.insert(QStringLiteral("core_running"), snapshot_.value(QStringLiteral("core_running")).toBool(false));
+    sig.insert(QStringLiteral("core_health"), snapshot_.value(QStringLiteral("core_health")).toString());
+    sig.insert(QStringLiteral("ai_guard_mode"), snapshot_.value(QStringLiteral("ai_guard")).toObject().value(QStringLiteral("mode")).toString());
     sig.insert(QStringLiteral("lang"), I18n::instance().language());
     sig.insert(QStringLiteral("preset"), settings.value(QStringLiteral("tray_icon_preset")));
     sig.insert(QStringLiteral("show_speed"), settings.value(QStringLiteral("show_tray_speed")).toBool(true));
@@ -612,13 +648,22 @@ void TrayController::rebuildTrayVisualsAndMenu(bool forceMenu) {
     const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
     const QJsonArray profiles = snapshot_.value(QStringLiteral("profiles")).toArray();
     const bool armedStandby = profiles.isEmpty() && !aiLocked;
+    const QString coreHealth = snapshot_.value(QStringLiteral("core_health")).toString();
+    const QString guardMode = snapshot_.value(QStringLiteral("ai_guard")).toObject().value(QStringLiteral("mode")).toString();
 
     TrayVisualState vis = TrayVisualState::Disconnected;
-    if (connected_ && !snapshot_.isEmpty() && coreRunning) {
-        if (armedStandby) vis = TrayVisualState::Idle;
-        else if (enhanced) vis = TrayVisualState::EnhancedTun;
-        else if (sysProxy) vis = TrayVisualState::SystemProxy;
-        else vis = TrayVisualState::Idle;
+    if (connected_ && !snapshot_.isEmpty()) {
+        if (coreRunning) {
+            if (armedStandby) vis = TrayVisualState::Idle;
+            else if (enhanced) vis = TrayVisualState::EnhancedTun;
+            else if (sysProxy) vis = TrayVisualState::SystemProxy;
+            else vis = TrayVisualState::Idle;
+        } else if (coreHealth == QStringLiteral("crash_loop") ||
+                   coreHealth == QStringLiteral("restarting") ||
+                   guardMode == QStringLiteral("blocking_leaks") ||
+                   aiLocked) {
+            vis = TrayVisualState::Alert;
+        }
     }
 
     const QString iconKey = QStringLiteral("%1|%2|%3")
@@ -670,9 +715,27 @@ void TrayController::rebuildMenuContents() {
     }
 
     if (connected_ && !snapshot_.isEmpty() && !coreRunning) {
-        QAction* coreWarnAct = trayMenu_->addAction(
-            L("⚠ 代理内核未运行（点击打开控制台查看原因）", "⚠ Proxy core stopped (Click to inspect)"));
-        connect(coreWarnAct, &QAction::triggered, this, &TrayController::openConsole);
+        const QString coreHealth = snapshot_.value(QStringLiteral("core_health")).toString();
+        const QString guardMode = snapshot_.value(QStringLiteral("ai_guard")).toObject().value(QStringLiteral("mode")).toString();
+        QString warnText = L("⚠ 代理内核未运行（点击查看诊断）", "⚠ Proxy core stopped (Inspect)");
+        if (coreHealth == QStringLiteral("restarting")) {
+            warnText = L("↻ 代理内核正在自动恢复中…", "↻ Proxy core auto-recovering…");
+        } else if (guardMode == QStringLiteral("blocking_leaks")) {
+            warnText = L("🛡 内核中断 · AI 防漏网护栏已拦截直连", "🛡 Core Down · AI Leak Guard Blocking Direct");
+        }
+        QAction* coreWarnAct = trayMenu_->addAction(warnText);
+        connect(coreWarnAct, &QAction::triggered, this, [this]() { openDiagnosticsDialog(); });
+        QAction* restartNowAct = trayMenu_->addAction(L("↻ 立即重启代理内核", "↻ Restart Proxy Core Now"));
+        connect(restartNowAct, &QAction::triggered, this, [this]() {
+            if (!client_) return;
+            QJsonObject p;
+            p.insert(QStringLiteral("allow_uac"), true);
+            client_->call(QStringLiteral("restart_core"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+                if (!ok && trayIcon_) {
+                    trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
+                }
+            });
+        });
         trayMenu_->addSeparator();
     }
 

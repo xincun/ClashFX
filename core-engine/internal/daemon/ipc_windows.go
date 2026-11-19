@@ -279,10 +279,11 @@ func StartPowerResumeMonitor(onWake func()) func() {
 	}
 	const (
 		deviceNotifyCallback = 2
+		pbtApmResumeSuspend  = 0x0007
 		pbtApmResumeAuto     = 0x0012
 	)
 	cb := syscall.NewCallback(func(_ uintptr, eventType uint32, _ uintptr) uintptr {
-		if eventType == pbtApmResumeAuto {
+		if eventType == pbtApmResumeAuto || eventType == pbtApmResumeSuspend {
 			go onWake()
 		}
 		return 0

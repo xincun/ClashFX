@@ -167,6 +167,9 @@ function computePageRenderSignature() {
         store.language,
         Boolean(settings.claudeProxyLockEnabled),
         settings.claudeProxyLockTarget || '',
+        snap.runtime?.mixed_port || 7890,
+        snap.ai_guard || null,
+        snap.core_health || '',
         snap.ai_lock_relay || '',
         snap.ai_lock_candidates || [],
         snap.proxy_groups || [],
@@ -178,6 +181,12 @@ function computePageRenderSignature() {
         store.connected,
         store.language,
         snap.logs_dir || '',
+        snap.core_log_file || '',
+        snap.daemon_log_file || '',
+        snap.service_log_file || '',
+        snap.core_health || '',
+        snap.core_restart_count || 0,
+        snap.ai_guard || null,
         snap.active_network || null,
         (snap.ai_lock_candidates || []).map((c) => c.name),
         (snap.proxy_groups || []).map((g) => [g.name, (g.items || []).map((i) => i.name)]),
@@ -240,9 +249,19 @@ function renderChrome() {
   const rawCoreVer = snap.core_version || (snap.version ? `v${String(snap.version).replace(/^v/i, '')}` : '');
   if (verEl) verEl.textContent = rawCoreVer || '--';
   if (subEl) {
+    const coreHealth = snap.core_health || '';
+    const guardMode = snap.ai_guard?.mode || '';
     if (!store.connected) {
       subEl.className = 'brand-sub err';
       subEl.textContent = t('守护进程未连接', 'Daemon Offline');
+    } else if (coreHealth === 'crash_loop' || (!snap.core_running && guardMode === 'blocking_leaks')) {
+      subEl.className = 'brand-sub err';
+      subEl.textContent = guardMode === 'blocking_leaks'
+        ? t('⚠ 内核中断 · AI 已防漏阻断', '⚠ Core Down · AI Guard Blocking')
+        : t('⚠ 内核异常停止', '⚠ Core Crash Loop');
+    } else if (coreHealth === 'restarting') {
+      subEl.className = 'brand-sub warn';
+      subEl.textContent = t('↻ 内核自动恢复中…', '↻ Core Recovering…');
     } else if (snap.suspended_by_network) {
       subEl.className = 'brand-sub warn';
       subEl.textContent = t('已因网络规则挂起', 'Suspended');
@@ -378,6 +397,8 @@ function renderChrome() {
     }
   }
   if (tbChip) {
+    const coreHealth = snap.core_health || '';
+    const guardMode = snap.ai_guard?.mode || '';
     const tags = [];
     if (sysOn) tags.push(t('系统代理', 'System'));
     if (tunOn) tags.push('TUN');
@@ -385,6 +406,14 @@ function renderChrome() {
     if (!store.connected) {
       tbChip.className = 'topbar-chip err';
       tbChip.textContent = t('核心守护未连接', 'Daemon Disconnected');
+    } else if (coreHealth === 'crash_loop' || (!snap.core_running && guardMode === 'blocking_leaks')) {
+      tbChip.className = 'topbar-chip err';
+      tbChip.textContent = guardMode === 'blocking_leaks'
+        ? t('AI 防漏网护栏已拦截直连 · 内核中断', 'AI Leak Guard Blocking · Core Down')
+        : t('代理内核异常停止', 'Core Crash Loop');
+    } else if (coreHealth === 'restarting') {
+      tbChip.className = 'topbar-chip warn';
+      tbChip.textContent = t('代理内核正在自动恢复…', 'Core Auto-Recovering…');
     } else if (armedStandby && (sysOn || tunOn)) {
       tbChip.className = 'topbar-chip warn';
       tbChip.textContent = t('就绪 · 导入订阅后自动开启代理', 'Ready · Import Sub to Activate');
@@ -442,6 +471,8 @@ function syncConsoleHost(forceReload = false) {
   const subsCount = Array.isArray(snap.subscriptions) ? snap.subscriptions.length : 0;
 
   if (consoleBanner) {
+    const coreHealth = snap.core_health || '';
+    const guardMode = snap.ai_guard?.mode || '';
     if (coreUpgradeInFlight) {
       consoleBanner.hidden = false;
       consoleBanner.className = 'console-banner';
@@ -451,6 +482,39 @@ function syncConsoleHost(forceReload = false) {
           'Downloading and upgrading Mihomo core, please wait (10–30s; console will refresh automatically)…'
         )
       )}</span>`;
+    } else if (store.connected && (coreHealth === 'crash_loop' || (!snap.core_running && guardMode === 'blocking_leaks'))) {
+      consoleBanner.hidden = false;
+      consoleBanner.className = 'console-banner err';
+      const detail = snap.last_crash_reason || snap.last_error || '';
+      const msg = guardMode === 'blocking_leaks'
+        ? t('代理内核异常中断，OS 级 AI 防漏网护栏已自动阻断 AI 客户端直连（防止暴露真实 IP）。', 'Proxy core stopped unexpectedly. OS AI Leak Guard is blocking direct AI egress to prevent real IP exposure.')
+        : t('代理内核连续异常退出，自动恢复已降频重试。', 'Proxy core entered crash loop; automatic recovery is backing off.');
+      consoleBanner.innerHTML = `
+        <span>${esc(msg)}${detail ? ` <span class="mono" style="opacity:.85;">(${esc(detail.slice(0, 140))})</span>` : ''}</span>
+        <div class="row-flex" style="gap:6px;flex-shrink:0;">
+          <button type="button" class="btn btn-xs btn-primary" id="console-banner-restart">${t('立即重启内核', 'Restart Core')}</button>
+          <button type="button" class="btn btn-xs" id="console-banner-logs">${t('打开日志', 'Logs')}</button>
+          <button type="button" class="btn btn-xs btn-danger" id="console-banner-diag">${t('打开诊断', 'Diagnostics')}</button>
+        </div>`;
+      consoleBanner.querySelector('#console-banner-restart')?.addEventListener('click', async () => {
+        const res = await rpc('restart_core', { allow_uac: true });
+        if (res.ok) showToast(t('代理内核已重启', 'Proxy core restarted'), 'ok');
+      });
+      consoleBanner.querySelector('#console-banner-logs')?.addEventListener('click', () => {
+        if (snap.logs_dir) native('open_path', { path: snap.logs_dir });
+      });
+      consoleBanner.querySelector('#console-banner-diag')?.addEventListener('click', () => go(5, 0));
+    } else if (store.connected && coreHealth === 'restarting') {
+      consoleBanner.hidden = false;
+      consoleBanner.className = 'console-banner';
+      consoleBanner.innerHTML = `
+        <span>${esc(
+          aiOn
+            ? t('检测到代理内核异常退出，后台服务正在自动恢复中（AI 防漏网护栏已拦截直连）…', 'Core exited unexpectedly; background supervisor is auto-recovering (AI Leak Guard is blocking direct egress)…')
+            : t('检测到代理内核异常退出，后台服务正在自动重启恢复…', 'Core exited unexpectedly; background supervisor is auto-restarting…')
+        )}</span>
+        <button type="button" class="btn btn-xs" id="console-banner-diag">${t('查看日志/诊断', 'Diagnostics')}</button>`;
+      consoleBanner.querySelector('#console-banner-diag')?.addEventListener('click', () => go(5, 0));
     } else if (snap.last_error) {
       consoleBanner.hidden = false;
       consoleBanner.className = 'console-banner err';

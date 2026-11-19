@@ -74,13 +74,14 @@ func runDaemon() error {
 		return err
 	}
 	runner := service.NewRunner(dir)
+	runner.InitPrivilegedService("")
 	go acceptLoop(ln, runner)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	_ = ln.Close()
-	_ = runner.Stop()
+	_ = runner.ShutdownService()
 	_ = os.Remove(service.ServiceSocketPath())
 	return nil
 }
@@ -290,12 +291,14 @@ func uninstallService() error {
 		return errors.New("uninstall must be run as root")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _ = service.Call(ctx, service.Request{Action: "disarm_ai_guard"})
 	_, _ = service.Call(ctx, service.Request{Action: "stop_core"})
 	cancel()
 	_ = exec.Command("/bin/launchctl", "bootout", "system", service.DarwinLaunchDaemonPlist).Run()
 	_ = os.Remove(service.DarwinLaunchDaemonPlist)
 	_ = os.Remove(service.ServiceSocketPath())
 	removeDarwinFirewallRules()
+	service.ClearPersistedServiceState("")
 	_ = os.RemoveAll(service.DarwinPrivilegedBinDir)
 	return nil
 }
@@ -313,6 +316,7 @@ func controlService(start bool) error {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _ = service.Call(ctx, service.Request{Action: "disarm_ai_guard"})
 	_, _ = service.Call(ctx, service.Request{Action: "stop_core"})
 	cancel()
 	_ = exec.Command("/bin/launchctl", "kill", "SIGTERM", "system/"+service.DarwinLaunchDaemonLabel).Run()

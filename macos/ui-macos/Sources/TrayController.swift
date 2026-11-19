@@ -18,6 +18,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
     private var lastVisualKey = ""
     private var lastTooltip = ""
     private var lastMenuSig = ""
+    private var lastAlertSig = ""
     private var i18nObserverID: UUID?
     private(set) var forceRestoreProxyOnQuit = false
     private(set) var headlessQuitOnTerminate = false
@@ -158,6 +159,41 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
 
         consoleWindow.applySnapshot(connected: true, snapshot: snap)
         rebuildVisualsAndMenu()
+
+        if !smokeMode {
+            let coreRunning = (snap["core_running"] as? Bool) ?? false
+            let health = (snap["core_health"] as? String) ?? ""
+            let aiGuard = (snap["ai_guard"] as? [String: Any]) ?? [:]
+            let guardMode = (aiGuard["mode"] as? String) ?? ""
+            let aiLocked = (settings["claudeProxyLockEnabled"] as? Bool) ?? false
+            let isCritical = (health == "crash_loop") || (!coreRunning && aiLocked && guardMode == "blocking_leaks" && health != "restarting")
+            if isCritical {
+                let sig = "\(health)|\(guardMode)|\((snap["last_crash_at"] as? String) ?? "")"
+                if sig != lastAlertSig {
+                    lastAlertSig = sig
+                    let msg = aiLocked
+                        ? L("代理内核异常中断，AI 防漏网护栏已拦截直连以防暴露真实 IP。请点击菜单栏「立即重启代理内核」或查看日志。",
+                            "Proxy core stopped unexpectedly. AI Leak Guard is blocking direct egress to prevent real IP exposure. Click Restart Proxy Core in the menu bar.")
+                        : L("代理内核异常中断且自动恢复失败，请点击菜单栏「立即重启代理内核」或查看日志。",
+                            "Proxy core stopped unexpectedly and failed to auto-recover. Click Restart Proxy Core in the menu bar.")
+                    postMacOSBannerNotification(title: L("ClashFX 代理内核告警", "ClashFX Core Alert"), body: msg)
+                }
+            } else if coreRunning && !lastAlertSig.isEmpty {
+                lastAlertSig = ""
+            }
+        }
+    }
+
+    private func postMacOSBannerNotification(title: String, body: String) {
+        let escapedTitle = title.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedBody = body.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "display notification \"\(escapedBody)\" with title \"\(escapedTitle)\""
+        DispatchQueue.global(qos: .utility).async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            proc.arguments = ["-e", script]
+            try? proc.run()
+        }
     }
 
     func handleExternalCommand(_ message: String) {
@@ -336,6 +372,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
         case idle = 1
         case systemProxy = 2
         case enhancedTun = 3
+        case alert = 4
     }
 
     private func isTraySpeedEnabled() -> Bool {
@@ -485,13 +522,19 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
         let aiLocked = (settings["claudeProxyLockEnabled"] as? Bool) ?? false
         let profiles = (snapshot["profiles"] as? [String]) ?? []
         let armedStandby = profiles.isEmpty && !aiLocked
+        let coreHealth = (snapshot["core_health"] as? String) ?? ""
+        let guardMode = ((snapshot["ai_guard"] as? [String: Any])?["mode"] as? String) ?? ""
 
         var vis: VisualState = .disconnected
-        if connected && !snapshot.isEmpty && coreRunning {
-            if armedStandby { vis = .idle }
-            else if enhanced { vis = .enhancedTun }
-            else if sysProxy { vis = .systemProxy }
-            else { vis = .idle }
+        if connected && !snapshot.isEmpty {
+            if coreRunning {
+                if armedStandby { vis = .idle }
+                else if enhanced { vis = .enhancedTun }
+                else if sysProxy { vis = .systemProxy }
+                else { vis = .idle }
+            } else if coreHealth == "crash_loop" || coreHealth == "restarting" || guardMode == "blocking_leaks" || aiLocked {
+                vis = .alert
+            }
         }
 
         let iconKey = "\(preset)|\(vis.rawValue)|\(aiLocked ? 1 : 0)"
@@ -613,6 +656,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
         case (true, _, .idle): bgColor = NSColor(calibratedWhite: 0.24, alpha: 0.92)
         case (true, _, .systemProxy): bgColor = NSColor(calibratedRed: 0.11, green: 0.13, blue: 0.16, alpha: 0.98)
         case (true, _, .enhancedTun): bgColor = NSColor(calibratedRed: 0.08, green: 0.10, blue: 0.12, alpha: 1.0)
+        case (_, _, .alert): bgColor = NSColor(calibratedRed: 220.0 / 255, green: 38.0 / 255, blue: 38.0 / 255, alpha: 1.0)
         case (_, true, .disconnected): bgColor = NSColor(calibratedWhite: 0.44, alpha: 0.88)
         case (_, true, .idle): bgColor = NSColor(calibratedWhite: 0.32, alpha: 0.92)
         case (_, true, .systemProxy): bgColor = NSColor(calibratedRed: 15.0 / 255, green: 118.0 / 255, blue: 178.0 / 255, alpha: 0.98)
@@ -694,10 +738,21 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
         let aiTarget = (settings["claudeProxyLockTarget"] as? String) ?? ""
         let suspendedNet = (snapshot["suspended_by_network"] as? String) ?? ""
         let arch = (snapshot["arch"] as? String) ?? ""
+        let coreHealth = (snapshot["core_health"] as? String) ?? ""
+        let guardMode = ((snapshot["ai_guard"] as? [String: Any])?["mode"] as? String) ?? ""
 
         var lines = ["ClashFX (\(arch))"]
         if !coreRunning {
-            lines.append(L("状态: 内核未运行 (请检查配置)", "Status: Core Stopped (Check Config)"))
+            if coreHealth == "restarting" {
+                lines.append(L("状态: 内核自动恢复中…", "Status: Core Recovering…"))
+            } else if coreHealth == "crash_loop" {
+                lines.append(L("⚠ 内核异常停止 (请点击修复)", "⚠ Core Crash Loop (Click to Fix)"))
+            } else {
+                lines.append(L("状态: 内核未运行 (请检查配置)", "Status: Core Stopped (Check Config)"))
+            }
+        }
+        if aiLocked && guardMode == "blocking_leaks" {
+            lines.append(L("🛡 AI 防漏网护栏: 已阻断直连", "🛡 AI Leak Guard: Blocking Direct"))
         }
         lines.append(L("配置: ", "Profile: ") + profileLabel + "  |  " + L("模式: ", "Mode: ") + mode)
         lines.append(L("混合端口: ", "Mixed Port: ") + "\(mixedPort)")
@@ -729,6 +784,8 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
         let sigObj: [String: Any] = [
             "connected": connected,
             "core_running": (snapshot["core_running"] as? Bool) ?? false,
+            "core_health": (snapshot["core_health"] as? String) ?? "",
+            "ai_guard_mode": ((snapshot["ai_guard"] as? [String: Any])?["mode"] as? String) ?? "",
             "lang": I18n.shared.language,
             "preset": settings["tray_icon_preset"] ?? "default",
             "show_speed": (settings["show_tray_speed"] as? Bool) ?? true,
@@ -813,12 +870,31 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
         menuDirty = false
 
         if connected && !snapshot.isEmpty && !coreRunning {
+            let coreHealth = (snapshot["core_health"] as? String) ?? ""
+            let guardMode = ((snapshot["ai_guard"] as? [String: Any])?["mode"] as? String) ?? ""
+            var warnTitle = L("⚠ 代理内核未运行（点击查看诊断）", "⚠ Proxy core stopped (Inspect)")
+            if coreHealth == "restarting" {
+                warnTitle = L("↻ 代理内核正在自动恢复中…", "↻ Proxy core auto-recovering…")
+            } else if guardMode == "blocking_leaks" {
+                warnTitle = L("🛡 内核中断 · AI 防漏网护栏已拦截直连", "🛡 Core Down · AI Leak Guard Blocking Direct")
+            }
             addItem(
                 to: trayMenu,
-                title: L("⚠ 代理内核未运行（点击打开控制台查看原因）", "⚠ Proxy core stopped (Click to inspect)"),
+                title: warnTitle,
                 enabled: true
             ) { [weak self] in
-                self?.openConsole()
+                self?.openDiagnosticsDialog()
+            }
+            addItem(
+                to: trayMenu,
+                title: L("↻ 立即重启代理内核", "↻ Restart Proxy Core Now"),
+                enabled: true
+            ) { [weak self] in
+                self?.client.call(method: "restart_core", params: ["allow_uac": true]) { ok, _, err, _ in
+                    if !ok {
+                        self?.showAlert(title: "ClashFX", message: I18n.translateBackendText(err), warning: true)
+                    }
+                }
             }
             trayMenu.addItem(.separator())
         }

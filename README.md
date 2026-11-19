@@ -20,13 +20,14 @@ ClashFX 采用**统一 Go 控制引擎 + 跨平台 Web 控制中心 + 双端轻�
 - **双端一致的控制中心（7 大功能页 + 原生托盘）**：
   - 内置 **MetaCubeXD**（`v1.266.1`）实时控制台、**订阅与配置**（支持远程订阅、`clash://` / `clashfx://` 一键导入及单条分享链接转换）、**分流与规则**、**AI 锁定**、**多节点服务**、**节点诊断** 与 **偏好设置**。
   - 支持 Obsidian Dark 深色 / Alabaster Light 浅色双主题、简体中文 / English 实时切换，以及可定制的全局快捷键（默认打开主窗口快捷键：macOS `Fn+F12`、Windows `Ctrl+Shift+F12`，可在偏好设置修改）。
-- **AI 专用锁定（Fail-Closed）**：
-  - 将 **Claude**、**Codex**、**Antigravity（`agy`）** 桌面端、CLI 与 API 流量固定绑定到指定具体节点；节点不可用或协议受限时直接 `REJECT` 阻断，绝不悄然回落直连或其他出口。详见 [AI 专用锁定说明](docs/AI-PROXY-LOCK.md)。
+- **AI 专用锁定（内核 + 系统级双层 Fail-Closed）**：
+  - 将 **Claude**、**Codex**、**Antigravity（`agy` 及内置语言服务器）** 桌面端、CLI 与 API 流量固定绑定到指定具体节点；节点不可用或协议受限时直接 `REJECT` 阻断。
+  - 独立于代理内核之外，由特权服务提供 **OS 级防漏网护盾**（Windows 应用粒度动态 WFP 会话 / macOS `pf` 故障窗口锚点）：即使发生内核意外崩溃、Wintun 掉线、升级切换或开机空窗期，也不会让受保护 AI 客户端裸连公网。详见 [AI 专用锁定说明](docs/AI-PROXY-LOCK.md)。
 - **多节点固定端口与自动巡检**：
   - 从 `127.0.0.1:21000` 起为每个节点分配持久化 HTTP + SOCKS5 混合监听端口，支持单节点 20 MB 下载测速、60 秒连通健康巡检，以及连续故障后经独立 `DIRECT` 通道自动刷新订阅。详见 [多节点服务说明](docs/NODE-SERVICES.md)。
-- **纯净上游内核与事务级防崩回滚**：
+- **纯净上游内核、崩溃自愈与全量轮转日志**：
   - 内置与在线升级均使用 100% 未修改的上游 `github.com/metacubex/mihomo`（`-tags with_gvisor`）。
-  - 所有订阅重载、Profile Mixin 与规则合成先经过预校验再原子切换，并维护 `.runtime-last-good.yaml` 自动回滚快照；支持按 Wi-Fi / 网络环境自动挂起代理。
+  - 所有订阅重载、Profile Mixin 与规则合成先经过预校验再原子切换，并维护 `.runtime-last-good.yaml` 自动回滚快照；特权服务与守护进程内置崩溃退避自愈、12 秒深度健康巡检、托盘红标强告警与 `<ConfigDir>/logs/` 全量轮转落盘日志（10 MiB × 5 份）；支持按 Wi-Fi / 网络环境自动挂起代理。
 - **自动化云端构建与双通道在线升级**：
   - 支持 **Stable（正式版）** 与 **Lab（预发布）** 双通道，客户端启动后自动从 [GitHub Releases](https://github.com/xincun/ClashFX/releases) 检测对应系统与 CPU 架构的安装包并提示更新。
 
