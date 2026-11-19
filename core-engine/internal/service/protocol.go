@@ -105,6 +105,7 @@ type Runner struct {
 	cmd            *exec.Cmd
 	guard          *childGuard
 	doneCh         chan error
+	pipesDone      chan struct{}
 	supStopCh      chan struct{}
 	gen            uint64
 	desiredRunning bool
@@ -706,6 +707,9 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 	corePath := filepath.Join(r.trustedDir, r.coreExeName)
 	info, err := os.Stat(corePath)
 	if err != nil || info.IsDir() {
+		if !isAutoRestart {
+			r.closeLogFilesLocked(false)
+		}
 		return r.statusLocked(), fmt.Errorf("trusted core binary missing at %s", corePath)
 	}
 
@@ -736,10 +740,16 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
+		if !isAutoRestart {
+			r.closeLogFilesLocked(false)
+		}
 		return r.statusLocked(), fmt.Errorf("create core stdout pipe: %w", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
+		if !isAutoRestart {
+			r.closeLogFilesLocked(false)
+		}
 		return r.statusLocked(), fmt.Errorf("create core stderr pipe: %w", err)
 	}
 
@@ -761,6 +771,9 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 	if err := cmd.Start(); err != nil {
 		r.health = CoreHealthStopped
 		r.logServiceEventLocked("ERROR", "start core process failed: %v", err)
+		if !isAutoRestart {
+			r.closeLogFilesLocked(false)
+		}
 		return r.statusLocked(), fmt.Errorf("start core process: %w", err)
 	}
 	guard := attachChildGuard(cmd)
@@ -769,6 +782,7 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 	readyCh := make(chan struct{})
 	var readyOnce sync.Once
 	doneCh := make(chan error, 1)
+	pipesDone := make(chan struct{})
 
 	streamPipe := func(reader io.Reader, tag string) {
 		readLinesBounded(reader, 32*1024, func(line string) {
@@ -781,8 +795,20 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 			}
 		})
 	}
-	go streamPipe(stdoutPipe, "core-out")
-	go streamPipe(stderrPipe, "core-err")
+	var pipeWG sync.WaitGroup
+	pipeWG.Add(2)
+	go func() {
+		defer pipeWG.Done()
+		streamPipe(stdoutPipe, "core-out")
+	}()
+	go func() {
+		defer pipeWG.Done()
+		streamPipe(stderrPipe, "core-err")
+	}()
+	go func() {
+		pipeWG.Wait()
+		close(pipesDone)
+	}()
 	go func() {
 		doneCh <- cmd.Wait()
 	}()
@@ -800,6 +826,7 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 	r.cmd = cmd
 	r.guard = guard
 	r.doneCh = doneCh
+	r.pipesDone = pipesDone
 	r.supStopCh = supStopCh
 	r.homeDir = cleanHome
 	r.configFile = cleanConfig
@@ -841,9 +868,14 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 		return r.statusLocked(), nil
 	case waitErr := <-doneCh:
 		guard.closeHandles()
+		select {
+		case <-pipesDone:
+		case <-time.After(250 * time.Millisecond):
+		}
 		r.cmd = nil
 		r.guard = nil
 		r.doneCh = nil
+		r.pipesDone = nil
 		r.closeSupStopLocked()
 		r.health = CoreHealthStopped
 		if !isAutoRestart {
@@ -854,6 +886,9 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 			r.coreLog.Logf("supervisor", "ERROR", "core exited before readiness (err=%v): %s", waitErr, logs)
 		}
 		r.logServiceEventLocked("ERROR", "core exited before readiness (err=%v)", waitErr)
+		if !isAutoRestart {
+			r.closeLogFilesLocked(false)
+		}
 		if waitErr != nil {
 			return r.statusLocked(), fmt.Errorf("core exited during startup (%v): %s", waitErr, logs)
 		}
@@ -869,6 +904,9 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 			r.coreLog.Logf("supervisor", "ERROR", "core timed out waiting for readiness (%s): %s", r.readyTimeout, logs)
 		}
 		r.logServiceEventLocked("ERROR", "core timed out waiting for readiness (%s)", r.readyTimeout)
+		if !isAutoRestart {
+			r.closeLogFilesLocked(false)
+		}
 		return r.statusLocked(), fmt.Errorf("core timed out waiting for readiness: %s", logs)
 	}
 }
@@ -1122,6 +1160,7 @@ func (r *Runner) Stop() error {
 	if r.aiGuardCfg.Enabled {
 		_ = r.syncAIGuardLocked(false)
 	}
+	r.closeLogFilesLocked(false)
 	return err
 }
 
@@ -1132,6 +1171,7 @@ func (r *Runner) stopLocked() error {
 	if r.cmd == nil && r.guard == nil {
 		return nil
 	}
+	pipesDone := r.pipesDone
 	running, _ := r.guard.activePID(r.cmd, r.doneCh)
 	if !running {
 		if r.guard != nil {
@@ -1140,6 +1180,13 @@ func (r *Runner) stopLocked() error {
 		r.cmd = nil
 		r.guard = nil
 		r.doneCh = nil
+		r.pipesDone = nil
+		if pipesDone != nil {
+			select {
+			case <-pipesDone:
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
 		if r.homeDir != "" {
 			repairUserHomeOwnership(r.homeDir)
 		}
@@ -1150,6 +1197,13 @@ func (r *Runner) stopLocked() error {
 	r.cmd = nil
 	r.guard = nil
 	r.doneCh = nil
+	r.pipesDone = nil
+	if pipesDone != nil {
+		select {
+		case <-pipesDone:
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 	if r.homeDir != "" {
 		repairUserHomeOwnership(r.homeDir)
 	}
@@ -1168,6 +1222,7 @@ func (r *Runner) isCoreAliveLocked() (bool, int) {
 		r.cmd = nil
 		r.guard = nil
 		r.doneCh = nil
+		r.pipesDone = nil
 	}
 	return running, pid
 }
@@ -1194,11 +1249,15 @@ func (r *Runner) statusLocked() Status {
 	}
 	if r.coreLog != nil {
 		st.CoreLogFile = r.coreLog.Path()
+	} else if r.logDir != "" {
+		st.CoreLogFile = filepath.Join(r.logDir, "mihomo-core.log")
 	}
 	if r.serviceLog != nil {
 		st.ServiceLogFile = r.serviceLog.Path()
 	} else if r.mirrorSvcLog != nil {
 		st.ServiceLogFile = r.mirrorSvcLog.Path()
+	} else if r.logDir != "" {
+		st.ServiceLogFile = filepath.Join(r.logDir, "clashfx-service-events.log")
 	}
 	if r.aiGuard != nil {
 		gs := r.aiGuard.Status()
