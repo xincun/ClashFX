@@ -58,18 +58,19 @@ type TransformHook func(root map[string]any, settings profile.AppSettings) error
 // CoreApplier abstracts validating a candidate config and applying it to the active core.
 type CoreApplier interface {
 	ValidateConfig(homeDir, configPath string) error
-	ApplyRuntimeConfig(ctx context.Context, settings profile.AppSettings, homeDir, runtimeConfigPath string, apiPort int, secret string) error
+	ApplyRuntimeConfig(ctx context.Context, settings profile.AppSettings, homeDir, runtimeConfigPath string, apiPort int, secret string, forceRestart bool) error
 }
 
 type AppliedRuntimeState struct {
-	ProfileName string `json:"profile_name"`
-	MixedPort   int    `json:"mixed_port"`
-	SocksPort   int    `json:"socks_port"`
-	HTTPPort    int    `json:"http_port"`
-	APIPort     int    `json:"api_port"`
-	DNSPort     int    `json:"dns_port"`
-	APISecret   string `json:"api_secret"`
-	Enhanced    bool   `json:"enhanced"`
+	ProfileName      string `json:"profile_name"`
+	MixedPort        int    `json:"mixed_port"`
+	SocksPort        int    `json:"socks_port"`
+	HTTPPort         int    `json:"http_port"`
+	APIPort          int    `json:"api_port"`
+	DNSPort          int    `json:"dns_port"`
+	APISecret        string `json:"api_secret"`
+	Enhanced         bool   `json:"enhanced"`
+	requestedAPIPort int
 }
 
 // Controller serializes runtime configuration generation, preflight validation,
@@ -82,6 +83,7 @@ type Controller struct {
 	dashboardUI      string
 	hooks            []TransformHook
 	probePort        func(port int, checkUDP bool) (bool, bool)
+	customPortProbe  bool
 	sourceResolver   func(profileName string) ([]byte, bool)
 	settingsResolver func(profile.AppSettings) profile.AppSettings
 	lastState        AppliedRuntimeState
@@ -116,6 +118,7 @@ func (c *Controller) SetPortProbeForTest(fn func(port int, checkUDP bool) (bool,
 	c.applyMu.Lock()
 	defer c.applyMu.Unlock()
 	c.probePort = fn
+	c.customPortProbe = true
 }
 
 func (c *Controller) LastState() AppliedRuntimeState {
@@ -154,6 +157,10 @@ func (c *Controller) SeedActiveStateFromDisk(configPath string) bool {
 	if apiPort <= 0 {
 		return false
 	}
+	requestedAPIPort := settings.APIPort
+	if requestedAPIPort <= 0 {
+		requestedAPIPort = 19090
+	}
 	mixedPort := intFromYAML(root["mixed-port"])
 	httpPort := intFromYAML(root["port"])
 	if httpPort <= 0 {
@@ -173,14 +180,15 @@ func (c *Controller) SeedActiveStateFromDisk(configPath string) bool {
 	}
 	secret, _ := root["secret"].(string)
 	c.setLastState(AppliedRuntimeState{
-		ProfileName: settings.SelectedProfile,
-		MixedPort:   mixedPort,
-		SocksPort:   socksPort,
-		HTTPPort:    httpPort,
-		APIPort:     apiPort,
-		DNSPort:     dnsPort,
-		APISecret:   secret,
-		Enhanced:    enhanced,
+		ProfileName:      settings.SelectedProfile,
+		MixedPort:        mixedPort,
+		SocksPort:        socksPort,
+		HTTPPort:         httpPort,
+		APIPort:          apiPort,
+		DNSPort:          dnsPort,
+		APISecret:        secret,
+		Enhanced:         enhanced,
+		requestedAPIPort: requestedAPIPort,
 	})
 	return true
 }
@@ -303,19 +311,25 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 	}
 
 	// 5. Apply to core; if apply fails and a last-good snapshot exists, automatically roll back!
-	// Note: if the core is already running, REST reload must target the currently active API port/secret.
+	// Note: Mihomo's PUT /configs hot reload never recreates external-controller or updates its
+	// secret. Only use REST reload when the core already has a known controller state whose
+	// APIPort and APISecret are unchanged; otherwise force a clean restart so lastState stays
+	// 100% consistent with the live core listener.
+	controllerChanged := prevState.APIPort > 0 &&
+		(state.APIPort != prevState.APIPort || state.APISecret != prevState.APISecret)
 	dialAPIPort := state.APIPort
 	dialSecret := state.APISecret
 	if prevState.APIPort > 0 {
 		dialAPIPort = prevState.APIPort
 		dialSecret = prevState.APISecret
 	}
+	forceRestart := prevState.APIPort <= 0 || controllerChanged
 	if c.applier != nil {
-		if applyErr := c.applier.ApplyRuntimeConfig(ctx, settings, cfgDir, runtimePath, dialAPIPort, dialSecret); applyErr != nil {
+		if applyErr := c.applier.ApplyRuntimeConfig(ctx, settings, cfgDir, runtimePath, dialAPIPort, dialSecret, forceRestart); applyErr != nil {
 			if hadPreviousGood {
 				if goodBytes, rErr := os.ReadFile(lastGoodPath); rErr == nil {
 					_ = profile.WriteFileAtomic(runtimePath, goodBytes, 0600)
-					_ = c.applier.ApplyRuntimeConfig(ctx, settings, cfgDir, runtimePath, dialAPIPort, dialSecret)
+					_ = c.applier.ApplyRuntimeConfig(ctx, settings, cfgDir, runtimePath, dialAPIPort, dialSecret, forceRestart)
 				}
 			}
 			return prevState, fmt.Errorf("apply runtime config failed (rolled back): %w", applyErr)
@@ -329,6 +343,7 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 
 func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profile.AppSettings) (AppliedRuntimeState, error) {
 	prevState := c.LastState()
+	probe := c.portProbeForSettings(settings)
 	state := AppliedRuntimeState{
 		ProfileName: settings.SelectedProfile,
 		Enhanced:    settings.EnhancedMode,
@@ -346,6 +361,7 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 			state.SocksPort = state.MixedPort
 		}
 		state.APIPort = extractPortFromHostPort(fmt.Sprint(root["external-controller"]), settings.APIPort)
+		state.requestedAPIPort = state.APIPort
 		if sec, ok := root["secret"].(string); ok {
 			state.APISecret = sec
 		}
@@ -374,14 +390,14 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 	}
 	mixedPort := intFromYAML(root["mixed-port"])
 	ownedMixedPort := prevState.MixedPort
-	if mixedPort != ownedMixedPort && !c.isPortUsable(mixedPort, false) {
+	if mixedPort != ownedMixedPort && !isPortUsableWith(probe, mixedPort, false) {
 		if settings.PortOverride > 0 {
 			return state, fmt.Errorf("configured proxy port %d is unavailable or occupied by another application", mixedPort)
 		}
-		if ownedMixedPort > 0 && c.isPortUsable(ownedMixedPort, false) {
+		if ownedMixedPort > 0 {
 			mixedPort = ownedMixedPort
 		} else {
-			fallback, err := portprobe.FindAvailablePort(7890, 7999, nil, false, c.probePort)
+			fallback, err := portprobe.FindAvailablePort(7890, 7999, nil, false, probe)
 			if err != nil {
 				return state, fmt.Errorf("select mixed-port: %w", err)
 			}
@@ -411,17 +427,26 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		state.SocksPort: true,
 	}
 
-	// Select API port (skipping Hyper-V/WinNAT WSAEACCES reserved ports if not already owned by us!)
-	apiPort := settings.APIPort
-	if apiPort <= 0 {
-		apiPort = 19090
+	// Select API port (skipping Hyper-V/WinNAT WSAEACCES reserved ports if not already owned by us!).
+	// Because Mihomo's PUT /configs reload does not rebind external-controller, preserve an
+	// already-owned fallback API port across routine hot reloads when settings.APIPort did not change.
+	requestedAPIPort := settings.APIPort
+	if requestedAPIPort <= 0 {
+		requestedAPIPort = 19090
 	}
+	apiPort := requestedAPIPort
 	ownedAPIPort := prevState.APIPort
-	if reserved[apiPort] || (apiPort != ownedAPIPort && !c.isPortUsable(apiPort, false)) {
+	prevRequestedAPIPort := prevState.requestedAPIPort
+	if prevRequestedAPIPort <= 0 {
+		prevRequestedAPIPort = ownedAPIPort
+	}
+	if ownedAPIPort > 0 && !reserved[ownedAPIPort] && requestedAPIPort == prevRequestedAPIPort {
+		apiPort = ownedAPIPort
+	} else if reserved[apiPort] || (apiPort != ownedAPIPort && !isPortUsableWith(probe, apiPort, false)) {
 		if ownedAPIPort > 0 && !reserved[ownedAPIPort] {
 			apiPort = ownedAPIPort
 		} else {
-			fallback, err := portprobe.FindAvailablePort(19090, 19999, reserved, false, c.probePort)
+			fallback, err := portprobe.FindAvailablePort(19090, 19999, reserved, false, probe)
 			if err != nil {
 				return state, fmt.Errorf("select external-controller port: %w", err)
 			}
@@ -430,6 +455,7 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 	}
 	reserved[apiPort] = true
 	state.APIPort = apiPort
+	state.requestedAPIPort = requestedAPIPort
 	root["external-controller"] = fmt.Sprintf("127.0.0.1:%d", apiPort)
 
 	if settings.APISecret != "" {
@@ -480,11 +506,11 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 			preferredDNS = 1053
 		}
 		ownedDNSPort := prevState.DNSPort
-		if reserved[preferredDNS] || (preferredDNS != ownedDNSPort && !c.isPortUsable(preferredDNS, true)) {
+		if reserved[preferredDNS] || (preferredDNS != ownedDNSPort && !isPortUsableWith(probe, preferredDNS, true)) {
 			if ownedDNSPort > 0 && !reserved[ownedDNSPort] {
 				preferredDNS = ownedDNSPort
 			} else {
-				nextDNS, err := portprobe.FindAvailablePort(10530, 11530, reserved, true, c.probePort)
+				nextDNS, err := portprobe.FindAvailablePort(10530, 11530, reserved, true, probe)
 				if err != nil {
 					return state, fmt.Errorf("select DNS listen port: %w", err)
 				}
@@ -640,11 +666,21 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 	return state, nil
 }
 
-func (c *Controller) isPortUsable(port int, checkUDP bool) bool {
-	if c.probePort == nil {
+func (c *Controller) portProbeForSettings(settings profile.AppSettings) func(port int, checkUDP bool) (bool, bool) {
+	if c.customPortProbe {
+		return c.probePort
+	}
+	if settings.EnhancedMode && runtime.GOOS == "darwin" {
+		return portprobe.ProbeLoopbackPortForPrivilegedCore
+	}
+	return c.probePort
+}
+
+func isPortUsableWith(probe func(port int, checkUDP bool) (bool, bool), port int, checkUDP bool) bool {
+	if probe == nil {
 		return true
 	}
-	ok, _ := c.probePort(port, checkUDP)
+	ok, _ := probe(port, checkUDP)
 	return ok
 }
 

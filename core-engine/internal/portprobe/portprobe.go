@@ -52,6 +52,20 @@ func ProbeLoopbackPort(port int, checkUDP bool) (available bool, reservedByOS bo
 	return true, false
 }
 
+// ProbeLoopbackPortForPrivilegedCore checks TCP (and optionally UDP) availability
+// on 127.0.0.1:port when the listening process will run under a privileged service
+// account (e.g. root via macOS ClashFXService LaunchDaemon).
+//
+// On macOS, an unprivileged daemon (UID != 0) receives a false EADDRINUSE from
+// XNU in_pcbbind_setup when probing a port that only has stale root-owned
+// TIME_WAIT / FIN_WAIT_2 sockets left by a recently stopped privileged core, even
+// though the root core itself can immediately rebind with SO_REUSEADDR. On other
+// platforms (including Windows Hyper-V/WinNAT WSAEACCES detection), this behaves
+// identically to ProbeLoopbackPort.
+func ProbeLoopbackPortForPrivilegedCore(port int, checkUDP bool) (available bool, reservedByOS bool) {
+	return probeLoopbackPortForPrivilegedCore(port, checkUDP)
+}
+
 // ProbeDualBindPort checks both wildcard (:port) and loopback (127.0.0.1:port).
 func ProbeDualBindPort(port int, checkUDP bool) (available bool, reservedByOS bool) {
 	if port < 1 || port > 65535 {

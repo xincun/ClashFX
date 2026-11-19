@@ -519,7 +519,7 @@ func (e *Engine) InstallPrivilegedService() error {
 
 // ApplyRuntimeConfig implements transaction.CoreApplier, transparently routing
 // normal mode through localRunner and Enhanced TUN mode through ClashFXService.
-func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSettings, homeDir, runtimeConfigPath string, apiPort int, secret string) error {
+func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSettings, homeDir, runtimeConfigPath string, apiPort int, secret string, forceRestart bool) error {
 	wantService := settings.EnhancedMode && supportsPrivilegedService()
 
 	if wantService {
@@ -534,8 +534,14 @@ func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSet
 			}
 		}
 		if e.isCoreViaService() && e.isServiceCoreRunning() {
-			if err := transaction.ReloadViaREST(ctx, apiPort, secret, runtimeConfigPath); err == nil {
-				return nil
+			if !forceRestart && apiPort > 0 {
+				if err := transaction.ReloadViaREST(ctx, apiPort, secret, runtimeConfigPath); err == nil {
+					return nil
+				} else {
+					e.logf("WARN", "REST reload via ClashFXService on 127.0.0.1:%d failed (%v); restarting core", apiPort, err)
+				}
+			} else if forceRestart {
+				e.logf("INFO", "restarting ClashFXService core instead of REST reload (external-controller or startup state changed)")
 			}
 		}
 		resp, err := callService(15*time.Second, service.Request{
@@ -561,8 +567,14 @@ func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSet
 		e.setCoreViaService(false)
 	}
 	if e.localRunner.Status().Running {
-		if err := transaction.ReloadViaREST(ctx, apiPort, secret, runtimeConfigPath); err == nil {
-			return nil
+		if !forceRestart && apiPort > 0 {
+			if err := transaction.ReloadViaREST(ctx, apiPort, secret, runtimeConfigPath); err == nil {
+				return nil
+			} else {
+				e.logf("WARN", "REST reload on local core 127.0.0.1:%d failed (%v); restarting core", apiPort, err)
+			}
+		} else if forceRestart {
+			e.logf("INFO", "restarting local core instead of REST reload (external-controller or startup state changed)")
 		}
 	}
 	_, err := e.localRunner.StartWithOptions(homeDir, runtimeConfigPath, e.cfg.DashboardUIDir, e.logsDir, true)

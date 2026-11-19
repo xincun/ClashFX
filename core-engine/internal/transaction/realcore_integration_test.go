@@ -30,8 +30,8 @@ func (a *runnerApplier) ValidateConfig(homeDir, configPath string) error {
 	return a.helper.ValidateConfig(homeDir, configPath)
 }
 
-func (a *runnerApplier) ApplyRuntimeConfig(ctx context.Context, _ profile.AppSettings, homeDir, runtimeConfigPath string, apiPort int, secret string) error {
-	if a.runner.Status().Running {
+func (a *runnerApplier) ApplyRuntimeConfig(ctx context.Context, _ profile.AppSettings, homeDir, runtimeConfigPath string, apiPort int, secret string, forceRestart bool) error {
+	if !forceRestart && apiPort > 0 && a.runner.Status().Running {
 		return ReloadViaREST(ctx, apiPort, secret, runtimeConfigPath)
 	}
 	_, err := a.runner.Start(homeDir, runtimeConfigPath, "")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,5 +254,291 @@ func TestEnginePersistentLogsAutoRecoveryAndSystemProxyFailClosedPolicy(t *testi
 	eng.reconcileSystemProxy()
 	if st, _ := eng.sysProxy.CurrentOSState(); st.ProxyEnable != 1 {
 		t.Fatalf("expected system proxy KEPT fail-closed when AI Lock is ON even while core is dead, got %+v", st)
+	}
+}
+
+const daemonConfigDrivenFakeCoreSrc = `package main
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+)
+
+func parseSimpleYAML(path string) (ctrl, secret, mixed string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "external-controller:") {
+			ctrl = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "external-controller:")), "\"'")
+		} else if strings.HasPrefix(line, "secret:") {
+			secret = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "secret:")), "\"'")
+		} else if strings.HasPrefix(line, "mixed-port:") {
+			mixed = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "mixed-port:")), "\"'")
+		}
+	}
+	return ctrl, secret, mixed
+}
+
+func main() {
+	var cfgPath string
+	for i := 1; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "-v":
+			fmt.Println("Mihomo Meta v1.19.34 darwin arm64")
+			return
+		case "-t":
+			fmt.Println("configuration file test is successful")
+			return
+		case "-f":
+			if i+1 < len(os.Args) {
+				cfgPath = os.Args[i+1]
+				i++
+			}
+		}
+	}
+	ctrl, secret, mixed := parseSimpleYAML(cfgPath)
+	if mixed != "" {
+		if mixLn, err := net.Listen("tcp", "127.0.0.1:"+mixed); err == nil {
+			defer mixLn.Close()
+			go func() {
+				for {
+					c, aErr := mixLn.Accept()
+					if aErr != nil {
+						return
+					}
+					_ = c.Close()
+				}
+			}()
+		}
+	}
+	if ctrl == "" {
+		fmt.Fprintln(os.Stderr, "missing external-controller")
+		os.Exit(2)
+	}
+	checkAuth := func(w http.ResponseWriter, r *http.Request) bool {
+		if secret == "" {
+			return true
+		}
+		if r.Header.Get("Authorization") != "Bearer "+secret {
+			w.WriteHeader(http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"meta\":true,\"version\":\"v1.19.34\"}"))
+	})
+	mux.HandleFunc("/configs", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(w, r) {
+			return
+		}
+		// Match real Mihomo PUT /configs behavior: reload config WITHOUT recreating external-controller or changing secret.
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"mode\":\"rule\"}"))
+	})
+	mux.HandleFunc("/proxies", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"proxies\":{}}"))
+	})
+	mux.HandleFunc("/providers/proxies", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"providers\":{}}"))
+	})
+
+	ln, err := net.Listen("tcp", ctrl)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "listen %s: %v\n", ctrl, err)
+		os.Exit(1)
+	}
+	defer ln.Close()
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+
+	fmt.Printf("time=\"now\" level=info msg=\"RESTful API listening at: %s\"\n", ctrl)
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+}
+`
+
+func compileConfigDrivenFakeCore(t *testing.T, outPath string) {
+	t.Helper()
+	srcDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(srcDir, "go.mod"), []byte("module fake_cfg_core\n\ngo 1.21\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "main.go"), []byte(daemonConfigDrivenFakeCoreSrc), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "build", "-ldflags=-s -w", "-o", outPath, ".")
+	cmd.Dir = srcDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("compile config-driven fake core: %v\n%s", err, string(out))
+	}
+}
+
+func TestEngineHotReloadFallbackAPIPortNoDesyncAndExplicitControllerChangeRestarts(t *testing.T) {
+	dataDir := t.TempDir()
+	binDir := t.TempDir()
+	exeName := "mihomo_core"
+	if runtime.GOOS == "windows" {
+		exeName += ".exe"
+	}
+	compileConfigDrivenFakeCore(t, filepath.Join(binDir, exeName))
+
+	// Hold an external listener on preferredAPIPort so startup must choose a fallback API port.
+	blockerLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockerLn.Close()
+	preferredAPIPort := blockerLn.Addr().(*net.TCPAddr).Port
+
+	lnMix, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mixedPort := lnMix.Addr().(*net.TCPAddr).Port
+	_ = lnMix.Close()
+
+	lnNewAPI, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitNewAPIPort := lnNewAPI.Addr().(*net.TCPAddr).Port
+	_ = lnNewAPI.Close()
+
+	eng, err := NewEngine(Config{
+		AppDataDir: dataDir,
+		BinDir:     binDir,
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer eng.Shutdown()
+
+	if _, err := eng.store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.APIPort = preferredAPIPort
+		s.APISecret = ""
+		s.PortOverride = mixedPort
+		s.EnhancedMode = false
+		s.SystemProxyEnabled = false
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := eng.Start(context.Background()); err != nil {
+		t.Fatalf("eng.Start: %v", err)
+	}
+
+	snap1 := eng.Snapshot()
+	if !snap1.CoreRunning {
+		t.Fatal("expected core running after Start")
+	}
+	fallbackAPIPort := snap1.Runtime.APIPort
+	if fallbackAPIPort <= 0 || fallbackAPIPort == preferredAPIPort {
+		t.Fatalf("expected startup fallback APIPort != occupied %d, got %d", preferredAPIPort, fallbackAPIPort)
+	}
+	pid1 := eng.localRunner.Status().PID
+	if pid1 <= 0 {
+		t.Fatalf("expected valid running PID, got %d", pid1)
+	}
+
+	// Release preferredAPIPort (analogous to TIME_WAIT expiring on 19090), then run a routine reload.
+	_ = blockerLn.Close()
+	if _, err := eng.applyAndSync(context.Background(), false, false); err != nil {
+		t.Fatalf("routine reload applyAndSync failed: %v", err)
+	}
+
+	snap2 := eng.Snapshot()
+	if snap2.Runtime.APIPort != fallbackAPIPort {
+		t.Fatalf("routine reload desynced APIPort: got %d, want preserved fallback %d", snap2.Runtime.APIPort, fallbackAPIPort)
+	}
+	if pid2 := eng.localRunner.Status().PID; pid2 != pid1 {
+		t.Fatalf("routine reload unexpectedly restarted core PID %d -> %d", pid1, pid2)
+	}
+	// Deep health check (tick%4 == 0) must pass cleanly against fallbackAPIPort!
+	eng.syncFromLiveCore(context.Background(), 4)
+	eng.statusMu.RLock()
+	fails := eng.healthFailCount
+	eng.statusMu.RUnlock()
+	if fails != 0 {
+		t.Fatalf("expected 0 deep health check failures after routine reload, got %d", fails)
+	}
+
+	// Explicit user settings.APIPort change MUST restart core cleanly (NOT PUT /configs desync!).
+	nextSettings := eng.store.Settings()
+	nextSettings.APIPort = explicitNewAPIPort
+	if err := eng.UpdateGeneralSettings(context.Background(), nextSettings); err != nil {
+		t.Fatalf("UpdateGeneralSettings(APIPort) failed: %v", err)
+	}
+	snap3 := eng.Snapshot()
+	if snap3.Runtime.APIPort != explicitNewAPIPort {
+		t.Fatalf("expected Runtime.APIPort = %d after explicit change, got %d", explicitNewAPIPort, snap3.Runtime.APIPort)
+	}
+	pid3 := eng.localRunner.Status().PID
+	if pid3 == pid1 || pid3 <= 0 {
+		t.Fatalf("expected explicit APIPort change to restart core with new PID (prev=%d, got=%d)", pid1, pid3)
+	}
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/version", explicitNewAPIPort))
+	if err != nil {
+		t.Fatalf("GET /version on new APIPort %d failed: %v", explicitNewAPIPort, err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /version on new APIPort %d status = %d, want 200", explicitNewAPIPort, resp.StatusCode)
+	}
+
+	// Explicit user settings.APISecret change MUST also restart core so new secret takes effect.
+	nextSettings = eng.store.Settings()
+	nextSettings.APISecret = "clashfx-secret-check"
+	if err := eng.UpdateGeneralSettings(context.Background(), nextSettings); err != nil {
+		t.Fatalf("UpdateGeneralSettings(APISecret) failed: %v", err)
+	}
+	pid4 := eng.localRunner.Status().PID
+	if pid4 == pid3 || pid4 <= 0 {
+		t.Fatalf("expected explicit APISecret change to restart core with new PID (prev=%d, got=%d)", pid3, pid4)
+	}
+	unauthResp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/version", explicitNewAPIPort))
+	if err != nil {
+		t.Fatalf("unauthenticated GET /version failed: %v", err)
+	}
+	_ = unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without secret after APISecret change, got %d", unauthResp.StatusCode)
+	}
+	eng.syncFromLiveCore(context.Background(), 4)
+	eng.statusMu.RLock()
+	failsAfterSecret := eng.healthFailCount
+	eng.statusMu.RUnlock()
+	if failsAfterSecret != 0 {
+		t.Fatalf("expected 0 deep health check failures after APISecret restart, got %d", failsAfterSecret)
 	}
 }

@@ -13,9 +13,12 @@ import (
 )
 
 type mockApplier struct {
-	failApply   bool
-	appliedData string
-	applyCalls  int
+	failApply        bool
+	appliedData      string
+	applyCalls       int
+	lastAPIPort      int
+	lastSecret       string
+	lastForceRestart bool
 }
 
 func (m *mockApplier) ValidateConfig(_, configPath string) error {
@@ -29,8 +32,11 @@ func (m *mockApplier) ValidateConfig(_, configPath string) error {
 	return nil
 }
 
-func (m *mockApplier) ApplyRuntimeConfig(_ context.Context, _ profile.AppSettings, _, runtimeConfigPath string, _ int, _ string) error {
+func (m *mockApplier) ApplyRuntimeConfig(_ context.Context, _ profile.AppSettings, _, runtimeConfigPath string, apiPort int, secret string, forceRestart bool) error {
 	m.applyCalls++
+	m.lastAPIPort = apiPort
+	m.lastSecret = secret
+	m.lastForceRestart = forceRestart
 	raw, err := os.ReadFile(runtimeConfigPath)
 	if err != nil {
 		return err
@@ -497,5 +503,194 @@ rules:
 	}
 	if len(wlDoc.DNS.FakeIPFilter) != 1 || wlDoc.DNS.FakeIPFilter[0] != "+.openai.com" {
 		t.Fatalf("whitelist fake-ip-filter must stay untouched, got %v", wlDoc.DNS.FakeIPFilter)
+	}
+}
+
+func TestControllerHotReloadPreservesFallbackPortsAndRestartsOnControllerChange(t *testing.T) {
+	store, err := profile.NewStore(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	baseYAML := `mixed-port: 7890
+proxies:
+  - name: NodeA
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [NodeA, DIRECT]
+rules:
+  - MATCH,Proxy
+`
+	if err := profile.WriteFileAtomic(store.ProfilePath("config"), []byte(baseYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _ = store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.EnhancedMode = true
+		s.APIPort = 19090
+		s.APISecret = ""
+		return nil
+	})
+
+	busyPorts := map[int]bool{
+		7890:  true,
+		19090: true,
+	}
+	applier := &mockApplier{}
+	ctrl := NewController(store, applier, "")
+	ctrl.SetPortProbeForTest(func(port int, _ bool) (bool, bool) {
+		if busyPorts[port] {
+			return false, false
+		}
+		return true, false
+	})
+
+	// 1. Cold start with 7890 & 19090 busy -> falls back to 7891 & 19091 with forceRestart=true.
+	st1, err := ctrl.Apply(context.Background(), false)
+	if err != nil {
+		t.Fatalf("initial Apply failed: %v", err)
+	}
+	if st1.MixedPort != 7891 || st1.APIPort != 19091 {
+		t.Fatalf("initial fallback ports = (mixed=%d, api=%d), want (7891, 19091)", st1.MixedPort, st1.APIPort)
+	}
+	if !applier.lastForceRestart {
+		t.Fatal("expected initial cold start to set forceRestart=true")
+	}
+
+	// 2. Scenario A1 + A3: 19090 later becomes free, while 7890 stays busy AND our own running core
+	// holds 7891 & 19091 busy. Routine hot reload (settings.APIPort unchanged at 19090) MUST:
+	// - preserve APIPort=19091 so PUT /configs never desyncs lastState from live mihomo_core;
+	// - keep MixedPort=7891 instead of bouncing to 7892;
+	// - use REST hot reload (forceRestart=false, dialAPIPort=19091).
+	delete(busyPorts, 19090)
+	busyPorts[7891] = true
+	busyPorts[19091] = true
+
+	st2, err := ctrl.Apply(context.Background(), false)
+	if err != nil {
+		t.Fatalf("routine reload Apply failed: %v", err)
+	}
+	if st2.APIPort != 19091 {
+		t.Fatalf("routine reload changed APIPort to %d, want preserved 19091", st2.APIPort)
+	}
+	if st2.MixedPort != 7891 {
+		t.Fatalf("routine reload drifted MixedPort to %d, want preserved owned 7891", st2.MixedPort)
+	}
+	if applier.lastForceRestart {
+		t.Fatal("routine reload with unchanged controller must use REST reload (forceRestart=false)")
+	}
+	if applier.lastAPIPort != 19091 {
+		t.Fatalf("routine reload dialed API port %d, want 19091", applier.lastAPIPort)
+	}
+	if !strings.Contains(applier.appliedData, "external-controller: 127.0.0.1:19091") {
+		t.Fatalf("expected runtime YAML to retain external-controller 127.0.0.1:19091, got:\n%s", applier.appliedData)
+	}
+
+	// 3. Scenario A2: Adopting running core via SeedActiveStateFromDisk (e.g. daemon respawn)
+	// must also preserve fallback APIPort=19091 on immediate Apply without forcing restart.
+	ctrl.ResetActiveState()
+	if !ctrl.SeedActiveStateFromDisk(ctrl.RuntimeConfigPath()) {
+		t.Fatal("expected SeedActiveStateFromDisk to succeed")
+	}
+	stAdopted, err := ctrl.Apply(context.Background(), false)
+	if err != nil {
+		t.Fatalf("post-adoption Apply failed: %v", err)
+	}
+	if stAdopted.APIPort != 19091 || applier.lastForceRestart {
+		t.Fatalf("post-adoption Apply = (api=%d, forceRestart=%v), want (19091, false)", stAdopted.APIPort, applier.lastForceRestart)
+	}
+
+	// 4. Scenario B1: User explicitly changes settings.APIPort to 19095 -> MUST select 19095
+	// and set forceRestart=true so mihomo_core restarts and actually binds 19095.
+	_, _ = store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.APIPort = 19095
+		return nil
+	})
+	st3, err := ctrl.Apply(context.Background(), false)
+	if err != nil {
+		t.Fatalf("explicit APIPort change Apply failed: %v", err)
+	}
+	if st3.APIPort != 19095 {
+		t.Fatalf("explicit APIPort change got %d, want 19095", st3.APIPort)
+	}
+	if !applier.lastForceRestart {
+		t.Fatal("explicit APIPort change must set forceRestart=true (PUT /configs cannot rebind external-controller)")
+	}
+	if !strings.Contains(applier.appliedData, "external-controller: 127.0.0.1:19095") {
+		t.Fatalf("expected runtime YAML external-controller 127.0.0.1:19095, got:\n%s", applier.appliedData)
+	}
+
+	// Subsequent routine reload on 19095 returns to REST hot reload targeting 19095.
+	delete(busyPorts, 19091)
+	busyPorts[19095] = true
+	st4, err := ctrl.Apply(context.Background(), false)
+	if err != nil {
+		t.Fatalf("post-change routine reload failed: %v", err)
+	}
+	if st4.APIPort != 19095 || applier.lastForceRestart || applier.lastAPIPort != 19095 {
+		t.Fatalf("post-change routine reload = (api=%d, dial=%d, forceRestart=%v), want (19095, 19095, false)", st4.APIPort, applier.lastAPIPort, applier.lastForceRestart)
+	}
+
+	// 5. Scenario B2: User explicitly changes settings.APISecret -> MUST set forceRestart=true.
+	_, _ = store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.APISecret = "new-secret-token"
+		return nil
+	})
+	st5, err := ctrl.Apply(context.Background(), false)
+	if err != nil {
+		t.Fatalf("APISecret change Apply failed: %v", err)
+	}
+	if st5.APISecret != "new-secret-token" || !applier.lastForceRestart {
+		t.Fatalf("APISecret change = (secret=%q, forceRestart=%v), want (\"new-secret-token\", true)", st5.APISecret, applier.lastForceRestart)
+	}
+
+	// Next routine reload carries new secret with forceRestart=false.
+	st6, err := ctrl.Apply(context.Background(), false)
+	if err != nil {
+		t.Fatalf("post-secret routine reload failed: %v", err)
+	}
+	if st6.APISecret != "new-secret-token" || applier.lastForceRestart || applier.lastSecret != "new-secret-token" {
+		t.Fatalf("post-secret reload = (secret=%q, dialSecret=%q, forceRestart=%v), want (\"new-secret-token\", \"new-secret-token\", false)", st6.APISecret, applier.lastSecret, applier.lastForceRestart)
+	}
+
+	// 6. Scenario B3: CustomConfigAsIs changing external-controller port forces restart.
+	customYAML := strings.Replace(baseYAML, "mixed-port: 7890", "mixed-port: 7890\nexternal-controller: 127.0.0.1:19098", 1)
+	if err := profile.WriteFileAtomic(store.ProfilePath("custom"), []byte(customYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.SelectedProfile = "custom"
+		s.CustomConfigAsIs = true
+		return nil
+	})
+	st7, err := ctrl.Apply(context.Background(), false)
+	if err != nil {
+		t.Fatalf("CustomConfigAsIs controller change Apply failed: %v", err)
+	}
+	if st7.APIPort != 19098 || !applier.lastForceRestart {
+		t.Fatalf("CustomConfigAsIs controller change = (api=%d, forceRestart=%v), want (19098, true)", st7.APIPort, applier.lastForceRestart)
+	}
+
+	// 7. Scenario B4: After ResetActiveState (as in RestartCore), default settings.APIPort is probed fresh.
+	_, _ = store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.SelectedProfile = "config"
+		s.CustomConfigAsIs = false
+		s.APIPort = 19090
+		s.APISecret = ""
+		return nil
+	})
+	delete(busyPorts, 7890)
+	ctrl.ResetActiveState()
+	st8, err := ctrl.Apply(context.Background(), false)
+	if err != nil {
+		t.Fatalf("post-reset Apply failed: %v", err)
+	}
+	if st8.MixedPort != 7890 || st8.APIPort != 19090 || !applier.lastForceRestart {
+		t.Fatalf("post-reset Apply = (mixed=%d, api=%d, forceRestart=%v), want (7890, 19090, true)", st8.MixedPort, st8.APIPort, applier.lastForceRestart)
 	}
 }

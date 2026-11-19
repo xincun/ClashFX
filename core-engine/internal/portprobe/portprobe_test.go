@@ -44,7 +44,7 @@ func TestWindowsReservedPortClassificationAndSkip(t *testing.T) {
 		t.Fatalf("FindAvailablePortReverse = %d, %v; want 20997", rev, err)
 	}
 
-	// Real socket check: occupied TCP port is reported unavailable.
+	// Real socket check: occupied TCP port is reported unavailable by both strict and privileged probes.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -53,5 +53,8 @@ func TestWindowsReservedPortClassificationAndSkip(t *testing.T) {
 	busyPort := ln.Addr().(*net.TCPAddr).Port
 	if ok, _ := ProbeLoopbackPort(busyPort, false); ok {
 		t.Fatalf("occupied port %d reported available", busyPort)
+	}
+	if ok, _ := ProbeLoopbackPortForPrivilegedCore(busyPort, false); ok {
+		t.Fatalf("occupied port %d reported available by privileged probe", busyPort)
 	}
 }

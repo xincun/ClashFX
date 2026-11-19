@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -498,9 +499,10 @@ func DefaultPersistedState() PersistedState {
 }
 
 type Store struct {
-	mu        sync.Mutex
-	statePath string
-	probePort func(port int, checkUDP bool) (bool, bool)
+	mu              sync.Mutex
+	statePath       string
+	probePort       func(port int, checkUDP bool) (bool, bool)
+	customPortProbe bool
 }
 
 func NewStore(appDataDir string) *Store {
@@ -514,6 +516,17 @@ func (s *Store) SetPortProbeForTest(fn func(port int, checkUDP bool) (bool, bool
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.probePort = fn
+	s.customPortProbe = true
+}
+
+func (s *Store) portProbeLocked(privilegedCore bool) func(port int, checkUDP bool) (bool, bool) {
+	if s.customPortProbe {
+		return s.probePort
+	}
+	if privilegedCore && runtime.GOOS == "darwin" {
+		return portprobe.ProbeLoopbackPortForPrivilegedCore
+	}
+	return s.probePort
 }
 
 func ProfileKey(profileName string) string {
@@ -650,6 +663,10 @@ func (s *Store) PrepareWithFallbackProxies(root map[string]any, profileName stri
 }
 
 func (s *Store) PrepareWithProviderProxies(root map[string]any, profileName string, coreRunning bool, providerProxies []ProviderProxy) ([]NodePortBinding, error) {
+	return s.prepareWithProviderProxies(root, profileName, coreRunning, false, providerProxies)
+}
+
+func (s *Store) prepareWithProviderProxies(root map[string]any, profileName string, coreRunning bool, privilegedCore bool, providerProxies []ProviderProxy) ([]NodePortBinding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -690,12 +707,13 @@ func (s *Store) PrepareWithProviderProxies(root map[string]any, profileName stri
 		}
 	}
 	pKey := ProfileKey(profileName)
+	probe := s.portProbeLocked(privilegedCore)
 
 	availFn := func(port int) bool {
-		if s.probePort == nil {
+		if probe == nil {
 			return true
 		}
-		ok, _ := s.probePort(port, true)
+		ok, _ := probe(port, true)
 		return ok
 	}
 
@@ -724,10 +742,10 @@ func (s *Store) PrepareWithProviderProxies(root map[string]any, profileName stri
 	// scheduled subscription refreshes can bypass TUN/dead nodes via DIRECT even
 	// if background 204 auto-recovery is disabled.
 	dp, err := st.Registry.PrepareDirectPort(reserved, coreRunning, func(port int) bool {
-		if s.probePort == nil {
+		if probe == nil {
 			return true
 		}
-		ok, _ := s.probePort(port, false)
+		ok, _ := probe(port, false)
 		return ok
 	})
 	if err != nil {
@@ -785,7 +803,7 @@ func (s *Store) TransformHookForControllerWithProviderProxies(
 		if providerProxiesLoader != nil {
 			provs = providerProxiesLoader(root)
 		}
-		_, err := s.PrepareWithProviderProxies(root, settings.SelectedProfile, running, provs)
+		_, err := s.prepareWithProviderProxies(root, settings.SelectedProfile, running, settings.EnhancedMode, provs)
 		return err
 	}
 }

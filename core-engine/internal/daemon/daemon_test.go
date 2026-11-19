@@ -443,7 +443,7 @@ func TestLoadProviderSnapshotsFromDiskAndUninstallCleanup(t *testing.T) {
 type noopApplier struct{}
 
 func (noopApplier) ValidateConfig(_, _ string) error { return nil }
-func (noopApplier) ApplyRuntimeConfig(_ context.Context, _ profile.AppSettings, _, _ string, _ int, _ string) error {
+func (noopApplier) ApplyRuntimeConfig(_ context.Context, _ profile.AppSettings, _, _ string, _ int, _ string, _ bool) error {
 	return nil
 }
 
@@ -561,7 +561,7 @@ type uacSpyApplier struct {
 }
 
 func (a *uacSpyApplier) ValidateConfig(_, _ string) error { return nil }
-func (a *uacSpyApplier) ApplyRuntimeConfig(_ context.Context, _ profile.AppSettings, _, _ string, _ int, _ string) error {
+func (a *uacSpyApplier) ApplyRuntimeConfig(_ context.Context, _ profile.AppSettings, _, _ string, _ int, _ string, _ bool) error {
 	a.called = true
 	a.seenAllowUAC = a.engine.allowPromptUAC
 	return nil
