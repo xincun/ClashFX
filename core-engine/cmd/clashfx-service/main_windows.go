@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/clashfx/core-engine/internal/service"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
@@ -172,8 +173,21 @@ func resolveTrustedDir() (string, error) {
 	return filepath.Dir(exe), nil
 }
 
+func winRenameWithRetry(src, dst string) error {
+	var err error
+	for i := 0; i < 6; i++ {
+		err = os.Rename(src, dst)
+		if err == nil {
+			return nil
+		}
+		time.Sleep(120 * time.Millisecond)
+	}
+	return err
+}
+
 // reconcileBundledWindowsCore promotes mihomo_core.bundled.exe staged by the installer
-// unless the already-installed mihomo_core.exe is strictly newer (online upgrade).
+// unless the already-installed mihomo_core.exe is strictly newer (online upgrade) and same arch.
+// Uses backup-and-swap so transient AV/Defender locks never delete the only working core binary.
 func reconcileBundledWindowsCore(trustedDir string) error {
 	bundledPath := filepath.Join(trustedDir, "mihomo_core.bundled.exe")
 	if _, err := os.Stat(bundledPath); os.IsNotExist(err) {
@@ -187,11 +201,23 @@ func reconcileBundledWindowsCore(trustedDir string) error {
 		_ = os.Remove(bundledPath)
 		return nil
 	}
-	if err := os.Remove(corePath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove previous mihomo_core.exe: %w", err)
+
+	var backupPath string
+	if _, err := os.Stat(corePath); err == nil {
+		backupPath = corePath + ".install.bak"
+		_ = os.Remove(backupPath)
+		if err := winRenameWithRetry(corePath, backupPath); err != nil {
+			return fmt.Errorf("backup previous mihomo_core.exe: %w", err)
+		}
 	}
-	if err := os.Rename(bundledPath, corePath); err != nil {
+	if err := winRenameWithRetry(bundledPath, corePath); err != nil {
+		if backupPath != "" {
+			_ = winRenameWithRetry(backupPath, corePath)
+		}
 		return fmt.Errorf("promote bundled mihomo_core.exe: %w", err)
+	}
+	if backupPath != "" {
+		_ = os.Remove(backupPath)
 	}
 	return nil
 }
@@ -205,6 +231,15 @@ func installAndStartService() error {
 		exe = resolved
 	}
 	trustedDir := filepath.Dir(exe)
+	// Always ensure mihomo_core.bundled.exe is reconciled even if SCM registration fails
+	// (e.g. ERROR_SERVICE_MARKED_FOR_DELETE), so local unprivileged mode still has mihomo_core.exe.
+	reconciled := false
+	defer func() {
+		if !reconciled {
+			_ = reconcileBundledWindowsCore(trustedDir)
+		}
+	}()
+
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("connect SCM (run as Administrator): %w", err)
@@ -212,9 +247,11 @@ func installAndStartService() error {
 	defer m.Disconnect()
 
 	cfg := mgr.Config{
-		StartType:   mgr.StartAutomatic,
-		DisplayName: "ClashFX Privileged Tunnel Service",
-		Description: "Manages ClashFX Mihomo TUN adapter lifecycle without daily UAC prompts.",
+		ServiceType:  windows.SERVICE_WIN32_OWN_PROCESS,
+		StartType:    mgr.StartAutomatic,
+		DisplayName:  "ClashFX Privileged Tunnel Service",
+		Description:  "Manages ClashFX Mihomo TUN adapter lifecycle without daily UAC prompts.",
+		Dependencies: []string{"BFE"},
 	}
 	s, err := m.OpenService(service.ServiceName)
 	if err == nil {
@@ -223,10 +260,15 @@ func installAndStartService() error {
 		if existingCfg, cfgErr := s.Config(); cfgErr == nil {
 			cfg = existingCfg
 		}
+		if cfg.ServiceType == 0 {
+			cfg.ServiceType = windows.SERVICE_WIN32_OWN_PROCESS
+		}
 		cfg.StartType = mgr.StartAutomatic
-		cfg.BinaryPathName = exe
+		// UpdateConfig passes BinaryPathName verbatim to ChangeServiceConfig; quote explicitly (CWE-428).
+		cfg.BinaryPathName = syscall.EscapeArg(exe)
 		cfg.DisplayName = "ClashFX Privileged Tunnel Service"
 		cfg.Description = "Manages ClashFX Mihomo TUN adapter lifecycle without daily UAC prompts."
+		cfg.Dependencies = []string{"BFE"}
 		if err := s.UpdateConfig(cfg); err != nil {
 			return fmt.Errorf("update service config: %w", err)
 		}
@@ -245,6 +287,7 @@ func installAndStartService() error {
 	if err := reconcileBundledWindowsCore(trustedDir); err != nil {
 		return err
 	}
+	reconciled = true
 	ensureWindowsFirewallRules(trustedDir)
 	if err := s.Start(); err != nil {
 		st, qErr := s.Query()
@@ -252,15 +295,22 @@ func installAndStartService() error {
 			return fmt.Errorf("start service: %w", err)
 		}
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
+	var lastState svc.State
 	for time.Now().Before(deadline) {
 		st, qErr := s.Query()
-		if qErr == nil && st.State == svc.Running {
-			return nil
+		if qErr == nil {
+			lastState = st.State
+			if st.State == svc.Running {
+				return nil
+			}
+			if st.State == svc.Stopped {
+				return fmt.Errorf("service stopped unexpectedly during startup (win32_exit=%d, svc_exit=%d)", st.Win32ExitCode, st.ServiceSpecificExitCode)
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return nil
+	return fmt.Errorf("service did not reach Running state within 8s (last_state=%d)", lastState)
 }
 
 func uninstallService() error {

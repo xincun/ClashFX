@@ -94,7 +94,7 @@ func attachChildGuard(cmd *exec.Cmd) *childGuard {
 	return &childGuard{job: job}
 }
 
-func (g *childGuard) activePID(cmd *exec.Cmd, doneCh <-chan error) (bool, int) {
+func (g *childGuard) activePID(cmd *exec.Cmd, exitSig *coreExitSignal) (bool, int) {
 	if g != nil && g.job != 0 {
 		var list jobBasicProcessIDList
 		var retLen uint32
@@ -114,11 +114,11 @@ func (g *childGuard) activePID(cmd *exec.Cmd, doneCh <-chan error) (bool, int) {
 			}
 		}
 	}
-	if cmd == nil || cmd.Process == nil || doneCh == nil {
+	if cmd == nil || cmd.Process == nil || exitSig == nil {
 		return false, 0
 	}
 	select {
-	case <-doneCh:
+	case <-exitSig.done:
 		return false, 0
 	default:
 		return true, cmd.Process.Pid
@@ -132,7 +132,7 @@ func (g *childGuard) closeHandles() {
 	}
 }
 
-func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, stopTimeout time.Duration) error {
+func (g *childGuard) terminate(cmd *exec.Cmd, exitSig *coreExitSignal, stopTimeout time.Duration) error {
 	// Best-effort graceful CTRL_BREAK_EVENT to the child's own process group so
 	// mihomo_core can close Wintun cleanly (preventing Event ID 1010 surprise removal)
 	// before falling back to hard Job Object termination.
@@ -141,13 +141,13 @@ func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, stopTimeout t
 			uintptr(windows.CTRL_BREAK_EVENT),
 			uintptr(uint32(cmd.Process.Pid)),
 		)
-		if r1 != 0 && doneCh != nil {
+		if r1 != 0 && exitSig != nil {
 			grace := 2500 * time.Millisecond
 			if stopTimeout > 0 && stopTimeout < grace {
 				grace = stopTimeout
 			}
 			select {
-			case <-doneCh:
+			case <-exitSig.done:
 				g.closeHandles()
 				flushWindowsDNSCache()
 				return nil
@@ -168,9 +168,9 @@ func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, stopTimeout t
 			stopErr = fmt.Errorf("kill core process: %w", err)
 		}
 	}
-	if doneCh != nil {
+	if exitSig != nil {
 		select {
-		case <-doneCh:
+		case <-exitSig.done:
 		case <-time.After(2 * time.Second):
 		}
 	}

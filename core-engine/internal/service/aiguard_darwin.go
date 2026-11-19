@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
@@ -15,6 +16,22 @@ import (
 )
 
 const darwinPFAnchorName = "com.apple/clashfx.ailock"
+
+var (
+	mihomoDefaultTunV4Prefix = netip.MustParsePrefix("198.18.0.0/15")
+	mihomoDefaultTunV6Prefix = netip.MustParsePrefix("fdfe:dcba:9876::/48")
+)
+
+// FlushDarwinPFAnchorDirect unconditionally flushes ClashFX's dedicated pf anchor.
+// Used during uninstall or recovery even when the privileged service is unresponsive.
+func FlushDarwinPFAnchorDirect() {
+	if os.Geteuid() != 0 || strings.TrimSpace(os.Getenv("CLASHFX_DISABLE_PRIVILEGED_SERVICE")) == "1" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = exec.CommandContext(ctx, "/sbin/pfctl", "-a", darwinPFAnchorName, "-F", "all").Run()
+	cancel()
+}
 
 // darwinAIGuard implements crash-window fail-closed protection on macOS using a
 // dedicated pf anchor under Apple's built-in "com.apple/*" anchor point (ref-counted
@@ -38,17 +55,57 @@ func newPlatformAIGuard() aiGuardController {
 	}
 }
 
-func (g *darwinAIGuard) IsTunHealthy(_ string) (uint64, bool) {
+func ifaceHasMihomoTunAddr(addrs []net.Addr, strictAlias bool) bool {
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil {
+			continue
+		}
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			continue
+		}
+		addr = addr.Unmap()
+		if addr.IsLinkLocalUnicast() || addr.IsLoopback() || addr.IsUnspecified() {
+			continue
+		}
+		if strictAlias {
+			return true
+		}
+		if mihomoDefaultTunV4Prefix.Contains(addr) || mihomoDefaultTunV6Prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *darwinAIGuard) IsTunHealthy(alias string) (uint64, bool) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return 0, false
 	}
+	wantExact := strings.TrimSpace(alias)
+	strictAlias := strings.HasPrefix(wantExact, "utun")
 	for _, iface := range ifaces {
-		if strings.HasPrefix(iface.Name, "utun") && iface.Flags&net.FlagUp != 0 {
-			addrs, aErr := iface.Addrs()
-			if aErr == nil && len(addrs) > 0 {
-				return uint64(iface.Index), true
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if strictAlias {
+			if iface.Name != wantExact {
+				continue
 			}
+		} else if !strings.HasPrefix(iface.Name, "utun") {
+			continue
+		}
+		addrs, aErr := iface.Addrs()
+		if aErr == nil && ifaceHasMihomoTunAddr(addrs, strictAlias) {
+			return uint64(iface.Index), true
 		}
 	}
 	return 0, false
@@ -179,6 +236,7 @@ func buildDarwinPFBlockRules(consoleUID uint32, allowLAN bool, allowCIDRs []stri
 }
 
 func (g *darwinAIGuard) applyAnchorLocked(rules string) error {
+	acquiredToken := false
 	if g.pfToken == "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		out, err := exec.CommandContext(ctx, "/sbin/pfctl", "-E").CombinedOutput()
@@ -189,6 +247,7 @@ func (g *darwinAIGuard) applyAnchorLocked(rules string) error {
 		for _, line := range strings.Split(string(out), "\n") {
 			if strings.HasPrefix(strings.TrimSpace(line), "Token :") {
 				g.pfToken = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Token :"))
+				acquiredToken = g.pfToken != ""
 				break
 			}
 		}
@@ -200,6 +259,13 @@ func (g *darwinAIGuard) applyAnchorLocked(rules string) error {
 	out, err := cmd.CombinedOutput()
 	cancel()
 	if err != nil {
+		// Release newly acquired pfctl -E reference so failed loads never leak pf enable refs.
+		if acquiredToken && g.pfToken != "" {
+			rCtx, rCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = exec.CommandContext(rCtx, "/sbin/pfctl", "-X", g.pfToken).Run()
+			rCancel()
+			g.pfToken = ""
+		}
 		return fmt.Errorf("pfctl load anchor %s failed: %w (%s)", darwinPFAnchorName, err, strings.TrimSpace(string(out)))
 	}
 	g.blocking = true
@@ -212,12 +278,10 @@ func (g *darwinAIGuard) clearAnchorLocked() {
 		g.pfToken = ""
 		return
 	}
-	if g.blocking {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = exec.CommandContext(ctx, "/sbin/pfctl", "-a", darwinPFAnchorName, "-F", "all").Run()
-		cancel()
-		g.blocking = false
-	}
+	// Always flush our dedicated anchor even when g.blocking is false, so rules left
+	// behind across a crash, SIGKILL, or LaunchDaemon restart are never stranded.
+	FlushDarwinPFAnchorDirect()
+	g.blocking = false
 	if g.pfToken != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = exec.CommandContext(ctx, "/sbin/pfctl", "-X", g.pfToken).Run()

@@ -13,10 +13,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -414,6 +416,38 @@ func TestShouldPreserveInstalledCore(t *testing.T) {
 	}
 	if !ShouldPreserveInstalledCore(missingPath, installedV34) {
 		t.Fatal("expected valid installed core to be preserved if bundled path is missing")
+	}
+}
+
+func TestDoHTTPGetWithProxyFallbackOnProxyNon2xx(t *testing.T) {
+	// Target server returns 200 OK directly.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("direct-ok"))
+	}))
+	defer origin.Close()
+
+	// Proxy returns 403 rate-limited error.
+	badProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("proxy-rate-limited"))
+	}))
+	defer badProxy.Close()
+
+	u, err := url.Parse(badProxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyPort, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	body, code, err := doHTTPGetWithProxyFallback(ctx, origin.URL+"/test", "", proxyPort, 3*time.Second, 1024, origin.URL)
+	if err != nil || code != http.StatusOK || string(body) != "direct-ok" {
+		t.Fatalf("expected direct fallback on proxy 403, got code=%d body=%q err=%v", code, string(body), err)
 	}
 }
 

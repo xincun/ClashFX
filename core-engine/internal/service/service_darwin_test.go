@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -65,5 +66,47 @@ func TestDarwinUnixSocketRPCAndPeerAuth(t *testing.T) {
 	defer c2.Close()
 	if err := VerifyPipePeer(c1, trustedDir); err == nil {
 		t.Fatal("expected VerifyPipePeer to reject non-Unix socket connection")
+	}
+
+	// Verify kern.procargs2 resolves our own executable path and peer allowlist filters properly.
+	selfExe, err := peerExecutablePathDarwin(os.Getpid())
+	if err != nil || selfExe == "" {
+		t.Fatalf("peerExecutablePathDarwin(self) failed: %v (%q)", err, selfExe)
+	}
+	if isAllowedDarwinPeerExecutable("/usr/bin/python3", trustedDir) {
+		t.Fatal("expected python3 to be rejected as darwin service peer")
+	}
+	if !isAllowedDarwinPeerExecutable("/Applications/ClashFX.app/Contents/MacOS/clashfx-daemon", trustedDir) {
+		t.Fatal("expected ClashFX.app clashfx-daemon to be allowed as darwin service peer")
+	}
+	if !isAllowedDarwinPeerExecutable(filepath.Join(trustedDir, "clashfx-service"), trustedDir) {
+		t.Fatal("expected trustedDir clashfx-service to be allowed as darwin service peer")
+	}
+
+	// Verify socket identity guard prevents unlinking a replaced socket inode.
+	sockID := StatSocketIdentity(sockPath)
+	if !sockID.OK {
+		t.Fatal("expected valid socket identity")
+	}
+	_ = ln.Close()
+	if err := os.Remove(sockPath); err != nil {
+		t.Fatalf("remove old socket: %v", err)
+	}
+	if err := os.WriteFile(sockPath, []byte("new-instance"), 0600); err != nil {
+		t.Fatalf("write replacement file: %v", err)
+	}
+	RemoveSocketIfMatches(sockPath, sockID)
+	if _, err := os.Stat(sockPath); err != nil {
+		t.Fatalf("RemoveSocketIfMatches deleted a different inode: %v", err)
+	}
+
+	// Verify macOS TUN health helper ignores link-local fe80:: utun addrs and accepts Mihomo 198.18.x.x.
+	_, llNet, _ := net.ParseCIDR("fe80::1/64")
+	if ifaceHasMihomoTunAddr([]net.Addr{llNet}, false) {
+		t.Fatal("expected link-local IPv6 utun address not to be treated as Mihomo TUN")
+	}
+	_, tunNet, _ := net.ParseCIDR("198.18.0.1/30")
+	if !ifaceHasMihomoTunAddr([]net.Addr{llNet, tunNet}, false) {
+		t.Fatal("expected 198.18.0.1/30 utun address to be recognized as Mihomo TUN")
 	}
 }

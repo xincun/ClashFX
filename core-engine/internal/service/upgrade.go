@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"debug/pe"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -171,10 +172,27 @@ func CompareCoreVersions(a, b string) int {
 	return strings.Compare(ta, tb)
 }
 
+func probePEMachine(path string) (uint16, bool) {
+	f, err := pe.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	return f.FileHeader.Machine, true
+}
+
 // ShouldPreserveInstalledCore reports whether an already-installed mihomo_core
 // binary should be preserved instead of being overwritten by a bundled binary
-// during app/service installation (i.e. when installed is valid and strictly newer).
+// during app/service installation (i.e. when installed is valid, same architecture,
+// and strictly newer).
 func ShouldPreserveInstalledCore(bundledPath, installedPath string) bool {
+	if bm, okB := probePEMachine(bundledPath); okB {
+		if im, okI := probePEMachine(installedPath); okI && bm != im {
+			// Never preserve a mismatched PE architecture (e.g. amd64 vs arm64) alongside
+			// newly installed architecture-specific wintun.dll.
+			return false
+		}
+	}
 	installedVer := ProbeCoreVersion(installedPath)
 	if installedVer == "" {
 		return false
@@ -289,9 +307,13 @@ func (r *Runner) upgradeEndpointsLocked() (string, string) {
 func doHTTPGetWithProxyFallback(ctx context.Context, rawURL string, accept string, proxyPort int, timeout time.Duration, maxBytes int64, testBaseURL string) ([]byte, int, error) {
 	fetchOnce := func(port int) ([]byte, int, error) {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
+		defer transport.CloseIdleConnections()
 		if port > 0 && port <= 65535 {
 			pURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
 			transport.Proxy = http.ProxyURL(pURL)
+		} else {
+			// Direct fallback must not inherit a dead/unrelated HTTP_PROXY env var.
+			transport.Proxy = nil
 		}
 		client := &http.Client{
 			Transport: transport,
@@ -330,9 +352,19 @@ func doHTTPGetWithProxyFallback(ctx context.Context, rawURL string, accept strin
 	}
 
 	if proxyPort > 0 && proxyPort <= 65535 {
-		if data, code, err := fetchOnce(proxyPort); err == nil {
-			return data, code, nil
+		pData, pCode, pErr := fetchOnce(proxyPort)
+		if pErr == nil && pCode >= 200 && pCode < 300 {
+			return pData, pCode, nil
 		}
+		dData, dCode, dErr := fetchOnce(0)
+		if dErr == nil && dCode >= 200 && dCode < 300 {
+			return dData, dCode, nil
+		}
+		// If direct failed at transport level while proxy returned an HTTP status, preserve proxy's status.
+		if dErr != nil && pErr == nil {
+			return pData, pCode, nil
+		}
+		return dData, dCode, dErr
 	}
 	return fetchOnce(0)
 }
@@ -495,6 +527,24 @@ func extractArchiveBinary(archiveBytes []byte, assetName string, out *os.File) e
 	return fmt.Errorf("unsupported archive format %q", assetName)
 }
 
+func removeWithRetry(path string) error {
+	var err error
+	attempts := 1
+	if runtime.GOOS == "windows" {
+		attempts = 6
+	}
+	for i := 0; i < attempts; i++ {
+		err = os.Remove(path)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		if i+1 < attempts {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	return err
+}
+
 func renameWithRetry(src, dst string) error {
 	var err error
 	attempts := 1
@@ -639,7 +689,7 @@ func (r *Runner) UpgradeCore(ctx context.Context, channel string, proxyPort int)
 		return CoreUpgradeInfo{PreviousVersion: prevVer, CurrentVersion: prevVer, LatestVersion: rel.Version}, r.statusLocked(),
 			errors.New("trusted directory changed concurrently during upgrade")
 	}
-	wasRunning := r.statusLocked().Running
+	shouldRestart := r.statusLocked().Running || r.desiredRunning
 	homeDir := r.homeDir
 	configFile := r.configFile
 	extUI := r.extUI
@@ -658,7 +708,7 @@ func (r *Runner) UpgradeCore(ctx context.Context, channel string, proxyPort int)
 
 	backupPath, bakErr := moveAsideBackup(corePath)
 	if bakErr != nil {
-		if wasRunning && homeDir != "" && configFile != "" {
+		if shouldRestart && homeDir != "" && configFile != "" {
 			_, _ = r.startLocked(homeDir, configFile, extUI, logDir, supervise, false)
 		}
 		return CoreUpgradeInfo{PreviousVersion: prevVer, CurrentVersion: prevVer, LatestVersion: rel.Version}, r.statusLocked(),
@@ -669,7 +719,7 @@ func (r *Runner) UpgradeCore(ctx context.Context, channel string, proxyPort int)
 		if backupPath != "" {
 			_ = renameWithRetry(backupPath, corePath)
 		}
-		if wasRunning && homeDir != "" && configFile != "" {
+		if shouldRestart && homeDir != "" && configFile != "" {
 			_, _ = r.startLocked(homeDir, configFile, extUI, logDir, supervise, false)
 		}
 		return CoreUpgradeInfo{PreviousVersion: prevVer, CurrentVersion: prevVer, LatestVersion: rel.Version}, r.statusLocked(),
@@ -678,14 +728,17 @@ func (r *Runner) UpgradeCore(ctx context.Context, channel string, proxyPort int)
 	keepTmp = true
 	refreshCorePlatformPostInstall(corePath)
 
-	if wasRunning && homeDir != "" && configFile != "" {
+	if shouldRestart && homeDir != "" && configFile != "" {
+		r.consecutiveCrashes = 0
 		_, startErr := r.startLocked(homeDir, configFile, extUI, logDir, supervise, false)
 		if startErr != nil {
 			_ = r.stopLocked()
-			_ = os.Remove(corePath)
+			_ = removeWithRetry(corePath)
 			rollbackNote := ""
+			curVer := prevVer
 			if backupPath != "" {
 				if rbRenameErr := renameWithRetry(backupPath, corePath); rbRenameErr == nil {
+					refreshCorePlatformPostInstall(corePath)
 					if _, rbStartErr := r.startLocked(homeDir, configFile, extUI, logDir, supervise, false); rbStartErr != nil {
 						rollbackNote = fmt.Sprintf("; rollback restart failed: %v", rbStartErr)
 					} else {
@@ -693,15 +746,18 @@ func (r *Runner) UpgradeCore(ctx context.Context, channel string, proxyPort int)
 					}
 				} else {
 					rollbackNote = fmt.Sprintf("; rollback rename failed: %v", rbRenameErr)
+					if probed := ProbeCoreVersion(corePath); probed != "" {
+						curVer = probed
+					}
 				}
 			}
-			return CoreUpgradeInfo{PreviousVersion: prevVer, CurrentVersion: prevVer, LatestVersion: rel.Version}, r.statusLocked(),
+			return CoreUpgradeInfo{PreviousVersion: prevVer, CurrentVersion: curVer, LatestVersion: rel.Version}, r.statusLocked(),
 				fmt.Errorf("upgraded core failed to start (%w)%s", startErr, rollbackNote)
 		}
 	}
 
 	if backupPath != "" {
-		_ = os.Remove(backupPath)
+		_ = removeWithRetry(backupPath)
 	}
 	return CoreUpgradeInfo{
 		Updated:         true,

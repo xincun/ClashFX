@@ -108,12 +108,29 @@ func TestRunnerLifecycleAndValidation(t *testing.T) {
 	runner := NewRunner(trustedDir)
 	runner.SetCoreBinaryForTest(fakeExeName, 10*time.Second, 5*time.Second)
 
-	// Reject relative or UNC paths
+	// Reject relative, UNC, filesystem root, trustedDir, and symlinked system log paths
 	if resp := runner.Handle(Request{Action: "start_core", HomeDir: "relative", ConfigFile: cfgPath}); resp.OK {
 		t.Fatal("expected relative home_dir to be rejected")
 	}
 	if resp := runner.Handle(Request{Action: "start_core", HomeDir: `\\evil\share`, ConfigFile: cfgPath}); resp.OK {
 		t.Fatal("expected UNC path to be rejected")
+	}
+	if resp := runner.Handle(Request{Action: "start_core", HomeDir: `//evil/share`, ConfigFile: cfgPath}); resp.OK {
+		t.Fatal("expected forward-slash UNC path to be rejected")
+	}
+	if resp := runner.Handle(Request{Action: "start_core", HomeDir: trustedDir, ConfigFile: filepath.Join(trustedDir, "config.yaml")}); resp.OK {
+		t.Fatal("expected home_dir == trustedDir to be rejected")
+	}
+	if runtime.GOOS != "windows" {
+		if resp := runner.Handle(Request{Action: "start_core", HomeDir: "/", ConfigFile: cfgPath}); resp.OK {
+			t.Fatal("expected filesystem root home_dir to be rejected")
+		}
+		symLog := filepath.Join(t.TempDir(), "etc-link")
+		if err := os.Symlink("/etc", symLog); err == nil {
+			if resp := runner.Handle(Request{Action: "start_core", HomeDir: homeDir, ConfigFile: cfgPath, LogDir: filepath.Join(symLog, "sub")}); resp.OK {
+				t.Fatal("expected symlinked /etc log_dir to be rejected")
+			}
+		}
 	}
 	otherDir := t.TempDir()
 	outsideCfg := filepath.Join(otherDir, "outside.yaml")

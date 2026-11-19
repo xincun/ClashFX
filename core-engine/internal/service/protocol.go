@@ -80,6 +80,11 @@ type Response struct {
 	Upgrade *CoreUpgradeInfo `json:"upgrade,omitempty"`
 }
 
+type coreExitSignal struct {
+	done chan struct{}
+	err  error
+}
+
 // Runner supervises a single stock upstream mihomo_core binary located strictly inside
 // trustedDir (the service executable's own directory). It provides:
 //   - complete rotating log persistence for mihomo_core and service lifecycle events
@@ -104,7 +109,7 @@ type Runner struct {
 
 	cmd            *exec.Cmd
 	guard          *childGuard
-	doneCh         chan error
+	exitSig        *coreExitSignal
 	pipesDone      chan struct{}
 	supStopCh      chan struct{}
 	gen            uint64
@@ -185,6 +190,9 @@ func (r *Runner) InitPrivilegedService(serviceDataDir string) {
 		st := r.syncAIGuardLocked(false)
 		r.logServiceEventLocked("INFO", "restored persisted AI Guard on service startup (mode=%s, armed=%v, protected=%d, err=%q)",
 			st.Mode, st.Armed, st.ProtectedCount, st.LastError)
+	} else {
+		// Flush any stale OS firewall anchor/session left behind by an earlier crash/SIGKILL.
+		_ = r.disarmAIGuardLocked()
 	}
 	r.mu.Unlock()
 }
@@ -293,7 +301,9 @@ func (r *Runner) Handle(req Request) Response {
 		st := r.Status()
 		return Response{OK: true, Status: &st}
 	case "upgrade_core":
-		info, st, err := r.UpgradeCore(context.Background(), req.Channel, req.ProxyPort)
+		upgradeCtx, cancel := context.WithTimeout(context.Background(), 115*time.Second)
+		defer cancel()
+		info, st, err := r.UpgradeCore(upgradeCtx, req.Channel, req.ProxyPort)
 		if err != nil {
 			return Response{OK: false, Message: err.Error(), Status: &st, Upgrade: &info}
 		}
@@ -427,7 +437,123 @@ func (r *Runner) verifyAfterPowerResume(expectedGen uint64) {
 	}
 	if _, err := r.startLocked(r.homeDir, r.configFile, r.extUI, r.logDir, r.supervise, true); err != nil {
 		r.logServiceEventLocked("ERROR", "post-resume restart failed: %v", err)
+		if r.supervise {
+			// Resume failed transiently while NICs/Wintun were still settling; re-arm
+			// backoff supervision instead of leaving desiredRunning orphaned without a watcher.
+			r.consecutiveCrashes++
+			r.lastCrashAt = time.Now()
+			r.lastCrashReason = fmt.Sprintf("post-resume restart failed: %v", err)
+			if r.consecutiveCrashes >= r.crashLoopThreshold {
+				r.health = CoreHealthCrashLoop
+			} else {
+				r.health = CoreHealthRestarting
+			}
+			r.gen++
+			nextGen := r.gen
+			nextStop := make(chan struct{})
+			r.supStopCh = nextStop
+			r.desiredRunning = true
+			go r.runSuperviseRetryLoop(nextGen, nextStop)
+		}
 	}
+}
+
+func resolvePathCanonical(p string) string {
+	cleaned := filepath.Clean(p)
+	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
+		return filepath.Clean(resolved)
+	}
+	// Walk up to the longest existing ancestor so symlinks in parent segments
+	// (e.g., /tmp/link-to-etc/sub) are still canonicalized before prefix checks.
+	cur := cleaned
+	var tail []string
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return cleaned
+		}
+		tail = append(tail, filepath.Base(cur))
+		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+			parts := make([]string, 0, len(tail)+1)
+			parts = append(parts, resolved)
+			for i := len(tail) - 1; i >= 0; i-- {
+				parts = append(parts, tail[i])
+			}
+			return filepath.Clean(filepath.Join(parts...))
+		}
+		cur = parent
+	}
+}
+
+func isRestrictedSystemPath(p string) bool {
+	canonical := resolvePathCanonical(p)
+	low := strings.ToLower(strings.ReplaceAll(canonical, `\`, "/"))
+	low = strings.TrimRight(low, "/")
+	if low == "" || strings.HasSuffix(low, ":") {
+		// Filesystem root "/" or Windows drive root "c:"
+		return true
+	}
+	for _, prefix := range []string{
+		"/etc",
+		"/private/etc",
+		"/usr",
+		"/bin",
+		"/sbin",
+		"/system",
+		"/dev",
+		"/proc",
+		"/sys",
+		"/var/run",
+		"/private/var/run",
+		"/library/launchdaemons",
+		"/library/launchagents",
+		"/library/privilegedhelpertools",
+	} {
+		if low == prefix || strings.HasPrefix(low, prefix+"/") {
+			return true
+		}
+	}
+	// Windows system roots (e.g. C:/Windows, C:/Windows/System32, SysWOW64, WinSxS)
+	if len(low) >= 2 && low[1] == ':' {
+		rest := low[2:]
+		for _, winPrefix := range []string{
+			"/windows/system32",
+			"/windows/syswow64",
+			"/windows/winsxs",
+			"/windows/system",
+		} {
+			if rest == winPrefix || strings.HasPrefix(rest, winPrefix+"/") {
+				return true
+			}
+		}
+		if rest == "/windows" {
+			return true
+		}
+	}
+	return false
+}
+
+func isSameOrWithinDir(baseDir, targetPath string) bool {
+	if strings.TrimSpace(baseDir) == "" || strings.TrimSpace(targetPath) == "" {
+		return false
+	}
+	cb := resolvePathCanonical(baseDir)
+	ct := resolvePathCanonical(targetPath)
+	if runtime.GOOS == "windows" {
+		if strings.EqualFold(cb, ct) {
+			return true
+		}
+	} else if cb == ct {
+		return true
+	}
+	rel, err := filepath.Rel(cb, ct)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 func validateCleanAbsPath(label, p string, mustExist bool, wantDir bool) (string, error) {
@@ -441,10 +567,13 @@ func validateCleanAbsPath(label, p string, mustExist bool, wantDir bool) (string
 	if !filepath.IsAbs(p) {
 		return "", fmt.Errorf("%s must be an absolute path: %q", label, p)
 	}
-	if strings.HasPrefix(p, `\\`) {
+	if strings.HasPrefix(p, `\\`) || strings.HasPrefix(p, `//`) {
 		return "", fmt.Errorf("%s must be a local filesystem path, not UNC: %q", label, p)
 	}
 	cleaned := filepath.Clean(p)
+	if strings.HasPrefix(cleaned, `\\`) || strings.HasPrefix(cleaned, `//`) {
+		return "", fmt.Errorf("%s must be a local filesystem path, not UNC: %q", label, p)
+	}
 	if mustExist {
 		info, err := os.Stat(cleaned)
 		if err != nil {
@@ -460,7 +589,7 @@ func validateCleanAbsPath(label, p string, mustExist bool, wantDir bool) (string
 	return cleaned, nil
 }
 
-func validateSafeLogDir(rawLogDir, cleanHome string) (string, error) {
+func validateSafeLogDir(rawLogDir, cleanHome, trustedDir string) (string, error) {
 	trimmed := strings.TrimSpace(rawLogDir)
 	if trimmed == "" {
 		return filepath.Join(cleanHome, "logs"), nil
@@ -469,14 +598,11 @@ func validateSafeLogDir(rawLogDir, cleanHome string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Reject obvious OS root/system directories even from authenticated callers.
-	low := strings.ToLower(strings.ReplaceAll(cleaned, `\`, "/"))
-	if low == "/" || strings.HasSuffix(low, ":/") ||
-		strings.Contains(low, "/windows/system32") ||
-		strings.HasPrefix(low, "/etc") ||
-		strings.HasPrefix(low, "/usr") ||
-		strings.HasPrefix(low, "/system") {
+	if isRestrictedSystemPath(cleaned) {
 		return "", fmt.Errorf("log_dir %q points to a restricted system directory", cleaned)
+	}
+	if trustedDir != "" && isSameOrWithinDir(trustedDir, cleaned) {
+		return "", fmt.Errorf("log_dir %q must not point into trusted binary directory %q", cleaned, trustedDir)
 	}
 	return cleaned, nil
 }
@@ -613,9 +739,16 @@ func (r *Runner) Start(homeDir, configFile, extUI string) (Status, error) {
 
 // StartWithOptions launches mihomo_core with explicit log directory and crash-supervision toggle.
 func (r *Runner) StartWithOptions(homeDir, configFile, extUI, logDir string, supervise bool) (Status, error) {
+	trustedDir := r.TrustedDir()
 	cleanHome, err := validateCleanAbsPath("home_dir", homeDir, true, true)
 	if err != nil {
 		return r.Status(), err
+	}
+	if isRestrictedSystemPath(cleanHome) {
+		return r.Status(), fmt.Errorf("home_dir %q points to a restricted system directory", cleanHome)
+	}
+	if trustedDir != "" && isSameOrWithinDir(trustedDir, cleanHome) {
+		return r.Status(), fmt.Errorf("home_dir %q must not reside inside trusted binary directory %q", cleanHome, trustedDir)
 	}
 	cleanConfig, err := validateCleanAbsPath("config_file", configFile, true, false)
 	if err != nil {
@@ -630,8 +763,24 @@ func (r *Runner) StartWithOptions(homeDir, configFile, extUI, logDir string, sup
 		if err != nil {
 			return r.Status(), err
 		}
+		if isRestrictedSystemPath(cleanUI) {
+			return r.Status(), fmt.Errorf("ext_ui %q points to a restricted system directory", cleanUI)
+		}
+		// ext_ui may live inside a dedicated subdirectory (e.g. resources/dashboard on Windows),
+		// but must never equal trustedDir itself so SAFE_PATHS never exposes service binaries.
+		if trustedDir != "" {
+			cUI := resolvePathCanonical(cleanUI)
+			cTrusted := resolvePathCanonical(trustedDir)
+			sameTrusted := cUI == cTrusted
+			if runtime.GOOS == "windows" {
+				sameTrusted = strings.EqualFold(cUI, cTrusted)
+			}
+			if sameTrusted {
+				return r.Status(), fmt.Errorf("ext_ui %q must not equal trusted binary directory", cleanUI)
+			}
+		}
 	}
-	cleanLogDir, err := validateSafeLogDir(logDir, cleanHome)
+	cleanLogDir, err := validateSafeLogDir(logDir, cleanHome, trustedDir)
 	if err != nil {
 		return r.Status(), err
 	}
@@ -721,10 +870,11 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 
 	cmd := exec.Command(corePath, args...)
 	cmd.Dir = r.trustedDir
-	// Always confine stock Mihomo file access via SAFE_PATHS so SYSTEM-launched
-	// mihomo_core cannot read/write arbitrary provider paths outside home_dir / trustedDir.
+	// Always confine stock Mihomo file access via SAFE_PATHS so SYSTEM/root-launched
+	// mihomo_core cannot read/write arbitrary provider paths outside home_dir (or ext_ui)
+	// and can NEVER write into trustedDir (service/core binaries).
 	env := make([]string, 0, len(os.Environ())+1)
-	safeList := []string{cleanHome, r.trustedDir}
+	safeList := []string{cleanHome}
 	if cleanUI != "" {
 		safeList = append(safeList, cleanUI)
 	}
@@ -738,20 +888,26 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 	cmd.Env = env
 	configureChildProcess(cmd)
 
-	stdoutPipe, err := cmd.StdoutPipe()
+	// Use explicit os.Pipe() rather than cmd.StdoutPipe/StderrPipe so cmd.Wait()
+	// never closes read ends prematurely before streamPipe finishes draining fatal crash logs.
+	outR, outW, err := os.Pipe()
 	if err != nil {
 		if !isAutoRestart {
 			r.closeLogFilesLocked(false)
 		}
 		return r.statusLocked(), fmt.Errorf("create core stdout pipe: %w", err)
 	}
-	stderrPipe, err := cmd.StderrPipe()
+	errR, errW, err := os.Pipe()
 	if err != nil {
+		_ = outR.Close()
+		_ = outW.Close()
 		if !isAutoRestart {
 			r.closeLogFilesLocked(false)
 		}
 		return r.statusLocked(), fmt.Errorf("create core stderr pipe: %w", err)
 	}
+	cmd.Stdout = outW
+	cmd.Stderr = errW
 
 	r.logMu.Lock()
 	r.recentLogs = nil
@@ -769,6 +925,10 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 		r.coreExeName, isAutoRestart, cleanConfig, endpoints.tunEnabled)
 
 	if err := cmd.Start(); err != nil {
+		_ = outR.Close()
+		_ = outW.Close()
+		_ = errR.Close()
+		_ = errW.Close()
 		r.health = CoreHealthStopped
 		r.logServiceEventLocked("ERROR", "start core process failed: %v", err)
 		if !isAutoRestart {
@@ -776,15 +936,19 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 		}
 		return r.statusLocked(), fmt.Errorf("start core process: %w", err)
 	}
+	// Close parent write ends immediately so readers observe EOF when child exits.
+	_ = outW.Close()
+	_ = errW.Close()
 	guard := attachChildGuard(cmd)
 	coreLogRef := r.coreLog
 
 	readyCh := make(chan struct{})
 	var readyOnce sync.Once
-	doneCh := make(chan error, 1)
+	exitSig := &coreExitSignal{done: make(chan struct{})}
 	pipesDone := make(chan struct{})
 
-	streamPipe := func(reader io.Reader, tag string) {
+	streamPipe := func(reader io.ReadCloser, tag string) {
+		defer reader.Close()
 		readLinesBounded(reader, 32*1024, func(line string) {
 			r.appendLog(line)
 			if coreLogRef != nil {
@@ -799,18 +963,19 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 	pipeWG.Add(2)
 	go func() {
 		defer pipeWG.Done()
-		streamPipe(stdoutPipe, "core-out")
+		streamPipe(outR, "core-out")
 	}()
 	go func() {
 		defer pipeWG.Done()
-		streamPipe(stderrPipe, "core-err")
+		streamPipe(errR, "core-err")
 	}()
 	go func() {
 		pipeWG.Wait()
 		close(pipesDone)
 	}()
 	go func() {
-		doneCh <- cmd.Wait()
+		exitSig.err = cmd.Wait()
+		close(exitSig.done)
 	}()
 
 	probeCtx, cancelProbe := context.WithCancel(context.Background())
@@ -825,7 +990,7 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 
 	r.cmd = cmd
 	r.guard = guard
-	r.doneCh = doneCh
+	r.exitSig = exitSig
 	r.pipesDone = pipesDone
 	r.supStopCh = supStopCh
 	r.homeDir = cleanHome
@@ -854,7 +1019,7 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 		}
 		r.logServiceEventLocked("INFO", "core ready (pid=%d, auto_restart=%v, restart_count=%d)", pid, isAutoRestart, r.restartCount)
 		if r.aiGuardCfg.Enabled {
-			if r.aiGuardCfg.TunDeviceName == "" {
+			if endpoints.tunDevice != "" {
 				r.aiGuardCfg.TunDeviceName = endpoints.tunDevice
 			}
 			st := r.syncAIGuardLocked(true)
@@ -863,10 +1028,11 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 			}
 		}
 		if supervise {
-			go r.superviseCoreExit(gen, cmd, doneCh, supStopCh)
+			go r.superviseCoreExit(gen, cmd, exitSig, supStopCh)
 		}
 		return r.statusLocked(), nil
-	case waitErr := <-doneCh:
+	case <-exitSig.done:
+		waitErr := exitSig.err
 		guard.closeHandles()
 		select {
 		case <-pipesDone:
@@ -874,7 +1040,7 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 		}
 		r.cmd = nil
 		r.guard = nil
-		r.doneCh = nil
+		r.exitSig = nil
 		r.pipesDone = nil
 		r.closeSupStopLocked()
 		r.health = CoreHealthStopped
@@ -911,8 +1077,8 @@ func (r *Runner) startLocked(cleanHome, cleanConfig, cleanUI, cleanLogDir string
 	}
 }
 
-// waitForTunAndSyncAIGuard polls for the Wintun adapter LUID for up to 5 seconds after
-// mihomo_core becomes ready so WFP permits the newly created TUN interface immediately.
+// waitForTunAndSyncAIGuard polls for the Wintun/utun adapter for up to 5 seconds after
+// mihomo_core becomes ready so WFP/pf permits the newly created TUN interface immediately.
 func (r *Runner) waitForTunAndSyncAIGuard(gen uint64, stopCh <-chan struct{}, tunAlias string) {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -924,6 +1090,19 @@ func (r *Runner) waitForTunAndSyncAIGuard(gen uint64, stopCh <-chan struct{}, tu
 			return
 		case <-ticker.C:
 		}
+		// Check TUN health outside r.mu so we don't hold the lock across repeated
+		// process/disk scans and WFP transactions while Wintun is still coming up.
+		r.mu.Lock()
+		guardCtrl := r.aiGuard
+		stillValid := r.gen == gen && r.aiGuardCfg.Enabled
+		r.mu.Unlock()
+		if !stillValid || guardCtrl == nil {
+			return
+		}
+		if _, tunUp := guardCtrl.IsTunHealthy(tunAlias); !tunUp {
+			continue
+		}
+
 		r.mu.Lock()
 		if r.gen != gen || !r.aiGuardCfg.Enabled {
 			r.mu.Unlock()
@@ -949,13 +1128,13 @@ func (r *Runner) waitForTunAndSyncAIGuard(gen uint64, stopCh <-chan struct{}, tu
 // If it exits unexpectedly (while desiredRunning is still true and generation matches),
 // it logs complete diagnostics to disk, immediately tightens the OS AI Guard into
 // blocking_leaks mode, and restarts mihomo_core with exponential backoff + circuit breaker.
-func (r *Runner) superviseCoreExit(gen uint64, exitedCmd *exec.Cmd, doneCh <-chan error, stopCh <-chan struct{}) {
-	var waitErr error
+func (r *Runner) superviseCoreExit(gen uint64, exitedCmd *exec.Cmd, exitSig *coreExitSignal, stopCh <-chan struct{}) {
 	select {
-	case waitErr = <-doneCh:
+	case <-exitSig.done:
 	case <-stopCh:
 		return
 	}
+	waitErr := exitSig.err
 
 	r.mu.Lock()
 	if r.gen != gen || !r.desiredRunning {
@@ -975,7 +1154,7 @@ func (r *Runner) superviseCoreExit(gen uint64, exitedCmd *exec.Cmd, doneCh <-cha
 	}
 	r.cmd = nil
 	r.guard = nil
-	r.doneCh = nil
+	r.exitSig = nil
 
 	if uptime >= r.stableResetAfter {
 		r.consecutiveCrashes = 1
@@ -1016,8 +1195,21 @@ func (r *Runner) superviseCoreExit(gen uint64, exitedCmd *exec.Cmd, doneCh <-cha
 			st.Mode, st.Armed, st.ProtectedCount, st.LastError)
 	}
 
-	// Retry loop owned by this supervisor until either restart succeeds or generation is cancelled.
+	r.runSuperviseRetryLoopLocked(gen, stopCh)
+}
+
+func (r *Runner) runSuperviseRetryLoop(gen uint64, stopCh <-chan struct{}) {
+	r.mu.Lock()
+	r.runSuperviseRetryLoopLocked(gen, stopCh)
+}
+
+// runSuperviseRetryLoopLocked expects r.mu held on entry and releases r.mu on every exit path.
+func (r *Runner) runSuperviseRetryLoopLocked(gen uint64, stopCh <-chan struct{}) {
 	for {
+		if r.gen != gen || !r.desiredRunning {
+			r.mu.Unlock()
+			return
+		}
 		delay := r.backoffDelayLocked(r.consecutiveCrashes)
 		r.logServiceEventLocked("INFO", "scheduling automatic mihomo_core restart in %s (attempt crash#%d, health=%s)",
 			delay, r.consecutiveCrashes, r.health)
@@ -1172,14 +1364,14 @@ func (r *Runner) stopLocked() error {
 		return nil
 	}
 	pipesDone := r.pipesDone
-	running, _ := r.guard.activePID(r.cmd, r.doneCh)
+	running, _ := r.guard.activePID(r.cmd, r.exitSig)
 	if !running {
 		if r.guard != nil {
 			r.guard.closeHandles()
 		}
 		r.cmd = nil
 		r.guard = nil
-		r.doneCh = nil
+		r.exitSig = nil
 		r.pipesDone = nil
 		if pipesDone != nil {
 			select {
@@ -1193,10 +1385,10 @@ func (r *Runner) stopLocked() error {
 		return nil
 	}
 
-	stopErr := r.guard.terminate(r.cmd, r.doneCh, r.stopTimeout)
+	stopErr := r.guard.terminate(r.cmd, r.exitSig, r.stopTimeout)
 	r.cmd = nil
 	r.guard = nil
-	r.doneCh = nil
+	r.exitSig = nil
 	r.pipesDone = nil
 	if pipesDone != nil {
 		select {
@@ -1214,14 +1406,14 @@ func (r *Runner) isCoreAliveLocked() (bool, int) {
 	if r.guard == nil && r.cmd == nil {
 		return false, 0
 	}
-	running, pid := r.guard.activePID(r.cmd, r.doneCh)
+	running, pid := r.guard.activePID(r.cmd, r.exitSig)
 	if !running {
 		if r.guard != nil {
 			r.guard.closeHandles()
 		}
 		r.cmd = nil
 		r.guard = nil
-		r.doneCh = nil
+		r.exitSig = nil
 		r.pipesDone = nil
 	}
 	return running, pid

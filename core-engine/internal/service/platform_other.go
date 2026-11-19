@@ -21,12 +21,12 @@ func attachChildGuard(_ *exec.Cmd) *childGuard {
 	return &childGuard{}
 }
 
-func (g *childGuard) activePID(cmd *exec.Cmd, doneCh <-chan error) (bool, int) {
-	if cmd == nil || cmd.Process == nil || doneCh == nil {
+func (g *childGuard) activePID(cmd *exec.Cmd, exitSig *coreExitSignal) (bool, int) {
+	if cmd == nil || cmd.Process == nil || exitSig == nil {
 		return false, 0
 	}
 	select {
-	case <-doneCh:
+	case <-exitSig.done:
 		return false, 0
 	default:
 		return true, cmd.Process.Pid
@@ -35,14 +35,14 @@ func (g *childGuard) activePID(cmd *exec.Cmd, doneCh <-chan error) (bool, int) {
 
 func (g *childGuard) closeHandles() {}
 
-func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, stopTimeout time.Duration) error {
+func (g *childGuard) terminate(cmd *exec.Cmd, exitSig *coreExitSignal, stopTimeout time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
 	_ = cmd.Process.Signal(syscall.SIGTERM)
-	if doneCh != nil {
+	if exitSig != nil {
 		select {
-		case <-doneCh:
+		case <-exitSig.done:
 			return nil
 		case <-time.After(stopTimeout):
 		}
@@ -51,9 +51,9 @@ func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, stopTimeout t
 	if killErr := cmd.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
 		stopErr = fmt.Errorf("kill unresponsive core: %w", killErr)
 	}
-	if doneCh != nil {
+	if exitSig != nil {
 		select {
-		case <-doneCh:
+		case <-exitSig.done:
 		case <-time.After(2 * time.Second):
 		}
 	}

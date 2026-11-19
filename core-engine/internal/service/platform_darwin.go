@@ -51,12 +51,12 @@ func attachChildGuard(cmd *exec.Cmd) *childGuard {
 	return &childGuard{pgid: cmd.Process.Pid}
 }
 
-func (g *childGuard) activePID(cmd *exec.Cmd, doneCh <-chan error) (bool, int) {
-	if cmd == nil || cmd.Process == nil || doneCh == nil {
+func (g *childGuard) activePID(cmd *exec.Cmd, exitSig *coreExitSignal) (bool, int) {
+	if cmd == nil || cmd.Process == nil || exitSig == nil {
 		return false, 0
 	}
 	select {
-	case <-doneCh:
+	case <-exitSig.done:
 		return false, 0
 	default:
 		return true, cmd.Process.Pid
@@ -65,7 +65,7 @@ func (g *childGuard) activePID(cmd *exec.Cmd, doneCh <-chan error) (bool, int) {
 
 func (g *childGuard) closeHandles() {}
 
-func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, stopTimeout time.Duration) error {
+func (g *childGuard) terminate(cmd *exec.Cmd, exitSig *coreExitSignal, stopTimeout time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
@@ -74,9 +74,9 @@ func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, stopTimeout t
 	}
 	_ = cmd.Process.Signal(syscall.SIGTERM)
 
-	if doneCh != nil {
+	if exitSig != nil {
 		select {
-		case <-doneCh:
+		case <-exitSig.done:
 			return nil
 		case <-time.After(stopTimeout):
 		}
@@ -89,9 +89,9 @@ func (g *childGuard) terminate(cmd *exec.Cmd, doneCh <-chan error, stopTimeout t
 	if killErr := cmd.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
 		stopErr = fmt.Errorf("kill unresponsive core: %w", killErr)
 	}
-	if doneCh != nil {
+	if exitSig != nil {
 		select {
-		case <-doneCh:
+		case <-exitSig.done:
 		case <-time.After(2 * time.Second):
 		}
 	}
@@ -126,7 +126,7 @@ func Call(ctx context.Context, req Request) (Response, error) {
 }
 
 // ListenSecurePipe creates the root-supervised Unix socket for ClashFXService.
-// Client authorization is enforced per-connection via LOCAL_PEERCRED in VerifyPipePeer.
+// Client authorization is enforced per-connection via LOCAL_PEERCRED + LOCAL_PEERPID in VerifyPipePeer.
 func ListenSecurePipe() (net.Listener, error) {
 	sockPath := ServiceSocketPath()
 	if err := os.MkdirAll(filepath.Dir(sockPath), 0755); err != nil {
@@ -137,17 +137,94 @@ func ListenSecurePipe() (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen %s: %w", sockPath, err)
 	}
-	// Allow local console users to dial the root socket; VerifyPipePeer enforces UID.
+	// Disable automatic unlink-on-close so a shutting-down instance never deletes
+	// a newly spawned replacement instance's live socket; caller unlinks by inode match.
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
+	// Allow local console users to dial the root socket; VerifyPipePeer enforces UID & peer binary.
 	if chErr := os.Chmod(sockPath, 0666); chErr != nil {
 		_ = ln.Close()
+		_ = os.Remove(sockPath)
 		return nil, fmt.Errorf("chmod service socket %s: %w", sockPath, chErr)
 	}
 	return ln, nil
 }
 
-// VerifyPipePeer authenticates Unix domain socket callers via macOS LOCAL_PEERCRED.
-// Allowed callers: root (UID 0), same effective UID, or the active /dev/console GUI user.
-func VerifyPipePeer(conn net.Conn, _ string) error {
+// SocketIdentity captures the filesystem device and inode of a bound Unix socket.
+type SocketIdentity struct {
+	Dev int32
+	Ino uint64
+	OK  bool
+}
+
+// StatSocketIdentity records the current device/inode of sockPath.
+func StatSocketIdentity(sockPath string) SocketIdentity {
+	info, err := os.Lstat(sockPath)
+	if err != nil {
+		return SocketIdentity{}
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return SocketIdentity{}
+	}
+	return SocketIdentity{Dev: st.Dev, Ino: st.Ino, OK: true}
+}
+
+// RemoveSocketIfMatches removes sockPath only if it still refers to the same inode we created.
+func RemoveSocketIfMatches(sockPath string, id SocketIdentity) {
+	if !id.OK {
+		return
+	}
+	cur := StatSocketIdentity(sockPath)
+	if cur.OK && cur.Dev == id.Dev && cur.Ino == id.Ino {
+		_ = os.Remove(sockPath)
+	}
+}
+
+func peerExecutablePathDarwin(pid int) (string, error) {
+	if pid <= 0 {
+		return "", errors.New("invalid peer pid")
+	}
+	raw, err := unix.SysctlRaw("kern.procargs2", pid)
+	if err != nil || len(raw) <= 4 {
+		return "", fmt.Errorf("sysctl kern.procargs2(pid=%d): %w", pid, err)
+	}
+	// kern.procargs2 layout: [int32 argc][NUL-terminated exec_path][padding/argv/env]
+	rest := raw[4:]
+	end := 0
+	for end < len(rest) && rest[end] != 0 {
+		end++
+	}
+	exe := strings.TrimSpace(string(rest[:end]))
+	if exe == "" {
+		return "", fmt.Errorf("empty exec_path for pid=%d", pid)
+	}
+	if resolved, rErr := filepath.EvalSymlinks(exe); rErr == nil {
+		exe = resolved
+	}
+	return filepath.Clean(exe), nil
+}
+
+func isAllowedDarwinPeerExecutable(exePath, trustedDir string) bool {
+	if strings.TrimSpace(exePath) == "" {
+		return false
+	}
+	cleanExe := resolvePathCanonical(exePath)
+	base := filepath.Base(cleanExe)
+	if base != "clashfx-daemon" && base != "clashfx-service" {
+		return false
+	}
+	dir := filepath.Dir(cleanExe)
+	if trustedDir != "" && dir == resolvePathCanonical(trustedDir) {
+		return true
+	}
+	return strings.HasSuffix(dir, "/ClashFX.app/Contents/MacOS")
+}
+
+// VerifyPipePeer authenticates Unix domain socket callers via macOS LOCAL_PEERCRED
+// and (when running as root) LOCAL_PEERPID + kern.procargs2 executable verification.
+func VerifyPipePeer(conn net.Conn, trustedDir string) error {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
 		return fmt.Errorf("unexpected connection type %T (expected Unix socket)", conn)
@@ -159,8 +236,11 @@ func VerifyPipePeer(conn net.Conn, _ string) error {
 
 	var cred *unix.Xucred
 	var credErr error
+	var peerPID int
+	var pidErr error
 	if ctrlErr := raw.Control(func(fd uintptr) {
 		cred, credErr = unix.GetsockoptXucred(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
+		peerPID, pidErr = unix.GetsockoptInt(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERPID)
 	}); ctrlErr != nil {
 		return fmt.Errorf("socket control error: %w", ctrlErr)
 	}
@@ -172,10 +252,23 @@ func VerifyPipePeer(conn net.Conn, _ string) error {
 	}
 
 	euid := uint32(os.Geteuid())
-	if cred.Uid == 0 || cred.Uid == euid {
+	if cred.Uid == 0 {
+		return nil
+	}
+	if euid != 0 && cred.Uid == euid {
 		return nil
 	}
 	if consoleUID, ok := consoleOwnerUID(); ok && cred.Uid == consoleUID {
+		if pidErr != nil || peerPID <= 0 {
+			return fmt.Errorf("unauthorized Unix socket caller uid=%d (failed to query LOCAL_PEERPID: %v)", cred.Uid, pidErr)
+		}
+		exePath, exeErr := peerExecutablePathDarwin(peerPID)
+		if exeErr != nil {
+			return fmt.Errorf("unauthorized Unix socket caller uid=%d pid=%d (%v)", cred.Uid, peerPID, exeErr)
+		}
+		if !isAllowedDarwinPeerExecutable(exePath, trustedDir) {
+			return fmt.Errorf("unauthorized Unix socket caller %q (uid=%d pid=%d)", exePath, cred.Uid, peerPID)
+		}
 		return nil
 	}
 	return fmt.Errorf("unauthorized Unix socket caller uid=%d", cred.Uid)
@@ -220,32 +313,49 @@ func refreshCorePlatformPostInstall(corePath string) {
 
 // repairUserHomeOwnership restores user ownership on runtime directories/files created
 // inside the desktop user's ~/.config/clashfx directory while mihomo_core runs as root.
+// Uses O_NOFOLLOW/O_DIRECTORY + Fchownat(AT_SYMLINK_NOFOLLOW) to prevent symlink TOCTOU attacks.
 func repairUserHomeOwnership(cleanHome string) {
 	if os.Geteuid() != 0 || strings.TrimSpace(cleanHome) == "" {
 		return
 	}
-	info, err := os.Stat(cleanHome)
+	homeFD, err := unix.Open(cleanHome, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || st.Uid == 0 {
+	defer unix.Close(homeFD)
+
+	var homeSt unix.Stat_t
+	if err := unix.Fstat(homeFD, &homeSt); err != nil || homeSt.Uid == 0 {
 		return
 	}
-	uid, gid := int(st.Uid), int(st.Gid)
+	uid, gid := int(homeSt.Uid), int(homeSt.Gid)
 	for _, name := range []string{"logs", "ruleset", "clashfx-rulesets", "proxies", "rules", "cache.db", ".mihomo_core.log", ".mihomo_core_logs"} {
-		target := filepath.Join(cleanHome, name)
-		linfo, lerr := os.Lstat(target)
-		if lerr != nil {
+		var targetSt unix.Stat_t
+		if err := unix.Fstatat(homeFD, name, &targetSt, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 			continue
 		}
-		_ = os.Lchown(target, uid, gid)
-		if linfo.IsDir() {
-			if entries, rerr := os.ReadDir(target); rerr == nil {
+		// Never follow symlinks inside cleanHome.
+		if targetSt.Mode&unix.S_IFMT == unix.S_IFLNK {
+			continue
+		}
+		if targetSt.Mode&unix.S_IFMT == unix.S_IFDIR {
+			dirFD, oErr := unix.Openat(homeFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+			if oErr != nil {
+				continue
+			}
+			_ = unix.Fchown(dirFD, uid, gid)
+			dirFile := os.NewFile(uintptr(dirFD), name)
+			if entries, rErr := dirFile.ReadDir(-1); rErr == nil {
 				for _, entry := range entries {
-					_ = os.Lchown(filepath.Join(target, entry.Name()), uid, gid)
+					if entry.Type()&os.ModeSymlink != 0 {
+						continue
+					}
+					_ = unix.Fchownat(dirFD, entry.Name(), uid, gid, unix.AT_SYMLINK_NOFOLLOW)
 				}
 			}
+			_ = dirFile.Close()
+		} else {
+			_ = unix.Fchownat(homeFD, name, uid, gid, unix.AT_SYMLINK_NOFOLLOW)
 		}
 	}
 }

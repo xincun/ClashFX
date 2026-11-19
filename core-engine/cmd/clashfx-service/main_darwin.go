@@ -73,6 +73,8 @@ func runDaemon() error {
 	if err != nil {
 		return err
 	}
+	sockPath := service.ServiceSocketPath()
+	sockID := service.StatSocketIdentity(sockPath)
 	runner := service.NewRunner(dir)
 	runner.InitPrivilegedService("")
 	go acceptLoop(ln, runner)
@@ -82,7 +84,7 @@ func runDaemon() error {
 	<-sigCh
 	_ = ln.Close()
 	_ = runner.ShutdownService()
-	_ = os.Remove(service.ServiceSocketPath())
+	service.RemoveSocketIfMatches(sockPath, sockID)
 	return nil
 }
 
@@ -242,9 +244,17 @@ func installAndStartService(sourceDir string) error {
 	}
 	_ = os.Chown(service.DarwinPrivilegedBinDir, 0, 0)
 
-	// Boot out existing service before replacing binaries if already registered.
+	// Boot out existing service before replacing binaries if already registered,
+	// and wait for launchd to unload it cleanly so shutdown does not race bootstrap.
+	_ = exec.Command("/bin/launchctl", "bootout", "system/"+service.DarwinLaunchDaemonLabel).Run()
 	_ = exec.Command("/bin/launchctl", "bootout", "system", service.DarwinLaunchDaemonPlist).Run()
-	time.Sleep(200 * time.Millisecond)
+	bootoutDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(bootoutDeadline) {
+		if err := exec.Command("/bin/launchctl", "print", "system/"+service.DarwinLaunchDaemonLabel).Run(); err != nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	for _, name := range []string{"clashfx-service", "mihomo_core"} {
 		src := filepath.Join(srcDir, name)
@@ -268,10 +278,13 @@ func installAndStartService(sourceDir string) error {
 	}
 	_ = os.Chown(service.DarwinLaunchDaemonPlist, 0, 0)
 
+	// RunAtLoad=true in the plist starts the daemon on bootstrap; avoid an immediate
+	// kickstart -k which would SIGTERM instance #1 while spawning instance #2.
 	if out, err := exec.Command("/bin/launchctl", "bootstrap", "system", service.DarwinLaunchDaemonPlist).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl bootstrap failed: %w (%s)", err, strings.TrimSpace(string(out)))
+		if kOut, kErr := exec.Command("/bin/launchctl", "kickstart", "-k", "system/"+service.DarwinLaunchDaemonLabel).CombinedOutput(); kErr != nil {
+			return fmt.Errorf("launchctl bootstrap failed: %w (%s) / kickstart: %v (%s)", err, strings.TrimSpace(string(out)), kErr, strings.TrimSpace(string(kOut)))
+		}
 	}
-	_ = exec.Command("/bin/launchctl", "kickstart", "-k", "system/"+service.DarwinLaunchDaemonLabel).Run()
 
 	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) {
@@ -294,6 +307,9 @@ func uninstallService() error {
 	_, _ = service.Call(ctx, service.Request{Action: "disarm_ai_guard"})
 	_, _ = service.Call(ctx, service.Request{Action: "stop_core"})
 	cancel()
+	// Always flush pf anchor directly in case the service was dead/unresponsive.
+	service.FlushDarwinPFAnchorDirect()
+	_ = exec.Command("/bin/launchctl", "bootout", "system/"+service.DarwinLaunchDaemonLabel).Run()
 	_ = exec.Command("/bin/launchctl", "bootout", "system", service.DarwinLaunchDaemonPlist).Run()
 	_ = os.Remove(service.DarwinLaunchDaemonPlist)
 	_ = os.Remove(service.ServiceSocketPath())
@@ -319,7 +335,10 @@ func controlService(start bool) error {
 	_, _ = service.Call(ctx, service.Request{Action: "disarm_ai_guard"})
 	_, _ = service.Call(ctx, service.Request{Action: "stop_core"})
 	cancel()
-	_ = exec.Command("/bin/launchctl", "kill", "SIGTERM", "system/"+service.DarwinLaunchDaemonLabel).Run()
+	// Use bootout rather than kill SIGTERM so KeepAlive=true does not immediately respawn it.
+	_ = exec.Command("/bin/launchctl", "bootout", "system/"+service.DarwinLaunchDaemonLabel).Run()
+	_ = exec.Command("/bin/launchctl", "bootout", "system", service.DarwinLaunchDaemonPlist).Run()
+	service.FlushDarwinPFAnchorDirect()
 	return nil
 }
 

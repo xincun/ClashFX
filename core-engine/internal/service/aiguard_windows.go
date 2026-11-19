@@ -281,13 +281,10 @@ func (g *windowsAIGuard) closeSessionLocked() {
 	g.filterIDs = nil
 }
 
-func (g *windowsAIGuard) ensureSessionLocked() error {
-	if g.session != 0 {
-		return nil
-	}
+func openDynamicWFPSession() (uintptr, windows.GUID, windows.GUID, error) {
 	disp, pins, err := makeWFPDisplayData("ClashFX AI Lock Guard", "Fail-closed dynamic WFP session for protected AI clients")
 	if err != nil {
-		return err
+		return 0, windows.GUID{}, windows.GUID{}, err
 	}
 	sess := wfpSession0{
 		displayData:          disp,
@@ -301,7 +298,7 @@ func (g *windowsAIGuard) ensureSessionLocked() error {
 		uintptr(unsafe.Pointer(&sess)),
 		uintptr(unsafe.Pointer(&handle)),
 	); err != nil {
-		return err
+		return 0, windows.GUID{}, windows.GUID{}, err
 	}
 	runtime.KeepAlive(pins)
 	runtime.KeepAlive(&sess)
@@ -309,22 +306,22 @@ func (g *windowsAIGuard) ensureSessionLocked() error {
 	provGUID, err := windows.GenerateGUID()
 	if err != nil {
 		_ = wfpCall(procFwpmEngineClose0, "FwpmEngineClose0", handle)
-		return err
+		return 0, windows.GUID{}, windows.GUID{}, err
 	}
 	subGUID, err := windows.GenerateGUID()
 	if err != nil {
 		_ = wfpCall(procFwpmEngineClose0, "FwpmEngineClose0", handle)
-		return err
+		return 0, windows.GUID{}, windows.GUID{}, err
 	}
 
 	if err := wfpCall(procFwpmTransactionBegin0, "FwpmTransactionBegin0", handle, 0); err != nil {
 		_ = wfpCall(procFwpmEngineClose0, "FwpmEngineClose0", handle)
-		return err
+		return 0, windows.GUID{}, windows.GUID{}, err
 	}
-	abortAndClose := func(cause error) error {
+	abortAndClose := func(cause error) (uintptr, windows.GUID, windows.GUID, error) {
 		_ = wfpCall(procFwpmTransactionAbort0, "FwpmTransactionAbort0", handle)
 		_ = wfpCall(procFwpmEngineClose0, "FwpmEngineClose0", handle)
-		return cause
+		return 0, windows.GUID{}, windows.GUID{}, cause
 	}
 
 	pDisp, pPins, err := makeWFPDisplayData("ClashFX", "ClashFX Privileged Tunnel Service")
@@ -361,11 +358,7 @@ func (g *windowsAIGuard) ensureSessionLocked() error {
 		return abortAndClose(err)
 	}
 
-	g.session = handle
-	g.providerGUID = provGUID
-	g.sublayerGUID = subGUID
-	g.filterIDs = nil
-	return nil
+	return handle, provGUID, subGUID, nil
 }
 
 func (g *windowsAIGuard) Sync(cfg AIGuardConfig, coreRunning bool) AIGuardStatus {
@@ -400,36 +393,73 @@ func (g *windowsAIGuard) Sync(cfg AIGuardConfig, coreRunning bool) AIGuardStatus
 		tunLUID, tunUp = lookupWindowsTunLUID(tunAlias)
 	}
 
-	if err := g.ensureSessionLocked(); err != nil {
-		g.status = AIGuardStatus{
-			Enabled:        true,
-			Armed:          false,
-			Mode:           AIGuardModeError,
-			Backend:        "wfp",
-			ProtectedCount: len(exePaths),
-			TunAlias:       tunAlias,
-			TunLUID:        tunLUID,
-			LastError:      err.Error(),
-			UpdatedAt:      time.Now().Format(time.RFC3339),
+	var (
+		newIDs          []uint64
+		appliedExeCount int
+		err             error
+	)
+
+	if g.session == 0 {
+		newSess, provGUID, subGUID, openErr := openDynamicWFPSession()
+		if openErr != nil {
+			g.status = AIGuardStatus{
+				Enabled:        true,
+				Armed:          false,
+				Mode:           AIGuardModeError,
+				Backend:        "wfp",
+				ProtectedCount: len(exePaths),
+				TunAlias:       tunAlias,
+				TunLUID:        tunLUID,
+				LastError:      openErr.Error(),
+				UpdatedAt:      time.Now().Format(time.RFC3339),
+			}
+			return g.status
 		}
-		return g.status
+		newIDs, appliedExeCount, err = replaceFiltersOnSession(newSess, provGUID, subGUID, nil, exePaths, cfg.AllowLAN, cfg.AllowCIDRs, tunLUID, tunUp)
+		if err != nil {
+			_ = wfpCall(procFwpmEngineClose0, "FwpmEngineClose0", newSess)
+		} else {
+			g.session = newSess
+			g.providerGUID = provGUID
+			g.sublayerGUID = subGUID
+		}
+	} else {
+		newIDs, appliedExeCount, err = replaceFiltersOnSession(g.session, g.providerGUID, g.sublayerGUID, g.filterIDs, exePaths, cfg.AllowLAN, cfg.AllowCIDRs, tunLUID, tunUp)
+		if err != nil {
+			// Fail-closed retry: open and populate a replacement dynamic session BEFORE closing
+			// the existing session so active blocking filters are never dropped on transient errors.
+			if newSess, provGUID, subGUID, openErr := openDynamicWFPSession(); openErr == nil {
+				retryIDs, retryCount, retryErr := replaceFiltersOnSession(newSess, provGUID, subGUID, nil, exePaths, cfg.AllowLAN, cfg.AllowCIDRs, tunLUID, tunUp)
+				if retryErr == nil {
+					oldSess := g.session
+					g.session = newSess
+					g.providerGUID = provGUID
+					g.sublayerGUID = subGUID
+					newIDs = retryIDs
+					appliedExeCount = retryCount
+					err = nil
+					_ = wfpCall(procFwpmEngineClose0, "FwpmEngineClose0", oldSess)
+				} else {
+					_ = wfpCall(procFwpmEngineClose0, "FwpmEngineClose0", newSess)
+					err = retryErr
+				}
+			}
+		}
 	}
 
-	newIDs, appliedExeCount, err := g.replaceFiltersLocked(exePaths, cfg.AllowLAN, cfg.AllowCIDRs, tunLUID, tunUp)
 	if err != nil {
-		// Reopen session once on stale RPC handle before reporting error.
-		g.closeSessionLocked()
-		if reErr := g.ensureSessionLocked(); reErr == nil {
-			newIDs, appliedExeCount, err = g.replaceFiltersLocked(exePaths, cfg.AllowLAN, cfg.AllowCIDRs, tunLUID, tunUp)
+		// Preserve previously armed state if our existing session still holds committed filters.
+		stillArmed := g.session != 0 && len(g.filterIDs) > 0
+		protectedCount := appliedExeCount
+		if stillArmed && g.status.ProtectedCount > 0 {
+			protectedCount = g.status.ProtectedCount
 		}
-	}
-	if err != nil {
 		g.status = AIGuardStatus{
 			Enabled:        true,
-			Armed:          false,
+			Armed:          stillArmed,
 			Mode:           AIGuardModeError,
 			Backend:        "wfp",
-			ProtectedCount: appliedExeCount,
+			ProtectedCount: protectedCount,
 			TunAlias:       tunAlias,
 			TunLUID:        tunLUID,
 			LastError:      err.Error(),
@@ -457,24 +487,28 @@ func (g *windowsAIGuard) Sync(cfg AIGuardConfig, coreRunning bool) AIGuardStatus
 	return g.status
 }
 
-func (g *windowsAIGuard) replaceFiltersLocked(
+func replaceFiltersOnSession(
+	session uintptr,
+	providerGUID windows.GUID,
+	sublayerGUID windows.GUID,
+	existingFilterIDs []uint64,
 	exePaths []string,
 	allowLAN bool,
 	allowCIDRs []string,
 	tunLUID uint64,
 	tunUp bool,
 ) ([]uint64, int, error) {
-	if err := wfpCall(procFwpmTransactionBegin0, "FwpmTransactionBegin0", g.session, 0); err != nil {
+	if err := wfpCall(procFwpmTransactionBegin0, "FwpmTransactionBegin0", session, 0); err != nil {
 		return nil, 0, err
 	}
 	abort := func(cause error) ([]uint64, int, error) {
-		_ = wfpCall(procFwpmTransactionAbort0, "FwpmTransactionAbort0", g.session)
+		_ = wfpCall(procFwpmTransactionAbort0, "FwpmTransactionAbort0", session)
 		return nil, 0, cause
 	}
 
 	// Delete previous filters inside the same atomic transaction (zero leak window).
-	for _, id := range g.filterIDs {
-		r1, _, _ := syscall.SyscallN(procFwpmFilterDeleteById0.Addr(), g.session, uintptr(id))
+	for _, id := range existingFilterIDs {
+		r1, _, _ := syscall.SyscallN(procFwpmFilterDeleteById0.Addr(), session, uintptr(id))
 		if r1 != 0 && uint32(r1) != wfpErrFilterNotFound {
 			return abort(fmt.Errorf("wfp FwpmFilterDeleteById0(%d) failed: 0x%08x", id, uint32(r1)))
 		}
@@ -488,9 +522,9 @@ func (g *windowsAIGuard) replaceFiltersLocked(
 		}
 		f := wfpFilter0{
 			displayData: disp,
-			providerKey: &g.providerGUID,
+			providerKey: &providerGUID,
 			layerKey:    layer,
-			subLayerKey: g.sublayerGUID,
+			subLayerKey: sublayerGUID,
 			weight:      wfpWeight(weight),
 			action:      wfpAction0{actionType: actionType},
 		}
@@ -501,7 +535,7 @@ func (g *windowsAIGuard) replaceFiltersLocked(
 		var fid uint64
 		err = wfpCall(
 			procFwpmFilterAdd0, "FwpmFilterAdd0",
-			g.session,
+			session,
 			uintptr(unsafe.Pointer(&f)),
 			0,
 			uintptr(unsafe.Pointer(&fid)),
@@ -631,7 +665,7 @@ func (g *windowsAIGuard) replaceFiltersLocked(
 		appliedApps++
 	}
 
-	if err := wfpCall(procFwpmTransactionCommit0, "FwpmTransactionCommit0", g.session); err != nil {
+	if err := wfpCall(procFwpmTransactionCommit0, "FwpmTransactionCommit0", session); err != nil {
 		return abort(err)
 	}
 	return nextIDs, appliedApps, nil
