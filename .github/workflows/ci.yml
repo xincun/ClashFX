@@ -108,7 +108,10 @@ jobs:
           cache: true
 
       - name: Build core, daemon & fetch WebView2 SDK
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           python windows/scripts/build-core.py --arch ${{ matrix.arch }}
           python windows/scripts/build-daemon.py --arch ${{ matrix.arch }}
           python windows/scripts/fetch-webview2-sdk.py
@@ -116,4 +119,6 @@ jobs:
       - name: Configure & Build clashfx-ui (${{ matrix.arch }})
         shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/build-ui.ps1 -TargetArch ${{ matrix.arch }} -QtArm64Root "$env:QT_ROOT_DIR" -QtX64Root "$env:QT_ROOT_DIR"
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          & windows/scripts/build-ui.ps1 -TargetArch ${{ matrix.arch }} -QtArm64Root "$env:QT_ROOT_DIR" -QtX64Root "$env:QT_ROOT_DIR"

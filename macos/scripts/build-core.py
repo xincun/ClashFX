@@ -2,6 +2,7 @@
 """Build Universal (arm64 + x86_64) stock upstream Mihomo core for macOS."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -13,12 +14,18 @@ BUILD_BIN = REPO_ROOT / "macos/build/bin"
 
 def resolve_mihomo() -> tuple[Path, str]:
     out = subprocess.check_output(
-        ["go", "list", "-m", "-f", "{{.Dir}}\t{{.Version}}", "github.com/metacubex/mihomo"],
+        ["go", "mod", "download", "-json", "github.com/metacubex/mihomo"],
         cwd=CORE_ENGINE_DIR,
         text=True,
-    ).strip()
-    mod_dir, ver = out.split("\t", 1)
-    return Path(mod_dir), ver
+    )
+    info = json.loads(out)
+    if info.get("Error"):
+        raise RuntimeError(f"Failed to download github.com/metacubex/mihomo: {info['Error']}")
+    mod_dir = Path(info.get("Dir") or "")
+    ver = str(info.get("Version") or "").strip()
+    if not mod_dir.is_dir() or not ver:
+        raise RuntimeError(f"Failed to resolve github.com/metacubex/mihomo module: {info!r}")
+    return mod_dir, ver
 
 
 def main() -> int:

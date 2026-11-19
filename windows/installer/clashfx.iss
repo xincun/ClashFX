@@ -48,6 +48,8 @@ chinesesimplified.AdditionalShortcuts=附加快捷方式:
 english.AdditionalShortcuts=Additional shortcuts:
 chinesesimplified.RegisterServiceMsg=正在注册 ClashFX 提权 TUN 系统服务...
 english.RegisterServiceMsg=Registering ClashFX privileged TUN service...
+chinesesimplified.ServiceInstallFailedMsg=ClashFX 提权 TUN 系统服务安装失败 (退出码 %1)。普通系统代理模式仍可使用，您可稍后在「偏好设置」中重试安装服务。
+english.ServiceInstallFailedMsg=Failed to register ClashFX privileged TUN service (exit code %1). Standard System Proxy mode still works, and you can retry installing the service later in Preferences.
 chinesesimplified.InstallWebView2Msg=正在安装 Microsoft Edge WebView2 运行时...
 english.InstallWebView2Msg=Installing Microsoft Edge WebView2 Runtime...
 chinesesimplified.LaunchAppDesc=立即启动 ClashFX
@@ -83,12 +85,9 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{tmp}\MicrosoftEdgeWebView2Setup.exe"; Parameters: "/silent /install"; StatusMsg: "{cm:InstallWebView2Msg}"; Flags: runhidden waituntilterminated; Check: NeedsWebView2Runtime
-Filename: "{app}\clashfx-service.exe"; Parameters: "install"; StatusMsg: "{cm:RegisterServiceMsg}"; Flags: runhidden waituntilterminated
 Filename: "{app}\clashfx-ui.exe"; Description: "{cm:LaunchAppDesc}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
-Filename: "{app}\clashfx-ui.exe"; Parameters: "--quit-uninstall"; RunOnceId: "QuitClashFXUI"; Flags: runhidden waituntilterminated skipifdoesntexist
-Filename: "{app}\clashfx-daemon.exe"; Parameters: "-cleanup-uninstall"; RunOnceId: "CleanupClashFXDaemon"; Flags: runhidden waituntilterminated skipifdoesntexist
 Filename: "{app}\clashfx-service.exe"; Parameters: "uninstall"; RunOnceId: "UninstallClashFXService"; Flags: runhidden waituntilterminated skipifdoesntexist
 
 [UninstallDelete]
@@ -97,6 +96,13 @@ Type: files; Name: "{app}\mihomo_core.bundled.exe"
 Type: files; Name: "{app}\mihomo_core.exe.bak*"
 
 [Code]
+const
+  INTERNET_OPTION_REFRESH = 37;
+  INTERNET_OPTION_SETTINGS_CHANGED = 39;
+
+function InternetSetOptionW(hInternet: LongWord; dwOption: DWORD; lpBuffer: LongWord; dwBufferLength: DWORD): BOOL;
+  external 'InternetSetOptionW@wininet.dll stdcall';
+
 function HasValidWebView2Version(RootKey: Integer; const Subkey: String): Boolean;
 var
   Pv: String;
@@ -155,22 +161,31 @@ begin
       end;
     end;
   end;
+  InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0);
+  InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0);
 end;
 
 procedure StopRunningClashFXProcesses(ForUninstall: Boolean);
 var
   ResultCode: Integer;
+  SysDir: String;
+  TaskkillExe: String;
+  ScExe: String;
   ExistingUI: String;
   ExistingDaemon: String;
   ExistingSvc: String;
 begin
+  SysDir := ExpandConstant('{sys}');
+  TaskkillExe := ExpandConstant('{sys}\taskkill.exe');
+  ScExe := ExpandConstant('{sys}\sc.exe');
+
   ExistingUI := ExpandConstant('{app}\clashfx-ui.exe');
   if FileExists(ExistingUI) then
   begin
     if ForUninstall then
-      Exec(ExistingUI, '--quit-uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+      Exec(ExistingUI, '--quit-uninstall', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode)
     else
-      Exec(ExistingUI, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      Exec(ExistingUI, '--quit', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Sleep(400);
   end;
 
@@ -179,21 +194,28 @@ begin
     ExistingDaemon := ExpandConstant('{app}\clashfx-daemon.exe');
     if FileExists(ExistingDaemon) then
     begin
-      Exec(ExistingDaemon, '-cleanup-uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      Exec(ExistingDaemon, '-cleanup-uninstall', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;
   end;
+
+  // Clear SCM recovery actions before stopping/terminating so SCM will not respawn clashfx-service.exe
+  Exec(ScExe, 'failure ClashFXService reset= 0 actions= ""', SysDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
   ExistingSvc := ExpandConstant('{app}\clashfx-service.exe');
   if FileExists(ExistingSvc) then
   begin
-    Exec(ExistingSvc, 'stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // clashfx-service.exe stop sends SERVICE_CONTROL_STOP and waits up to 8s for STOPPED
+    Exec(ExistingSvc, 'stop', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+  if Exec(ScExe, 'stop ClashFXService', SysDir, SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+  begin
+    Sleep(800);
   end;
 
-  Exec('taskkill.exe', '/F /IM clashfx-ui.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('taskkill.exe', '/F /IM clashfx-daemon.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('sc.exe', 'stop ClashFXService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('taskkill.exe', '/F /IM clashfx-service.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('taskkill.exe', '/F /IM mihomo_core.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(TaskkillExe, '/F /IM clashfx-ui.exe /T', SysDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(TaskkillExe, '/F /IM clashfx-daemon.exe /T', SysDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(TaskkillExe, '/F /IM clashfx-service.exe /T', SysDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(TaskkillExe, '/F /IM mihomo_core.exe /T', SysDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if ForUninstall then
   begin
     CleanupLoopbackProxyInRegistry();
@@ -207,15 +229,45 @@ begin
   Result := '';
 end;
 
-function InitializeUninstall(): Boolean;
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  SvcExe: String;
+  BundledCore: String;
+  ActiveCore: String;
+  ResultCode: Integer;
 begin
-  StopRunningClashFXProcesses(True);
-  Result := True;
+  if CurStep = ssPostInstall then
+  begin
+    SvcExe := ExpandConstant('{app}\clashfx-service.exe');
+    if FileExists(SvcExe) then
+    begin
+      if (not Exec(SvcExe, 'install', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode)) or (ResultCode <> 0) then
+      begin
+        Log(Format('clashfx-service.exe install failed (ResultCode=%d)', [ResultCode]));
+        if not WizardSilent then
+          SuppressibleMsgBox(
+            FmtMessage(CustomMessage('ServiceInstallFailedMsg'), [IntToStr(ResultCode)]),
+            mbError, MB_OK, IDOK);
+      end;
+    end;
+
+    ActiveCore := ExpandConstant('{app}\mihomo_core.exe');
+    BundledCore := ExpandConstant('{app}\mihomo_core.bundled.exe');
+    if (not FileExists(ActiveCore)) and FileExists(BundledCore) then
+    begin
+      if not RenameFile(BundledCore, ActiveCore) then
+        CopyFile(BundledCore, ActiveCore, False);
+    end;
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  if CurUninstallStep = usPostUninstall then
+  if CurUninstallStep = usUninstall then
+  begin
+    StopRunningClashFXProcesses(True);
+  end
+  else if CurUninstallStep = usPostUninstall then
   begin
     CleanupLoopbackProxyInRegistry();
   end;

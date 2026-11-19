@@ -62,7 +62,7 @@ if (Test-Path $LocalWv2) { Remove-Item -Recurse -Force $LocalWv2 }
 Copy-Item -Recurse -Force (Join-Path $RepoRoot "windows\ui-qt") $LocalSrc
 Copy-Item -Recurse -Force $WebView2SdkDir $LocalWv2
 
-$isArmHost = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64")
+$isArmHost = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") -or ($env:PROCESSOR_ARCHITEW6432 -eq "ARM64")
 $Targets = @(
     @{
         Arch          = "arm64"

@@ -129,20 +129,15 @@ jobs:
                       candidates.append((p[0], p[1], p[2]))
 
               rels_proc = subprocess.run(
-                  ["gh", "api", "--paginate", f"repos/{repo}/releases?per_page=100"],
+                  ["gh", "api", "--paginate", f"repos/{repo}/releases?per_page=100", "--jq", ".[].tag_name"],
                   capture_output=True,
                   text=True,
               )
               if rels_proc.returncode == 0 and rels_proc.stdout.strip():
-                  try:
-                      rels = json.loads(rels_proc.stdout)
-                  except json.JSONDecodeError:
-                      rels = []
-                  if isinstance(rels, list):
-                      for rel in rels:
-                          p = parse_ver(str(rel.get("tag_name") or ""))
-                          if p:
-                              candidates.append((p[0], p[1], p[2]))
+                  for tag_line in rels_proc.stdout.splitlines():
+                      p = parse_ver(tag_line.strip())
+                      if p:
+                          candidates.append((p[0], p[1], p[2]))
 
               highest = max(candidates)
               version = f"{highest[0]}.{highest[1]}.{highest[2] + 1}"
@@ -280,7 +275,10 @@ jobs:
           cache: true
 
       - name: Build mihomo_core, daemon, service & fetch WebView2 SDK
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           python windows/scripts/build-core.py --arch ${{ matrix.arch }}
           python windows/scripts/build-daemon.py --arch ${{ matrix.arch }} --version "${{ needs.prepare.outputs.version }}"
           python windows/scripts/fetch-webview2-sdk.py
@@ -288,8 +286,10 @@ jobs:
       - name: Build clashfx-ui & package installers (${{ matrix.arch }})
         shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/build-ui.ps1 -TargetArch ${{ matrix.arch }} -QtArm64Root "$env:QT_ROOT_DIR" -QtX64Root "$env:QT_ROOT_DIR"
-          powershell -NoProfile -ExecutionPolicy Bypass -File windows/scripts/package-release.ps1 -TargetArch ${{ matrix.arch }} -AppVersion "${{ needs.prepare.outputs.version }}"
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          & windows/scripts/build-ui.ps1 -TargetArch ${{ matrix.arch }} -QtArm64Root "$env:QT_ROOT_DIR" -QtX64Root "$env:QT_ROOT_DIR"
+          & windows/scripts/package-release.ps1 -TargetArch ${{ matrix.arch }} -AppVersion "${{ needs.prepare.outputs.version }}"
 
       - name: Upload Windows ${{ matrix.arch }} release artifacts
         uses: actions/upload-artifact@v4

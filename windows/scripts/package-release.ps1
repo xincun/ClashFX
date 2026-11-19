@@ -28,17 +28,38 @@ function Find-Iscc {
     return $null
 }
 
+$ExpectedInnoSha256 = "F3C42116542C4CC57263C5BA6C4FEABFC49FE771F2F98A79D2F7628B8762723B"
+
+function Test-Sha256 {
+    param([string]$FilePath, [string]$ExpectedHash)
+    if (-not (Test-Path $FilePath)) { return $false }
+    $actual = (Get-FileHash -Path $FilePath -Algorithm SHA256).Hash.ToUpperInvariant()
+    return ($actual -eq $ExpectedHash.ToUpperInvariant())
+}
+
+function Test-MicrosoftSignedBinary {
+    param([string]$FilePath)
+    if (-not (Test-Path $FilePath)) { return $false }
+    $sig = Get-AuthenticodeSignature -FilePath $FilePath
+    return ($sig.Status -eq 'Valid' -and $sig.SignerCertificate -and ($sig.SignerCertificate.Subject -match 'CN=Microsoft Corporation'))
+}
+
 $IsccExe = Find-Iscc
 if (-not $IsccExe) {
     Write-Host "=== [Package] Installing Inno Setup 6.4.3 silently ==="
     $cachedInstaller = Join-Path $RepoRoot "windows\build\.cache\innosetup-6.4.3.exe"
     $innoSetupTmp = "C:\Temp\innosetup-6.4.3.exe"
     New-Item -ItemType Directory -Force -Path "C:\Temp" | Out-Null
-    if (Test-Path $cachedInstaller) {
+    if ((Test-Path $cachedInstaller) -and (Test-Sha256 -FilePath $cachedInstaller -ExpectedHash $ExpectedInnoSha256)) {
         Copy-Item -Force $cachedInstaller $innoSetupTmp
     } else {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe" -OutFile $innoSetupTmp -UseBasicParsing
+    }
+    if (-not (Test-Sha256 -FilePath $innoSetupTmp -ExpectedHash $ExpectedInnoSha256)) {
+        $actualHash = (Get-FileHash -Path $innoSetupTmp -Algorithm SHA256).Hash
+        Remove-Item -Force $innoSetupTmp -ErrorAction SilentlyContinue
+        throw "SHA256 mismatch for innosetup-6.4.3.exe: expected $ExpectedInnoSha256, got $actualHash"
     }
     $innoLog = "C:\Temp\inno-install.log"
     Remove-Item -Force $innoLog -ErrorAction SilentlyContinue
@@ -62,14 +83,28 @@ $CacheDir = Join-Path $RepoRoot "windows\build\.cache"
 New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
 
 $Wv2Bootstrapper = Join-Path $CacheDir "MicrosoftEdgeWebView2Setup.exe"
-if (-not (Test-Path $Wv2Bootstrapper) -or (Get-Item $Wv2Bootstrapper).Length -lt 100KB) {
+$needDownloadWv2 = $true
+if ((Test-Path $Wv2Bootstrapper) -and (Get-Item $Wv2Bootstrapper).Length -ge 100KB) {
+    if (Test-MicrosoftSignedBinary -FilePath $Wv2Bootstrapper) {
+        $needDownloadWv2 = $false
+    } else {
+        Write-Warning "Cached MicrosoftEdgeWebView2Setup.exe failed Authenticode verification; re-downloading..."
+        Remove-Item -Force $Wv2Bootstrapper -ErrorAction SilentlyContinue
+    }
+}
+if ($needDownloadWv2) {
     Write-Host "=== [Package] Downloading MicrosoftEdgeWebView2Setup.exe bootstrapper ==="
     $wv2Tmp = "C:\Temp\MicrosoftEdgeWebView2Setup.exe.tmp"
     New-Item -ItemType Directory -Force -Path "C:\Temp" | Out-Null
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $wv2Tmp -UseBasicParsing
     if ((Get-Item $wv2Tmp).Length -lt 100KB) {
+        Remove-Item -Force $wv2Tmp -ErrorAction SilentlyContinue
         throw "Downloaded MicrosoftEdgeWebView2Setup.exe looks invalid/too small"
+    }
+    if (-not (Test-MicrosoftSignedBinary -FilePath $wv2Tmp)) {
+        Remove-Item -Force $wv2Tmp -ErrorAction SilentlyContinue
+        throw "Downloaded MicrosoftEdgeWebView2Setup.exe failed Microsoft Authenticode signature verification"
     }
     Move-Item -Force $wv2Tmp $Wv2Bootstrapper
 }

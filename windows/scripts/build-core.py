@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import json
 import os
 import pathlib
 import shutil
@@ -48,17 +49,20 @@ WINTUN_ZIP_MEMBER_BY_ARCH = {
 
 def resolve_upstream_mihomo() -> tuple[pathlib.Path, str]:
     out = subprocess.check_output(
-        ["go", "list", "-m", "-f", "{{.Dir}}\t{{.Version}}", "github.com/metacubex/mihomo"],
+        ["go", "mod", "download", "-json", "github.com/metacubex/mihomo"],
         cwd=CORE_ENGINE_ROOT,
         text=True,
-    ).strip()
-    parts = out.split("\t")
-    if len(parts) != 2 or not parts[0]:
-        raise RuntimeError(f"Failed to resolve upstream github.com/metacubex/mihomo module: {out!r}")
-    mod_dir = pathlib.Path(parts[0])
+    )
+    info = json.loads(out)
+    if info.get("Error"):
+        raise RuntimeError(f"Failed to download upstream github.com/metacubex/mihomo: {info['Error']}")
+    mod_dir = pathlib.Path(info.get("Dir") or "")
+    version = str(info.get("Version") or "").strip()
+    if not mod_dir.is_dir() or not version:
+        raise RuntimeError(f"Failed to resolve upstream github.com/metacubex/mihomo module: {info!r}")
     if not (mod_dir / "main.go").is_file():
         raise RuntimeError(f"Upstream Mihomo module directory missing main.go: {mod_dir}")
-    return mod_dir, parts[1]
+    return mod_dir, version
 
 
 def sha256_file(path: pathlib.Path) -> str:
