@@ -237,6 +237,7 @@ export function renderAiLockPage(root, handlers) {
       </div>
       <div class="row-flex">
         <span class="pill">${t(`共 ${candidates.length} 个独立节点`, `${candidates.length} candidates`)}</span>
+        <button type="button" class="btn btn-sm" id="ai-edit-private-direct">${ICONS.rules} ${t('编辑内网直连名单 (.list)', 'Edit Intranet Direct (.list)')}</button>
         <button type="button" class="btn btn-sm" id="ai-edit-rules">${ICONS.rules} ${t('编辑 clashfx-ai-lock 域名表', 'Edit AI Lock Domains (.list)')}</button>
       </div>
     </div>
@@ -269,6 +270,10 @@ export function renderAiLockPage(root, handlers) {
     }
   });
 
+  root.querySelector('#ai-edit-private-direct')?.addEventListener('click', () => {
+    store.preferredRuleProvider = 'clashfx-private-direct';
+    handlers.go(2, 2);
+  });
   root.querySelector('#ai-edit-rules')?.addEventListener('click', () => {
     store.preferredRuleProvider = 'clashfx-ai-lock';
     handlers.go(2, 2);

@@ -71,7 +71,7 @@ func SetFileClassicalRuleProvider(root map[string]any, name, relPath string) {
 
 func IsEditableBuiltinRuleset(providerName string) bool {
 	switch strings.TrimSpace(providerName) {
-	case AILockRuleProviderName, CNAppsRuleProviderName:
+	case AILockRuleProviderName, PrivateDirectRuleProviderName, CNAppsRuleProviderName:
 		return true
 	default:
 		return false
@@ -116,11 +116,35 @@ func DefaultBuiltinRulesetText(providerName string) (string, bool) {
 	switch strings.TrimSpace(providerName) {
 	case AILockRuleProviderName:
 		return DefaultAILockRulesetText(), true
+	case PrivateDirectRuleProviderName:
+		return DefaultPrivateDirectRulesetText(), true
 	case CNAppsRuleProviderName:
 		return DefaultCNAppsRulesetText(), true
 	default:
 		return "", false
 	}
+}
+
+func DefaultPrivateDirectRulesetText() string {
+	var b strings.Builder
+	b.WriteString("# ClashFX 内网与私有直连规则集 (clashfx-private-direct.list)\n")
+	b.WriteString("# 格式说明：每行写一条无目标策略的 Classical 规则（无需写 ,DIRECT），顶层优先直连（高于 AI 锁定）。\n")
+	b.WriteString("# 本文件中的域名会自动同步到 dns.fake-ip-filter（跳过 Fake-IP）与 dns.nameserver-policy（走系统/企业 DNS）。\n")
+	b.WriteString("# 可按需自由增删公司内网域名或网段（如 DOMAIN-SUFFIX,dingtalk.test 或 IP-CIDR,30.0.0.0/8,no-resolve），保存后自动重载生效。\n\n")
+	b.WriteString("# --- 回环与私有网段 (no-resolve) ---\n")
+	for _, cidr := range PrivateIPCIDRs {
+		b.WriteString("IP-CIDR," + cidr + ",no-resolve\n")
+	}
+	for _, cidr := range PrivateIPv6CIDRs {
+		b.WriteString("IP-CIDR6," + cidr + ",no-resolve\n")
+	}
+	b.WriteString("\n# --- 私有 / 局域网 / 内网域名后缀 ---\n")
+	b.WriteString("DOMAIN,localhost\n")
+	for _, suffix := range PrivateDomainSuffixes {
+		b.WriteString("DOMAIN-SUFFIX," + suffix + "\n")
+	}
+	b.WriteString("DOMAIN-REGEX," + DotlessHostnameRegex + "\n")
+	return b.String()
 }
 
 func DefaultAILockRulesetText() string {
@@ -153,16 +177,17 @@ func DefaultCNAppsRulesetText() string {
 	return b.String()
 }
 
-// EnsureBuiltinRulesetFiles creates ruleset/clashfx-ai-lock.list and
-// ruleset/clashfx-cn-apps-direct.list inside cfgDir (or clashfx-rulesets/ if
-// the legacy ruleset/ directory is not writable by the current user),
-// seeding from any readable legacy file and preserving user edits on disk.
+// EnsureBuiltinRulesetFiles creates ruleset/clashfx-ai-lock.list,
+// ruleset/clashfx-private-direct.list, and ruleset/clashfx-cn-apps-direct.list
+// inside cfgDir (or clashfx-rulesets/ if the legacy ruleset/ directory is not
+// writable by the current user), seeding from any readable legacy file and
+// preserving user edits on disk.
 func EnsureBuiltinRulesetFiles(cfgDir string) error {
 	if strings.TrimSpace(cfgDir) == "" {
 		return nil
 	}
 	dirName := ResolveRulesetDirName(cfgDir)
-	for _, name := range []string{AILockRuleProviderName, CNAppsRuleProviderName} {
+	for _, name := range []string{AILockRuleProviderName, PrivateDirectRuleProviderName, CNAppsRuleProviderName} {
 		absPath := filepath.Join(cfgDir, dirName, strings.TrimSpace(name)+".list")
 		if _, err := os.Stat(absPath); err == nil {
 			continue
@@ -183,6 +208,121 @@ func EnsureBuiltinRulesetFiles(cfgDir string) error {
 		}
 	}
 	return nil
+}
+
+// ReadPrivateDirectRules loads and parses the user-editable clashfx-private-direct.list
+// ruleset on disk. If the file exists and parses cleanly (even if emptied by the user),
+// its exact rules are returned; DefaultPrivateDirectRulePayload is only used as fallback
+// when no readable ruleset file exists yet.
+func ReadPrivateDirectRules(cfgDir string) []string {
+	trimmed := strings.TrimSpace(cfgDir)
+	if trimmed != "" {
+		candidates := []string{
+			BuiltinRulesetAbsPath(trimmed, PrivateDirectRuleProviderName),
+			filepath.Join(trimmed, RulesetDirName, PrivateDirectRuleProviderName+".list"),
+		}
+		for _, p := range candidates {
+			raw, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			rules, pErr := ParseAndValidateClassicalRulesetText(string(raw))
+			if pErr == nil {
+				return rules
+			}
+			break
+		}
+	}
+	return DefaultPrivateDirectRulePayload()
+}
+
+// ExtractPrivateDirectDNSPatterns converts domain-based classical rules from
+// clashfx-private-direct.list into Mihomo DomainTrie patterns suitable for
+// dns.fake-ip-filter and dns.nameserver-policy.
+func ExtractPrivateDirectDNSPatterns(rules []string) []string {
+	seen := make(map[string]bool, len(rules))
+	var out []string
+	add := func(pat string) {
+		p := strings.TrimSpace(pat)
+		if p == "" {
+			return
+		}
+		key := strings.ToLower(p)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, p)
+	}
+	for _, line := range rules {
+		tp, rest, ok := strings.Cut(line, ",")
+		if !ok {
+			continue
+		}
+		tp = strings.ToUpper(strings.TrimSpace(tp))
+		payload := strings.TrimSpace(rest)
+		if payload == "" {
+			continue
+		}
+		switch tp {
+		case "DOMAIN":
+			host := strings.TrimRight(strings.SplitN(payload, ",", 2)[0], ".")
+			if host != "" && !strings.ContainsAny(host, " \t\r\n/:") && !strings.Contains(host, "..") {
+				add(host)
+			}
+		case "DOMAIN-SUFFIX":
+			suf := strings.Trim(strings.SplitN(payload, ",", 2)[0], ".")
+			if suf != "" && !strings.ContainsAny(suf, " \t\r\n/:*") && !strings.Contains(suf, "..") {
+				add("+." + suf)
+			}
+		case "DOMAIN-WILDCARD":
+			wc := strings.TrimRight(strings.SplitN(payload, ",", 2)[0], ".")
+			if wc == "" || strings.ContainsAny(wc, " \t\r\n/:") || strings.Contains(wc, "..") {
+				continue
+			}
+			if strings.HasPrefix(wc, "*.") {
+				suffix := strings.TrimLeft(strings.TrimPrefix(wc, "*."), ".")
+				if suffix != "" && !strings.Contains(suffix, "*") {
+					add("+." + suffix)
+					continue
+				}
+			}
+			add(wc)
+		case "DOMAIN-REGEX":
+			if payload == DotlessHostnameRegex {
+				add("*")
+			}
+		}
+	}
+	return out
+}
+
+// ExtractPrivateDirectCIDRs extracts IPv4/IPv6 CIDR prefixes from clashfx-private-direct.list
+// so OS-level AI Guard firewalls (WFP/PF) stay consistent with user-configured intranet subnets.
+func ExtractPrivateDirectCIDRs(rules []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, line := range rules {
+		tp, rest, ok := strings.Cut(line, ",")
+		if !ok {
+			continue
+		}
+		tp = strings.ToUpper(strings.TrimSpace(tp))
+		if tp != "IP-CIDR" && tp != "IP-CIDR6" {
+			continue
+		}
+		cidrStr := strings.TrimSpace(strings.SplitN(rest, ",", 2)[0])
+		pfx, err := netip.ParsePrefix(cidrStr)
+		if err != nil {
+			continue
+		}
+		norm := pfx.Masked().String()
+		if !seen[norm] {
+			seen[norm] = true
+			out = append(out, norm)
+		}
+	}
+	return out
 }
 
 func (s *Store) BuiltinRulesetPath(providerName string) string {

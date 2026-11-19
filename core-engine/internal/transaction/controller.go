@@ -20,6 +20,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var captivePortalFakeIPFilter = []string{
+	"+.msftconnecttest.com",
+	"+.msftncsi.com",
+	"dns.msftncsi.com",
+	"captive.apple.com",
+}
+
+var captivePortalSystemDNSPolicyKeys = []string{
+	"captive.apple.com",
+	"+.msftconnecttest.com",
+	"+.msftncsi.com",
+}
+
 var defaultOSExtraFakeIPFilter = []string{
 	"time.apple.com",
 	"time-ios.apple.com",
@@ -36,43 +49,6 @@ var defaultOSExtraFakeIPFilter = []string{
 	"+.srv.nintendo.net",
 	"+.stun.playstation.net",
 	"xbox.*.microsoft.com",
-}
-
-func mandatoryPrivateAndCaptiveFakeIPFilter() []string {
-	out := make([]string, 0, len(profile.PrivateDomainSuffixes)+5)
-	out = append(out, "*")
-	for _, suffix := range profile.PrivateDomainSuffixes {
-		out = append(out, "+."+suffix)
-	}
-	out = append(out,
-		"+.msftconnecttest.com",
-		"+.msftncsi.com",
-		"dns.msftncsi.com",
-		"captive.apple.com",
-	)
-	return out
-}
-
-func defaultFakeIPFilter() []string {
-	mandatory := mandatoryPrivateAndCaptiveFakeIPFilter()
-	out := make([]string, 0, len(mandatory)+len(defaultOSExtraFakeIPFilter))
-	out = append(out, mandatory...)
-	out = append(out, defaultOSExtraFakeIPFilter...)
-	return out
-}
-
-func mandatorySystemDNSPolicyKeys() []string {
-	out := make([]string, 0, len(profile.PrivateDomainSuffixes)+4)
-	out = append(out, "*")
-	for _, suffix := range profile.PrivateDomainSuffixes {
-		out = append(out, "+."+suffix)
-	}
-	out = append(out,
-		"captive.apple.com",
-		"+.msftconnecttest.com",
-		"+.msftncsi.com",
-	)
-	return out
 }
 
 // TransformHook mutates the candidate runtime YAML map before validation (e.g.
@@ -265,16 +241,19 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 		}
 	}
 
-	// 2. Apply runtime port, controller, DNS, and TUN policies
+	// 2. Ensure disk-backed editable built-in ruleset files exist BEFORE prepareRuntimeTopology
+	// so clashfx-private-direct.list drives dns.fake-ip-filter and dns.nameserver-policy dynamically.
+	if err := profile.EnsureBuiltinRulesetFiles(cfgDir); err != nil {
+		return prevState, err
+	}
+
+	// 3. Apply runtime port, controller, DNS, and TUN policies
 	state, err := c.prepareRuntimeTopology(root, settings)
 	if err != nil {
 		return prevState, err
 	}
 
-	// 3. Ensure disk-backed built-in ruleset files exist, then run registered feature hooks
-	if err := profile.EnsureBuiltinRulesetFiles(cfgDir); err != nil {
-		return prevState, err
-	}
+	// 4. Run registered feature hooks
 	for _, hook := range c.hooks {
 		if hook == nil {
 			continue
@@ -287,7 +266,7 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 	// ruleset directory (falls back to ./clashfx-rulesets when legacy ./ruleset
 	// is root-owned / non-writable on macOS).
 	if rpMap, ok := root["rule-providers"].(map[string]any); ok {
-		for _, name := range []string{profile.AILockRuleProviderName, profile.CNAppsRuleProviderName} {
+		for _, name := range []string{profile.AILockRuleProviderName, profile.PrivateDirectRuleProviderName, profile.CNAppsRuleProviderName} {
 			if entry, exists := rpMap[name].(map[string]any); exists {
 				entry["path"] = profile.BuiltinRulesetRelPathInDir(cfgDir, name)
 			}
@@ -484,6 +463,9 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 	profMap["store-selected"] = true
 	root["profile"] = profMap
 
+	cfgDir := c.store.ActiveConfigDir()
+	privateDirectRules := profile.ReadPrivateDirectRules(cfgDir)
+	privateDNSPatterns := profile.ExtractPrivateDirectDNSPatterns(privateDirectRules)
 	excludeCIDRs, excludeDomains := parseTunRouteExcludes(settings.TunRouteExcludes)
 
 	// DNS + TUN configuration
@@ -522,14 +504,14 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 			filterMode, _ := dnsMap["fake-ip-filter-mode"].(string)
 			filterMode = strings.ToLower(strings.TrimSpace(filterMode))
 			if filterMode == "" || filterMode == "blacklist" {
-				var additions []string
-				if dnsMap["fake-ip-filter"] == nil {
-					additions = defaultFakeIPFilter()
-				} else {
-					additions = mandatoryPrivateAndCaptiveFakeIPFilter()
-				}
+				additions := make([]string, 0, len(privateDNSPatterns)+len(excludeDomains)+len(captivePortalFakeIPFilter)+len(defaultOSExtraFakeIPFilter))
+				additions = append(additions, privateDNSPatterns...)
 				for _, d := range excludeDomains {
 					additions = append(additions, d.dnsPattern)
+				}
+				additions = append(additions, captivePortalFakeIPFilter...)
+				if dnsMap["fake-ip-filter"] == nil {
+					additions = append(additions, defaultOSExtraFakeIPFilter...)
 				}
 				dnsMap["fake-ip-filter"] = mergeUniqueStringsFold(dnsMap["fake-ip-filter"], additions)
 			}
@@ -548,7 +530,12 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 				policyMap = map[string]any{}
 			}
 		}
-		for _, k := range mandatorySystemDNSPolicyKeys() {
+		for _, k := range captivePortalSystemDNSPolicyKeys {
+			if !hasMapKeyFold(policyMap, k) {
+				policyMap[k] = "system"
+			}
+		}
+		for _, k := range privateDNSPatterns {
 			if !hasMapKeyFold(policyMap, k) {
 				policyMap[k] = "system"
 			}
@@ -565,8 +552,20 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		root["dns"] = dnsMap
 	}
 
-	privateDirectPayload := buildPrivateDirectPayload(excludeCIDRs, excludeDomains)
-	profile.SetInlineClassicalRuleProvider(root, profile.PrivateDirectRuleProviderName, privateDirectPayload)
+	// Register editable file-backed clashfx-private-direct.list (plus optional inline
+	// clashfx-tun-excludes when the user configured settings.TunRouteExcludes).
+	profile.SetFileClassicalRuleProvider(
+		root,
+		profile.PrivateDirectRuleProviderName,
+		profile.BuiltinRulesetRelPathInDir(cfgDir, profile.PrivateDirectRuleProviderName),
+	)
+	leadingPrivateRules := []string{
+		"RULE-SET," + profile.PrivateDirectRuleProviderName + ",DIRECT",
+	}
+	if tunExcludesPayload := buildTunExcludesPayload(excludeCIDRs, excludeDomains); len(tunExcludesPayload) > 0 {
+		profile.SetInlineClassicalRuleProvider(root, profile.TunExcludesRuleProviderName, tunExcludesPayload)
+		leadingPrivateRules = append(leadingPrivateRules, "RULE-SET,"+profile.TunExcludesRuleProviderName+",DIRECT")
+	}
 
 	captiveDirectRules := []string{
 		"DOMAIN,captive.apple.com,DIRECT",
@@ -620,22 +619,19 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 			}, captiveDirectRules...)
 		}
 		PrependUniqueRules(root, tunCaptiveRules)
-		// Keep mihomo_core loop guard and private/LAN/intranet direct rules at the top
-		// (ahead of AI Proxy Lock) so local/private domains never get Fake-IP or remote proxied.
+		// Keep mihomo_core loop guard and configurable private/LAN/intranet direct rules
+		// at the top (ahead of AI Proxy Lock) so intranet domains never get Fake-IP or remote proxied.
 		profile.SetInlineClassicalRuleProvider(root, profile.InternalDirectRuleProviderName, []string{
 			"PROCESS-NAME,mihomo_core.exe",
 			"PROCESS-NAME,mihomo_core",
 		})
-		PrependUniqueRules(root, []string{
+		PrependUniqueRules(root, append([]string{
 			"RULE-SET," + profile.InternalDirectRuleProviderName + ",DIRECT",
-			"RULE-SET," + profile.PrivateDirectRuleProviderName + ",DIRECT",
-		})
+		}, leadingPrivateRules...))
 	} else {
 		root["tun"] = map[string]any{"enable": false}
 		PrependUniqueRules(root, captiveDirectRules)
-		PrependUniqueRules(root, []string{
-			"RULE-SET," + profile.PrivateDirectRuleProviderName + ",DIRECT",
-		})
+		PrependUniqueRules(root, leadingPrivateRules)
 	}
 
 	// Strip any legacy custom recovery key; stock Mihomo persists selections via profile.store-selected + REST replay.
@@ -835,10 +831,12 @@ func normalizeExcludeDomain(raw string) (excludedDomainSpec, bool) {
 	}, true
 }
 
-func buildPrivateDirectPayload(excludeCIDRs []string, excludeDomains []excludedDomainSpec) []string {
-	base := profile.DefaultPrivateDirectRulePayload()
-	seen := make(map[string]bool, len(base)+len(excludeCIDRs)+len(excludeDomains))
-	out := make([]string, 0, len(base)+len(excludeCIDRs)+len(excludeDomains))
+func buildTunExcludesPayload(excludeCIDRs []string, excludeDomains []excludedDomainSpec) []string {
+	if len(excludeCIDRs) == 0 && len(excludeDomains) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(excludeCIDRs)+len(excludeDomains))
+	out := make([]string, 0, len(excludeCIDRs)+len(excludeDomains))
 	add := func(line string) {
 		key := strings.ToLower(strings.TrimSpace(line))
 		if key == "" || seen[key] {
@@ -846,9 +844,6 @@ func buildPrivateDirectPayload(excludeCIDRs []string, excludeDomains []excludedD
 		}
 		seen[key] = true
 		out = append(out, line)
-	}
-	for _, r := range base {
-		add(r)
 	}
 	for _, c := range excludeCIDRs {
 		if strings.Contains(c, ":") {

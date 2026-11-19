@@ -76,11 +76,13 @@ func TestRealMihomoCoreAILockRoutingAndFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Local mock UDP DNS server to prove conan.dingtalk.test bypasses Fake-IP and routes DIRECT!
+	// Local mock UDP DNS server to prove conan.dingtalk.test and dynamically added custom intranet
+	// domains bypass Fake-IP and route DIRECT!
 	mockDNSAddr, stopMockDNS := startLocalMockDNSServer(t, map[string][4]byte{
-		"conan.dingtalk.test": {127, 0, 0, 1},
-		"app.clashfx.local":   {127, 0, 0, 1},
-		"buildbox":            {127, 0, 0, 1},
+		"conan.dingtalk.test":  {127, 0, 0, 1},
+		"app.clashfx.local":    {127, 0, 0, 1},
+		"buildbox":             {127, 0, 0, 1},
+		"repo.custom-conan.biz": {127, 0, 0, 1},
 	})
 	defer stopMockDNS()
 
@@ -95,6 +97,7 @@ dns:
   nameserver-policy:
     "+.test": %s
     "+.local": %s
+    "+.custom-conan.biz": %s
     "*": %s
 proxies:
   - name: GeneralNode
@@ -111,7 +114,7 @@ proxy-groups:
     proxies: [GeneralNode, LockedAINode]
 rules:
   - MATCH,Proxy
-`, mockDNSAddr, mockDNSAddr, mockDNSAddr, mockDNSAddr, generalPort, lockedPort)
+`, mockDNSAddr, mockDNSAddr, mockDNSAddr, mockDNSAddr, mockDNSAddr, generalPort, lockedPort)
 
 	if err := profile.WriteFileAtomic(store.ProfilePath("config"), []byte(cfgYAML), 0600); err != nil {
 		t.Fatal(err)
@@ -180,6 +183,42 @@ rules:
 	privBody, privErr := fetchViaProxy(client, fmt.Sprintf("http://conan.dingtalk.test:%d/v1/conan", echoPort))
 	if privErr != nil || !strings.Contains(privBody, "via=DIRECT_LEAK") || directHits.Load() <= directBeforePriv {
 		t.Fatalf("expected conan.dingtalk.test to route DIRECT ahead of AI Lock, got body=%q err=%v", privBody, privErr)
+	}
+
+	// 1c. Dynamically reconfigure clashfx-private-direct.list: add a custom public-TLD intranet domain
+	// (DOMAIN-SUFFIX,custom-conan.biz) and remove DOMAIN-SUFFIX,test, then hot-reload via ctrl.Apply!
+	if beforeBizIP, qErr := queryUDPTypeA(dnsListenAddr, "repo.custom-conan.biz"); qErr != nil || !strings.HasPrefix(beforeBizIP, "198.18.") {
+		t.Fatalf("expected repo.custom-conan.biz to get Fake-IP before adding to clashfx-private-direct.list, got %q (err=%v)", beforeBizIP, qErr)
+	}
+	privListPath := store.BuiltinRulesetPath(profile.PrivateDirectRuleProviderName)
+	origPrivList, err := os.ReadFile(privListPath)
+	if err != nil {
+		t.Fatalf("read clashfx-private-direct.list: %v", err)
+	}
+	customPrivList := strings.ReplaceAll(string(origPrivList), "DOMAIN-SUFFIX,test\n", "") + "\nDOMAIN-SUFFIX,custom-conan.biz\n"
+	if err := profile.WriteFileAtomic(privListPath, []byte(customPrivList), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ctrl.Apply(context.Background(), false); err != nil {
+		t.Fatalf("hot-reload after editing clashfx-private-direct.list failed: %v", err)
+	}
+	if afterBizIP, qErr := queryUDPTypeA(dnsListenAddr, "repo.custom-conan.biz"); qErr != nil || afterBizIP != "127.0.0.1" {
+		t.Fatalf("expected custom-conan.biz to skip Fake-IP after adding to clashfx-private-direct.list, got %q (err=%v)", afterBizIP, qErr)
+	}
+	directBeforeBiz := directHits.Load()
+	bizBody, bizErr := fetchViaProxy(client, fmt.Sprintf("http://repo.custom-conan.biz:%d/v1/conan", echoPort))
+	if bizErr != nil || !strings.Contains(bizBody, "via=DIRECT_LEAK") || directHits.Load() <= directBeforeBiz {
+		t.Fatalf("expected repo.custom-conan.biz to route DIRECT after adding to clashfx-private-direct.list, got body=%q err=%v", bizBody, bizErr)
+	}
+	if removedTestIP, qErr := queryUDPTypeA(dnsListenAddr, "conan.dingtalk.test"); qErr != nil || !strings.HasPrefix(removedTestIP, "198.18.") {
+		t.Fatalf("expected removed DOMAIN-SUFFIX,test to no longer be hardcoded in fake-ip-filter, got %q (err=%v)", removedTestIP, qErr)
+	}
+	// Restore default clashfx-private-direct.list
+	if err := profile.WriteFileAtomic(privListPath, origPrivList, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ctrl.Apply(context.Background(), false); err != nil {
+		t.Fatalf("restore default clashfx-private-direct.list failed: %v", err)
 	}
 
 	// 2. Unrelated domain (github.com & perplexity.ai) is NOT captured initially -> follows MATCH,Proxy (GeneralNode)!

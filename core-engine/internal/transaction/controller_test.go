@@ -239,6 +239,8 @@ rules:
 		RuleProviders map[string]struct {
 			Type     string   `yaml:"type"`
 			Behavior string   `yaml:"behavior"`
+			Format   string   `yaml:"format"`
+			Path     string   `yaml:"path"`
 			Payload  []string `yaml:"payload"`
 		} `yaml:"rule-providers"`
 	}
@@ -246,8 +248,8 @@ rules:
 		t.Fatalf("unmarshal applied runtime YAML failed: %v", err)
 	}
 
-	// 1. Verify Fake-IP filter includes dotless "*", multi-level private TLDs (+.<tld>),
-	// and normalized TunRouteExcludes domains.
+	// 1. Verify Fake-IP filter dynamically reflects default clashfx-private-direct.list
+	// plus normalized TunRouteExcludes domains.
 	hasItem := func(list []string, want string) bool {
 		for _, v := range list {
 			if v == want {
@@ -276,7 +278,7 @@ rules:
 		}
 	}
 
-	// 2. Verify nameserver-policy routes dotless, private TLDs, and TunRouteExcludes domains to system DNS.
+	// 2. Verify nameserver-policy routes configured private domains and TunRouteExcludes domains to system DNS.
 	for _, want := range []string{
 		"*",
 		"+.test",
@@ -299,10 +301,12 @@ rules:
 		}
 	}
 
-	// 4. Verify rule ordering places clashfx-internal-direct and clashfx-private-direct BEFORE clashfx-ai-lock.
+	// 4. Verify rule ordering places clashfx-internal-direct, clashfx-private-direct,
+	// and clashfx-tun-excludes BEFORE clashfx-ai-lock.
 	wantLeading := []string{
 		"RULE-SET," + profile.InternalDirectRuleProviderName + ",DIRECT",
 		"RULE-SET," + profile.PrivateDirectRuleProviderName + ",DIRECT",
+		"RULE-SET," + profile.TunExcludesRuleProviderName + ",DIRECT",
 		"RULE-SET," + profile.AILockRuleProviderName + ",LockedUS",
 		"RULE-SET," + profile.AILockRuleProviderName + ",REJECT",
 	}
@@ -315,27 +319,80 @@ rules:
 		}
 	}
 
-	// 5. Verify clashfx-private-direct inline provider contains LAN CIDRs, private TLDs, dotless regex, and TunRouteExcludes.
+	// 5. Verify clashfx-private-direct is a user-editable file-backed ruleset, while
+	// clashfx-tun-excludes holds explicit TunRouteExcludes CIDRs & domains.
 	privProv := doc.RuleProviders[profile.PrivateDirectRuleProviderName]
-	if privProv.Type != "inline" || privProv.Behavior != "classical" {
-		t.Fatalf("unexpected %s provider definition: %+v", profile.PrivateDirectRuleProviderName, privProv)
+	if privProv.Type != "file" || privProv.Behavior != "classical" || privProv.Format != "text" || privProv.Path != "./ruleset/clashfx-private-direct.list" {
+		t.Fatalf("unexpected %s file provider definition: %+v", profile.PrivateDirectRuleProviderName, privProv)
+	}
+	exclProv := doc.RuleProviders[profile.TunExcludesRuleProviderName]
+	if exclProv.Type != "inline" || exclProv.Behavior != "classical" {
+		t.Fatalf("unexpected %s provider definition: %+v", profile.TunExcludesRuleProviderName, exclProv)
 	}
 	for _, wantRule := range []string{
-		"IP-CIDR,127.0.0.0/8,no-resolve",
-		"IP-CIDR,10.0.0.0/8,no-resolve",
-		"IP-CIDR,192.168.0.0/16,no-resolve",
 		"IP-CIDR,30.0.0.0/8,no-resolve",
 		"IP-CIDR,30.1.2.3/32,no-resolve",
-		"DOMAIN-SUFFIX,test",
-		"DOMAIN-SUFFIX,local",
-		"DOMAIN-SUFFIX,internal",
 		"DOMAIN-SUFFIX,alibaba-inc.com",
 		"DOMAIN,conan.custom.org",
-		"DOMAIN-REGEX," + profile.DotlessHostnameRegex,
 	} {
-		if !hasItem(privProv.Payload, wantRule) {
-			t.Fatalf("expected %q in %s payload, got %v", wantRule, profile.PrivateDirectRuleProviderName, privProv.Payload)
+		if !hasItem(exclProv.Payload, wantRule) {
+			t.Fatalf("expected %q in %s payload, got %v", wantRule, profile.TunExcludesRuleProviderName, exclProv.Payload)
 		}
+	}
+
+	// 5b. Verify domains are 100% user-configurable via clashfx-private-direct.list (NOT hardcoded!):
+	// removing DOMAIN-SUFFIX,test removes +.test from fake-ip-filter & nameserver-policy,
+	// while adding custom domains dynamically injects them into both.
+	privListPath := store.BuiltinRulesetPath(profile.PrivateDirectRuleProviderName)
+	customPrivateList := strings.Join([]string{
+		"# custom corporate intranet list",
+		"IP-CIDR,10.0.0.0/8,no-resolve",
+		"DOMAIN-SUFFIX,dingtalk.test",
+		"DOMAIN,conan.corp.net",
+		"DOMAIN-WILDCARD,*.dev.internal-corp.io",
+	}, "\n") + "\n"
+	if err := profile.WriteFileAtomic(privListPath, []byte(customPrivateList), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.TunRouteExcludes = ""
+		return nil
+	})
+	if _, err := ctrl.Apply(context.Background(), false); err != nil {
+		t.Fatalf("Apply with custom clashfx-private-direct.list failed: %v", err)
+	}
+	var customDoc struct {
+		DNS struct {
+			FakeIPFilter     []string          `yaml:"fake-ip-filter"`
+			NameserverPolicy map[string]string `yaml:"nameserver-policy"`
+		} `yaml:"dns"`
+		RuleProviders map[string]any `yaml:"rule-providers"`
+	}
+	if err := yaml.Unmarshal([]byte(applier.appliedData), &customDoc); err != nil {
+		t.Fatal(err)
+	}
+	for _, wantAdded := range []string{"+.dingtalk.test", "conan.corp.net", "+.dev.internal-corp.io"} {
+		if !hasItem(customDoc.DNS.FakeIPFilter, wantAdded) {
+			t.Fatalf("expected dynamically configured %q in dns.fake-ip-filter, got %v", wantAdded, customDoc.DNS.FakeIPFilter)
+		}
+		if got := customDoc.DNS.NameserverPolicy[wantAdded]; got != "system" {
+			t.Fatalf("expected dynamically configured dns.nameserver-policy[%q] = system, got %q", wantAdded, got)
+		}
+	}
+	for _, mustBeRemoved := range []string{"+.test", "+.local", "+.internal", "*"} {
+		if hasItem(customDoc.DNS.FakeIPFilter, mustBeRemoved) {
+			t.Fatalf("removed rule %q must NOT stay hardcoded in dns.fake-ip-filter: %v", mustBeRemoved, customDoc.DNS.FakeIPFilter)
+		}
+		if _, exists := customDoc.DNS.NameserverPolicy[mustBeRemoved]; exists {
+			t.Fatalf("removed rule %q must NOT stay hardcoded in dns.nameserver-policy: %v", mustBeRemoved, customDoc.DNS.NameserverPolicy)
+		}
+	}
+	if _, hasExcl := customDoc.RuleProviders[profile.TunExcludesRuleProviderName]; hasExcl {
+		t.Fatalf("expected %s omitted when TunRouteExcludes is empty", profile.TunExcludesRuleProviderName)
+	}
+	// Restore default clashfx-private-direct.list for subsequent sub-checks
+	if err := profile.WriteFileAtomic(privListPath, []byte(profile.DefaultPrivateDirectRulesetText()), 0600); err != nil {
+		t.Fatal(err)
 	}
 
 	// 6. Verify partial subscription fake-ip-filter + direct-nameserver + custom nameserver-policy preservation

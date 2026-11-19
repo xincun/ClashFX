@@ -453,6 +453,7 @@ function countListLines(rawText = '') {
 function sourceBadge(source = '') {
   const s = String(source).toLowerCase();
   if (s === 'system') return `<span class="pill pill-green">${t('系统守护', 'System')}</span>`;
+  if (s === 'private_direct') return `<span class="pill pill-green">${t('内网直连', 'Intranet Direct')}</span>`;
   if (s === 'ai_lock') return `<span class="pill pill-purple">${t('AI 锁定', 'AI Lock')}</span>`;
   if (s === 'cn_apps') return `<span class="pill pill-blue">${t('CN 直连', 'CN Direct')}</span>`;
   if (s === 'mixin') return `<span class="pill pill-amber">${t('自定义分流', 'Custom Routing')}</span>`;
@@ -676,6 +677,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
             <select class="select select-sm" id="eff-source" style="width:160px;">
               <option value="all" ${rulesState.effSource === 'all' ? 'selected' : ''}>${t('全部规则来源', 'All Sources')}</option>
               <option value="system" ${rulesState.effSource === 'system' ? 'selected' : ''}>${t('系统守护', 'System')}</option>
+              <option value="private_direct" ${rulesState.effSource === 'private_direct' ? 'selected' : ''}>${t('内网直连', 'Intranet Direct')}</option>
               <option value="ai_lock" ${rulesState.effSource === 'ai_lock' ? 'selected' : ''}>${t('AI 锁定', 'AI Lock')}</option>
               <option value="cn_apps" ${rulesState.effSource === 'cn_apps' ? 'selected' : ''}>${t('CN 直连', 'CN Direct')}</option>
               <option value="mixin" ${rulesState.effSource === 'mixin' ? 'selected' : ''}>${t('自定义分流', 'Custom Routing')}</option>

@@ -1625,3 +1625,109 @@ rules:
 		t.Fatalf("expected live core /version v1.19.34, got %q", verPayload.Version)
 	}
 }
+
+func TestPrivateDirectRulesetSaveResetAndDynamicDNSSync(t *testing.T) {
+	t.Setenv("CLASHFX_DISABLE_OS_SYSPROXY", "1")
+	t.Setenv("CLASHFX_DISABLE_LAUNCH_AGENT", "1")
+	t.Setenv("CLASHFX_DISABLE_LEGACY_PLIST_MIGRATION", "1")
+	t.Setenv("CLASHFX_DISABLE_PRIVILEGED_SERVICE", "1")
+
+	appData := t.TempDir()
+	binDir := t.TempDir()
+	coreName := "mihomo_core"
+	if runtime.GOOS == "windows" {
+		coreName += ".exe"
+	}
+	compileFakeDaemonCore(t, filepath.Join(binDir, coreName), "v1.19.24")
+
+	eng, err := NewEngine(Config{AppDataDir: appData, BinDir: binDir}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Shutdown()
+
+	_, _ = eng.store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.EnhancedMode = false
+		s.SystemProxyEnabled = false
+		s.SelectedProfile = "work"
+		return nil
+	})
+	workYAML := `mixed-port: 17910
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+proxies:
+  - name: NodeA
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [NodeA, DIRECT]
+rules:
+  - MATCH,Proxy
+`
+	if err := profile.WriteFileAtomic(eng.store.ProfilePath("work"), []byte(workYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appData, "subscriptions.json"), []byte(`[{"name":"work","url":"https://example.invalid/work"}]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.applyAndSync(context.Background(), false, false); err != nil {
+		t.Fatalf("initial applyAndSync failed: %v", err)
+	}
+
+	// 1. GetEffectiveRules must expose clashfx-private-direct as editable & resettable
+	view, err := eng.GetEffectiveRules(context.Background())
+	if err != nil {
+		t.Fatalf("GetEffectiveRules failed: %v", err)
+	}
+	privProv, ok := view.RuleProviders[profile.PrivateDirectRuleProviderName]
+	if !ok || !privProv.Editable || !privProv.CanReset || privProv.RuleCount == 0 {
+		t.Fatalf("expected editable clashfx-private-direct provider, got %+v (ok=%v)", privProv, ok)
+	}
+
+	// 2. Save custom clashfx-private-direct rules via SaveRuleProvider -> regenerates runtime DNS dynamically!
+	customContent := "# custom\nDOMAIN-SUFFIX,dingtalk.test\nDOMAIN,conan.corp.local\nIP-CIDR,30.0.0.0/8,no-resolve\n"
+	updatedView, err := eng.SaveRuleProvider(context.Background(), profile.PrivateDirectRuleProviderName, customContent)
+	if err != nil {
+		t.Fatalf("SaveRuleProvider(clashfx-private-direct) failed: %v", err)
+	}
+	if got := updatedView.RuleProviders[profile.PrivateDirectRuleProviderName].RuleCount; got != 3 {
+		t.Fatalf("expected 3 rules after custom save, got %d", got)
+	}
+	rtBytes, err := os.ReadFile(eng.ctrl.RuntimeConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rtText := string(rtBytes)
+	if !strings.Contains(rtText, "+.dingtalk.test") || !strings.Contains(rtText, "conan.corp.local") {
+		t.Fatalf("expected custom domains synced into .runtime-config.yaml DNS, got:\n%s", rtText)
+	}
+	if strings.Contains(rtText, "+.internal") {
+		t.Fatalf("removed default +.internal must not stay hardcoded in .runtime-config.yaml:\n%s", rtText)
+	}
+
+	// 3. Clearing clashfx-private-direct completely must be allowed and remove all private DNS entries
+	emptyView, err := eng.SaveRuleProvider(context.Background(), profile.PrivateDirectRuleProviderName, "# intentionally empty\n")
+	if err != nil {
+		t.Fatalf("SaveRuleProvider(empty clashfx-private-direct) failed: %v", err)
+	}
+	if got := emptyView.RuleProviders[profile.PrivateDirectRuleProviderName].RuleCount; got != 0 {
+		t.Fatalf("expected 0 rules after clearing, got %d", got)
+	}
+
+	// 4. ResetRuleProvider restores built-in defaults and syncs DNS back
+	resetView, err := eng.ResetRuleProvider(context.Background(), profile.PrivateDirectRuleProviderName)
+	if err != nil {
+		t.Fatalf("ResetRuleProvider(clashfx-private-direct) failed: %v", err)
+	}
+	if got := resetView.RuleProviders[profile.PrivateDirectRuleProviderName].RuleCount; got < 15 {
+		t.Fatalf("expected restored default ruleset count >= 15, got %d", got)
+	}
+	rtAfterReset, _ := os.ReadFile(eng.ctrl.RuntimeConfigPath())
+	if !strings.Contains(string(rtAfterReset), "+.test") {
+		t.Fatalf("expected +.test restored in .runtime-config.yaml after reset:\n%s", string(rtAfterReset))
+	}
+}

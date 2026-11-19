@@ -14,15 +14,15 @@ const (
 	RecoverySelectionsKey          = "x-clashfx-recovery-selections"
 	InternalDirectRuleProviderName = "clashfx-internal-direct"
 	PrivateDirectRuleProviderName  = "clashfx-private-direct"
+	TunExcludesRuleProviderName    = "clashfx-tun-excludes"
 	AILockRuleProviderName         = "clashfx-ai-lock"
 	CNAppsRuleProviderName         = "clashfx-cn-apps-direct"
 	ProxyTargetPlaceholder         = "PROXY"
 )
 
-// PrivateDomainSuffixes lists RFC 2606 / RFC 6761 / RFC 6762 / RFC 8375 / ICANN-reserved
-// and standard non-public intranet TLDs that cannot exist on the public Internet.
-// These domains must resolve via OS/system DNS (never Fake-IP or public DoH) and route DIRECT
-// even ahead of AI Proxy Lock process rules.
+// PrivateDomainSuffixes lists the default non-public intranet TLDs seeded into
+// ruleset/clashfx-private-direct.list on first launch. At runtime ClashFX reads
+// the user-editable clashfx-private-direct.list file rather than hardcoding these.
 var PrivateDomainSuffixes = []string{
 	"localhost",
 	"local",
@@ -31,8 +31,6 @@ var PrivateDomainSuffixes = []string{
 	"home.arpa",
 	"internal",
 	"test",
-	"invalid",
-	"example",
 	"corp",
 	"intranet",
 	"private",
@@ -418,6 +416,7 @@ func SystemGuardPrefixCount(rules []string) int {
 		trimmed := strings.TrimSpace(rules[idx])
 		if trimmed == "RULE-SET,"+InternalDirectRuleProviderName+",DIRECT" ||
 			trimmed == "RULE-SET,"+PrivateDirectRuleProviderName+",DIRECT" ||
+			trimmed == "RULE-SET,"+TunExcludesRuleProviderName+",DIRECT" ||
 			strings.HasPrefix(trimmed, "RULE-SET,"+AILockRuleProviderName+",") ||
 			trimmed == "PROCESS-NAME,mihomo_core.exe,DIRECT" ||
 			trimmed == "PROCESS-NAME,mihomo_core,DIRECT" {

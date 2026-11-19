@@ -623,6 +623,7 @@ func (e *Engine) syncAIGuard(force bool) {
 	cfgDir := e.store.ActiveConfigDir()
 	exes := ailock.DiscoverProtectedExecutables(cfgDir)
 	cidrs := extractCIDRsFromRouteExcludes(settings.TunRouteExcludes)
+	cidrs = append(cidrs, profile.ExtractPrivateDirectCIDRs(profile.ReadPrivateDirectRules(cfgDir))...)
 	cfg := service.AIGuardConfig{
 		Enabled:           true,
 		ConfigDir:         cfgDir,
@@ -2475,8 +2476,10 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 
 	classifySource := func(tp, payload, proxy string) string {
 		switch strings.TrimSpace(payload) {
-		case profile.InternalDirectRuleProviderName, profile.PrivateDirectRuleProviderName:
+		case profile.InternalDirectRuleProviderName:
 			return "system"
+		case profile.PrivateDirectRuleProviderName, profile.TunExcludesRuleProviderName:
+			return "private_direct"
 		case profile.AILockRuleProviderName:
 			return "ai_lock"
 		case profile.CNAppsRuleProviderName:
@@ -2518,7 +2521,7 @@ func (e *Engine) GetEffectiveRules(ctx context.Context) (EffectiveRulesView, err
 		}, true
 	}
 
-	for _, builtinName := range []string{profile.AILockRuleProviderName, profile.CNAppsRuleProviderName} {
+	for _, builtinName := range []string{profile.AILockRuleProviderName, profile.PrivateDirectRuleProviderName, profile.CNAppsRuleProviderName} {
 		if v, ok := loadBuiltinView(builtinName); ok {
 			out.RuleProviders[builtinName] = v
 		}
@@ -2740,7 +2743,7 @@ func (e *Engine) SaveRuleProvider(ctx context.Context, providerName, content str
 	if err != nil {
 		return EffectiveRulesView{}, err
 	}
-	if len(parsedRules) == 0 {
+	if len(parsedRules) == 0 && providerName != profile.PrivateDirectRuleProviderName {
 		if providerName == profile.AILockRuleProviderName {
 			return EffectiveRulesView{}, errors.New("AI 锁定规则集不能为空（至少保留一条匹配规则，否则 AI 锁定将失去保护）")
 		}
@@ -2759,6 +2762,28 @@ func (e *Engine) SaveRuleProvider(ctx context.Context, providerName, content str
 	}
 
 	rt := e.ctrl.LastState()
+	if providerName == profile.PrivateDirectRuleProviderName {
+		// clashfx-private-direct.list also drives dns.fake-ip-filter & dns.nameserver-policy,
+		// so regenerate & hot-reload runtime config atomically when core is running.
+		if rt.APIPort > 0 && e.IsCoreRunning() {
+			if _, applyErr := e.ctrl.Apply(ctx, false); applyErr != nil {
+				if prevErr == nil {
+					_ = profile.WriteFileAtomic(absPath, prevBytes, 0600)
+					_, _ = e.ctrl.Apply(ctx, false)
+				}
+				return EffectiveRulesView{}, applyErr
+			}
+		}
+		view, err := e.GetEffectiveRules(ctx)
+		if err != nil {
+			return EffectiveRulesView{}, err
+		}
+		if e.store.Settings().AILockEnabled {
+			go e.syncAIGuard(true)
+		}
+		return view, nil
+	}
+
 	mounted, err := e.refreshLiveRuleProvider(ctx, rt, providerName)
 	if err != nil {
 		if prevErr == nil {
@@ -2824,8 +2849,8 @@ func (e *Engine) SetRuleDisabled(ctx context.Context, indices []int, disabled bo
 		if !exists {
 			return EffectiveRulesView{}, fmt.Errorf("规则索引 #%d 已失效，请先刷新规则列表", idx+1)
 		}
-		if r.Source == "system" || strings.TrimSpace(r.Payload) == profile.InternalDirectRuleProviderName || strings.TrimSpace(r.Payload) == profile.PrivateDirectRuleProviderName {
-			return EffectiveRulesView{}, errors.New("系统守护规则 (clashfx-internal-direct / clashfx-private-direct) 不可禁用")
+		if r.Source == "system" || strings.TrimSpace(r.Payload) == profile.InternalDirectRuleProviderName {
+			return EffectiveRulesView{}, errors.New("系统防环回守护规则 (clashfx-internal-direct) 不可禁用")
 		}
 		patchMap[fmt.Sprintf("%d", idx)] = disabled
 		if strings.TrimSpace(r.Payload) == profile.AILockRuleProviderName {
