@@ -36,6 +36,7 @@ protected:
     void resizeEvent(QResizeEvent* event) override;
 
 private:
+    void cleanupWebView();
     void ensureInitialized();
     void syncBounds();
     void applyBackgroundColor();
@@ -49,6 +50,7 @@ private:
     bool themeDark_ = true;
     bool navigated_ = false;
     bool subframeScriptsInstalled_ = false;
+    unsigned long long initGeneration_ = 0;
     QString uiRootDir_;
 
 #ifdef Q_OS_WIN

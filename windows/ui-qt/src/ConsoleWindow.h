@@ -29,7 +29,7 @@ enum class ConsolePage {
 class ConsoleWindow final : public QMainWindow {
     Q_OBJECT
 public:
-    explicit ConsoleWindow(DaemonClient* client, QWidget* parent = nullptr);
+    explicit ConsoleWindow(DaemonClient* client, bool smokeMode = false, QWidget* parent = nullptr);
     ~ConsoleWindow() override;
 
     void setAllowClose(bool allow) { allowClose_ = allow; }
@@ -78,6 +78,7 @@ private:
     QLabel* fallbackLabel_ = nullptr;
 
     QTimer* telemetryTimer_ = nullptr;
+    QTimer* trafficReconnectTimer_ = nullptr;
     QNetworkReply* trafficReply_ = nullptr;
     QByteArray trafficBuffer_;
     qint64 lastUpRate_ = 0;
@@ -86,6 +87,7 @@ private:
     QString lastTrafficSecret_;
 
     bool allowClose_ = false;
+    bool smokeMode_ = false;
     bool connected_ = false;
     bool uiReady_ = false;
     bool telemetryConnections_ = false;

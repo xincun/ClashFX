@@ -125,6 +125,14 @@ WebView2Widget::WebView2Widget(QWidget* parent)
 }
 
 WebView2Widget::~WebView2Widget() {
+    cleanupWebView();
+}
+
+void WebView2Widget::cleanupWebView() {
+    ++initGeneration_;
+    initStarted_ = false;
+    navigated_ = false;
+    subframeScriptsInstalled_ = false;
 #ifdef Q_OS_WIN
     if (webview_ && webMessageTokenValue_ != 0) {
         EventRegistrationToken token{};
@@ -207,8 +215,7 @@ void WebView2Widget::reloadApp() {
 }
 
 void WebView2Widget::retryInitialize() {
-    initStarted_ = false;
-    navigated_ = false;
+    cleanupWebView();
     ensureInitialized();
 }
 
@@ -274,12 +281,13 @@ void WebView2Widget::ensureInitialized() {
     QDir().mkpath(userDataDir);
 
     QPointer<WebView2Widget> self(this);
+    const unsigned long long gen = initGeneration_;
     const std::wstring wDataDir = userDataDir.toStdWString();
 
     auto* envHandler = makeComHandler<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
                                       ICoreWebView2Environment*>(
-        [self, hwnd](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
-            if (!self) return S_OK;
+        [self, hwnd, gen](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
+            if (!self || self->initGeneration_ != gen) return S_OK;
             if (FAILED(hr) || !env) {
                 const QString msg = QStringLiteral("WebView2 environment creation failed (0x%1)")
                                         .arg(static_cast<quint32>(hr), 8, 16, QLatin1Char('0'));
@@ -289,14 +297,23 @@ void WebView2Widget::ensureInitialized() {
                 return S_OK;
             }
 
+            if (self->env_) {
+                self->env_->Release();
+                self->env_ = nullptr;
+            }
             env->AddRef();
             self->env_ = env;
 
             auto* ctrlHandler =
                 makeComHandler<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
                                ICoreWebView2Controller*>(
-                    [self](HRESULT ctrlHr, ICoreWebView2Controller* controller) -> HRESULT {
-                        if (!self) return S_OK;
+                    [self, gen](HRESULT ctrlHr, ICoreWebView2Controller* controller) -> HRESULT {
+                        if (!self || self->initGeneration_ != gen) {
+                            if (controller) {
+                                controller->Close();
+                            }
+                            return S_OK;
+                        }
                         if (FAILED(ctrlHr) || !controller) {
                             const QString msg = QStringLiteral("WebView2 controller creation failed (0x%1)")
                                                     .arg(static_cast<quint32>(ctrlHr), 8, 16, QLatin1Char('0'));
@@ -401,6 +418,13 @@ void WebView2Widget::ensureInitialized() {
                                        host != QLatin1String("127.0.0.1") &&
                                        host != QLatin1String("localhost");
                             };
+                            auto isAllowedMainFrameUrl = [](const QUrl& url) {
+                                if (!url.isValid()) return false;
+                                const QString scheme = url.scheme().toLower();
+                                if (scheme == QLatin1String("about")) return true;
+                                if (scheme != QLatin1String("http") && scheme != QLatin1String("https")) return false;
+                                return url.host().toLower() == QLatin1String("app.clashfx.local");
+                            };
 
                             EventRegistrationToken newWinToken{};
                             auto* newWinHandler = makeComEventHandler<
@@ -409,12 +433,12 @@ void WebView2Widget::ensureInitialized() {
                                 ICoreWebView2NewWindowRequestedEventArgs*>(
                                 [self, isExternalBrowserUrl](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
                                     if (!self || !args) return S_OK;
+                                    args->put_Handled(TRUE);
                                     LPWSTR rawUri = nullptr;
                                     if (SUCCEEDED(args->get_Uri(&rawUri)) && rawUri) {
                                         const QUrl url(QString::fromWCharArray(rawUri));
                                         CoTaskMemFree(rawUri);
                                         if (isExternalBrowserUrl(url)) {
-                                            args->put_Handled(TRUE);
                                             QMetaObject::invokeMethod(self, [url]() {
                                                 QDesktopServices::openUrl(url);
                                             }, Qt::QueuedConnection);
@@ -432,18 +456,22 @@ void WebView2Widget::ensureInitialized() {
                                 ICoreWebView2NavigationStartingEventHandler,
                                 ICoreWebView2*,
                                 ICoreWebView2NavigationStartingEventArgs*>(
-                                [self, isExternalBrowserUrl](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                                [self, isExternalBrowserUrl, isAllowedMainFrameUrl](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
                                     if (!self || !args) return S_OK;
                                     LPWSTR rawUri = nullptr;
                                     if (SUCCEEDED(args->get_Uri(&rawUri)) && rawUri) {
                                         const QUrl url(QString::fromWCharArray(rawUri));
                                         CoTaskMemFree(rawUri);
-                                        if (isExternalBrowserUrl(url)) {
+                                        if (!isAllowedMainFrameUrl(url)) {
                                             args->put_Cancel(TRUE);
-                                            QMetaObject::invokeMethod(self, [url]() {
-                                                QDesktopServices::openUrl(url);
-                                            }, Qt::QueuedConnection);
+                                            if (isExternalBrowserUrl(url)) {
+                                                QMetaObject::invokeMethod(self, [url]() {
+                                                    QDesktopServices::openUrl(url);
+                                                }, Qt::QueuedConnection);
+                                            }
                                         }
+                                    } else {
+                                        args->put_Cancel(TRUE);
                                     }
                                     return S_OK;
                                 });
@@ -480,8 +508,8 @@ void WebView2Widget::ensureInitialized() {
     if (FAILED(hr)) {
         const QString msg = QStringLiteral("WebView2 runtime unavailable (0x%1). Please install Microsoft Edge WebView2 Runtime.")
                                 .arg(static_cast<quint32>(hr), 8, 16, QLatin1Char('0'));
-        QMetaObject::invokeMethod(this, [this, msg]() {
-            emit webViewFailed(msg);
+        QMetaObject::invokeMethod(this, [self, msg]() {
+            if (self) emit self->webViewFailed(msg);
         }, Qt::QueuedConnection);
     }
 #endif

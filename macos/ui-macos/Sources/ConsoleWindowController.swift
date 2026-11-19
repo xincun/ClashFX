@@ -236,6 +236,7 @@ private final class LoopbackHTTPServer {
 
 final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate, URLSessionDataDelegate {
     private let client: DaemonClient
+    private let smokeMode: Bool
     private let httpServer: LoopbackHTTPServer
     private let window: NSWindow
     private let webView: WKWebView
@@ -255,6 +256,7 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
     private var telemetryTimer: Timer?
     private var trafficSession: URLSession?
     private var trafficTask: URLSessionDataTask?
+    private var trafficReconnectWork: DispatchWorkItem?
     private var trafficBuffer = Data()
     private var activeTrafficPort = 0
     private var activeTrafficSecret = ""
@@ -265,8 +267,9 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
     var isVisible: Bool { window.isVisible }
     var onHotkeyRecordingChanged: ((Bool) -> Void)?
 
-    init(client: DaemonClient) {
+    init(client: DaemonClient, smokeMode: Bool = false) {
         self.client = client
+        self.smokeMode = smokeMode
         let webRoot = URL(fileURLWithPath: client.config.resourceDir).appendingPathComponent("web")
         self.httpServer = LoopbackHTTPServer(webRootURL: webRoot)
         let serverPort = self.httpServer.start()
@@ -429,21 +432,45 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
         guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel)
+            return
+        }
+        let scheme = url.scheme?.lowercased() ?? ""
+        if scheme == "about" {
             decisionHandler(.allow)
             return
         }
         let host = url.host?.lowercased() ?? ""
-        if url.scheme == "about" || host == "127.0.0.1" || host == "localhost" {
-            decisionHandler(.allow)
-            return
-        }
-        if navigationAction.targetFrame?.isMainFrame == true,
-           (url.scheme == "http" || url.scheme == "https") {
-            NSWorkspace.shared.open(url)
+        let port = url.port ?? 0
+        let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? false
+        let uiPort = Int(httpServer.port)
+
+        if isMainFrame {
+            if scheme == "http" && host == "127.0.0.1" && uiPort > 0 && port == uiPort {
+                decisionHandler(.allow)
+                return
+            }
+            if scheme == "http" || scheme == "https" {
+                NSWorkspace.shared.open(url)
+            }
             decisionHandler(.cancel)
             return
         }
-        decisionHandler(.allow)
+
+        let runtime = (snapshot["runtime"] as? [String: Any]) ?? [:]
+        let apiPort = (runtime["api_port"] as? Int) ?? 0
+        let isAllowedDashboardSubframe =
+            scheme == "http"
+            && (host == "127.0.0.1" || host == "localhost")
+            && ((apiPort > 0 && port == apiPort) || (uiPort > 0 && port == uiPort))
+        if isAllowedDashboardSubframe {
+            decisionHandler(.allow)
+            return
+        }
+        if navigationAction.navigationType == .linkActivated && (scheme == "http" || scheme == "https") {
+            NSWorkspace.shared.open(url)
+        }
+        decisionHandler(.cancel)
     }
 
     func webView(
@@ -528,6 +555,13 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
     // MARK: - WKScriptMessageHandler
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        let origin = message.frameInfo.securityOrigin
+        guard message.frameInfo.isMainFrame,
+              origin.protocol.lowercased() == "http",
+              origin.host.lowercased() == "127.0.0.1",
+              origin.port == Int(httpServer.port) else {
+            return
+        }
         guard let msg = message.body as? [String: Any],
               let type = msg["type"] as? String else {
             return
@@ -588,7 +622,8 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
     // MARK: - Bridge Helpers
 
     private func postJsonMessage(_ payload: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let jsonStr = String(data: data, encoding: .utf8) else {
             return
         }
@@ -617,6 +652,7 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
             "subTab": pendingSubTab,
             "maximized": window.isZoomed,
             "fullscreen": window.styleMask.contains(.fullScreen),
+            "smokeMode": smokeMode,
         ]
         if !pendingDiagNode.isEmpty {
             initMsg["diagNode"] = pendingDiagNode
@@ -640,12 +676,6 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
             : NSColor(calibratedRed: 245.0 / 255.0, green: 247.0 / 255.0, blue: 251.0 / 255.0, alpha: 1.0)
     }
 
-    private func persistSetting(key: String, value: Any) {
-        guard var settings = snapshot["settings"] as? [String: Any] else { return }
-        settings[key] = value
-        client.call(method: "update_settings", params: ["settings": settings])
-    }
-
     private func handleRpcMessage(_ msg: [String: Any]) {
         let id = msg["id"] ?? 0
         let method = (msg["method"] as? String) ?? ""
@@ -663,7 +693,7 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
             "upsert_subscription", "import_url_scheme", "update_geo_databases",
             "diagnose_node", "node_refresh_direct", "node_check_connectivity",
             "node_speed_test_start", "check_updates",
-            "upgrade_core", "restart_core",
+            "upgrade_core", "restart_core", "install_service",
             "set_enhanced_mode", "set_ai_lock", "reload_config", "update_settings",
         ]
         let allowUac = (params["allow_uac"] as? Bool) ?? false
@@ -924,6 +954,8 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
     }
 
     private func stopTrafficStream() {
+        trafficReconnectWork?.cancel()
+        trafficReconnectWork = nil
         trafficTask?.cancel()
         trafficTask = nil
         trafficSession?.invalidateAndCancel()
@@ -958,6 +990,23 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate, WKScriptMessage
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard session === trafficSession else { return }
         trafficTask = nil
+        trafficSession?.finishTasksAndInvalidate()
+        trafficSession = nil
+        activeTrafficPort = 0
+        activeTrafficSecret = ""
+        lastUpRate = 0
+        lastDownRate = 0
+        let runtime = (snapshot["runtime"] as? [String: Any]) ?? [:]
+        let coreRunning = (snapshot["core_running"] as? Bool) ?? false
+        let apiPort = (runtime["api_port"] as? Int) ?? 0
+        if window.isVisible && uiReady && connected && coreRunning && apiPort > 0 {
+            trafficReconnectWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                self?.syncTelemetryState()
+            }
+            trafficReconnectWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+        }
     }
 
     private func pollTelemetrySnapshot() {

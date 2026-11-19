@@ -57,7 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let client = DaemonClient(config: config)
         let showInitially = (!backgroundStart || smokeTestMs > 0) && startupCmd != "--quit" && startupCmd != "--quit-uninstall"
-        let console = ConsoleWindowController(client: client)
+        let console = ConsoleWindowController(client: client, smokeMode: smokeTestMs > 0)
         let tray = TrayController(
             client: client,
             consoleWindow: console,
@@ -380,12 +380,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func acquireSingleInstanceOrForward() -> Bool {
-        let runtimeDir = "/tmp/clashfx-\(getuid())"
-        try? FileManager.default.createDirectory(
-            atPath: runtimeDir,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
+        guard let runtimeDir = DaemonClient.ensurePrivateRuntimeDir() else {
+            return true
+        }
         let hash = pipeInstanceHash()
         let lockPath = (runtimeDir as NSString).appendingPathComponent("ui-\(hash).lock")
         let sockPath = (runtimeDir as NSString).appendingPathComponent("ui-\(hash).sock")
@@ -487,10 +484,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if errno == EINTR { continue }
                     break
                 }
+                var rcvTv = timeval(tv_sec: 2, tv_usec: 0)
+                _ = Darwin.setsockopt(connFd, SOL_SOCKET, SO_RCVTIMEO, &rcvTv, socklen_t(MemoryLayout<timeval>.size))
                 var collected = Data()
                 while collected.count < 16384 {
                     let n = Darwin.read(connFd, &buf, buf.count)
-                    if n <= 0 { break }
+                    if n < 0 {
+                        if errno == EINTR { continue }
+                        break
+                    }
+                    if n == 0 { break }
                     collected.append(contentsOf: buf[0..<n])
                     if collected.contains(0x0A) { break }
                 }

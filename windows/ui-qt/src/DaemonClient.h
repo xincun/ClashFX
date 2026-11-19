@@ -7,6 +7,7 @@
 #include <QList>
 #include <QLocalSocket>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QTimer>
 
@@ -31,13 +32,17 @@ public:
     static QString defaultServerName();
 
     void start();
-    void stopReconnect();
+    void stopReconnect(bool notifyQueued = false);
     bool sendQuitDaemonSync(bool forceRestoreProxy = false, int timeoutMs = 600, bool killAiClients = false);
 
     bool isConnected() const;
     QJsonObject snapshot() const { return snapshot_; }
 
     void call(const QString& method,
+              const QJsonObject& params = QJsonObject(),
+              RpcCallback callback = {});
+    void call(QObject* context,
+              const QString& method,
               const QJsonObject& params = QJsonObject(),
               RpcCallback callback = {});
 
@@ -60,14 +65,26 @@ private:
     struct PendingCall {
         QString method;
         RpcCallback callback;
+        bool hasContext = false;
+        QPointer<QObject> context;
     };
 
     struct QueuedCall {
         QString method;
         QJsonObject params;
         RpcCallback callback;
+        bool hasContext = false;
+        QPointer<QObject> context;
         qint64 queuedEpochMs = 0;
     };
+
+    static void invokeIfAlive(bool hasContext,
+                              const QPointer<QObject>& context,
+                              const RpcCallback& callback,
+                              bool ok,
+                              const QJsonValue& data,
+                              const QString& error,
+                              const QString& errorCode);
 
     void expireStaleQueuedCalls();
 

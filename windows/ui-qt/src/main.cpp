@@ -12,6 +12,7 @@
 #include <QLocalSocket>
 #include <QPalette>
 #include <QStyleFactory>
+#include <QThread>
 #include <QTimer>
 
 #ifdef Q_OS_WIN
@@ -199,6 +200,9 @@ int main(int argc, char* argv[]) {
         } else {
             uiServerName = QStringLiteral("ClashFXUI-") + clashfx::DaemonClient::sanitizedUsername();
         }
+        if (smokeTestMs > 0) {
+            uiServerName += QStringLiteral("-smoke-%1").arg(QCoreApplication::applicationPid());
+        }
     }
 
     QString forwardMsg = QStringLiteral("ACTIVATE");
@@ -208,21 +212,52 @@ int main(int argc, char* argv[]) {
         forwardMsg = startupCmd;
     }
 
+    const bool isQuitCmd = (startupCmd == QStringLiteral("CMD:--quit") ||
+                            startupCmd == QStringLiteral("CMD:--quit-uninstall"));
+
+#ifdef Q_OS_WIN
+    struct InstanceMutexGuard {
+        HANDLE handle = nullptr;
+        ~InstanceMutexGuard() {
+            if (handle) {
+                CloseHandle(handle);
+            }
+        }
+    } instanceMutex;
+
+    if (smokeTestMs <= 0 && !isQuitCmd) {
+        const std::wstring mutexName = (QStringLiteral("Local\\ClashFXInstance-") + uiServerName).toStdWString();
+        instanceMutex.handle = CreateMutexW(nullptr, FALSE, mutexName.c_str());
+        if (instanceMutex.handle && GetLastError() == ERROR_ALREADY_EXISTS) {
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                if (forwardToExistingInstance(uiServerName, forwardMsg)) {
+                    return 0;
+                }
+                QThread::msleep(150);
+            }
+            return 0;
+        }
+    }
+#endif
+
     if (smokeTestMs <= 0 && forwardToExistingInstance(uiServerName, forwardMsg)) {
         return 0;
     }
-    if (startupCmd == QStringLiteral("CMD:--quit") ||
-        startupCmd == QStringLiteral("CMD:--quit-uninstall")) {
+    if (isQuitCmd) {
         clashfx::DaemonClient tempClient(customDaemonPipe, customDataDir);
         tempClient.sendQuitDaemonSync(startupCmd == QStringLiteral("CMD:--quit-uninstall"), 600);
         return 0;
     }
 
     const bool showInitially = (!backgroundStart || smokeTestMs > 0);
-    auto* client = new clashfx::DaemonClient(customDaemonPipe, customDataDir, &app);
-    clashfx::TrayController controller(client, uiServerName, showInitially, smokeTestMs > 0, &app);
-    controller.startSingleInstanceServer();
-    client->start();
+    clashfx::DaemonClient client(customDaemonPipe, customDataDir);
+    clashfx::TrayController controller(&client, uiServerName, showInitially, smokeTestMs > 0);
+    if (!controller.startSingleInstanceServer() && smokeTestMs <= 0) {
+        if (forwardToExistingInstance(uiServerName, forwardMsg)) {
+            return 0;
+        }
+    }
+    client.start();
 
     if (smokeTestMs > 0 && controller.consoleWindow()) {
         controller.consoleWindow()->configureSmokeTest(smokeTestMs, smokeReportPath);

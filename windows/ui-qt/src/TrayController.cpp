@@ -153,7 +153,7 @@ TrayController::TrayController(DaemonClient* client,
     , uiServerName_(uiServerName)
     , smokeMode_(smokeMode) {
     hotkeys_ = new HotkeyManager(this);
-    consoleWindow_ = new ConsoleWindow(client_);
+    consoleWindow_ = new ConsoleWindow(client_, smokeMode_);
     netMgr_ = new QNetworkAccessManager(this);
     trafficReconnectTimer_ = new QTimer(this);
     trafficReconnectTimer_->setSingleShot(true);
@@ -372,7 +372,7 @@ void TrayController::onToggleSystemProxyHotkey() {
     const bool next = !settings.value(QStringLiteral("system_proxy_enabled")).toBool(false);
     QJsonObject p;
     p.insert(QStringLiteral("enabled"), next);
-    client_->call(QStringLiteral("set_system_proxy"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+    client_->call(this, QStringLiteral("set_system_proxy"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
         if (!ok) {
             trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
         }
@@ -395,7 +395,7 @@ void TrayController::onSwitchModeHotkey() {
 
     QJsonObject p;
     p.insert(QStringLiteral("mode"), next);
-    client_->call(QStringLiteral("set_outbound_mode"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+    client_->call(this, QStringLiteral("set_outbound_mode"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
         if (!ok) {
             trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
         }
@@ -453,7 +453,7 @@ void TrayController::handleConfigMutationResult(const QString& actionTitle,
                                                 const std::function<void()>& retryAction,
                                                 bool ok,
                                                 const QString& err) {
-    if (ok) {
+    if (ok || smokeMode_ || daemonQuitSent_) {
         return;
     }
     const QString localizedErr = I18n::translateBackendText(err);
@@ -476,9 +476,11 @@ void TrayController::handleConfigMutationResult(const QString& actionTitle,
             p.insert(QStringLiteral("enabled"), false);
             p.insert(QStringLiteral("target"), QString());
             p.insert(QStringLiteral("allow_uac"), false);
-            client_->call(QStringLiteral("set_ai_lock"), p, [this, actionTitle, retryAction](bool disOk, const QJsonValue&, const QString& disErr, const QString&) {
+            client_->call(this, QStringLiteral("set_ai_lock"), p, [this, actionTitle, retryAction](bool disOk, const QJsonValue&, const QString& disErr, const QString&) {
                 if (!disOk) {
-                    QMessageBox::warning(modalDialogParent(), actionTitle, I18n::translateBackendText(disErr));
+                    if (!smokeMode_ && !daemonQuitSent_) {
+                        QMessageBox::warning(modalDialogParent(), actionTitle, I18n::translateBackendText(disErr));
+                    }
                     return;
                 }
                 retryAction();
@@ -730,7 +732,7 @@ void TrayController::rebuildMenuContents() {
             if (!client_) return;
             QJsonObject p;
             p.insert(QStringLiteral("allow_uac"), true);
-            client_->call(QStringLiteral("restart_core"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+            client_->call(this, QStringLiteral("restart_core"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
                 if (!ok && trayIcon_) {
                     trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
                 }
@@ -796,7 +798,7 @@ void TrayController::rebuildMenuContents() {
         connect(act, &QAction::triggered, this, [this, targetMode]() {
             QJsonObject p;
             p.insert(QStringLiteral("mode"), targetMode);
-            client_->call(QStringLiteral("set_outbound_mode"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+            client_->call(this, QStringLiteral("set_outbound_mode"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
                 if (!ok) {
                     trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
                 }
@@ -853,7 +855,7 @@ void TrayController::rebuildMenuContents() {
         connect(benchGrpAct, &QAction::triggered, this, [this, gName]() {
             QJsonObject p;
             p.insert(QStringLiteral("group"), gName);
-            client_->call(QStringLiteral("benchmark_group"), p, [this, gName](bool ok, const QJsonValue&, const QString& err, const QString&) {
+            client_->call(this, QStringLiteral("benchmark_group"), p, [this, gName](bool ok, const QJsonValue&, const QString& err, const QString&) {
                 if (!ok) {
                     trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
                     return;
@@ -886,7 +888,7 @@ void TrayController::rebuildMenuContents() {
                     QJsonObject p;
                     p.insert(QStringLiteral("group"), gName);
                     p.insert(QStringLiteral("target"), itemName);
-                    client_->call(QStringLiteral("select_proxy"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+                    client_->call(this, QStringLiteral("select_proxy"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
                         if (!ok) {
                             trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
                         }
@@ -905,7 +907,7 @@ void TrayController::rebuildMenuContents() {
                     connect(autoAct, &QAction::triggered, this, [this, gName]() {
                         QJsonObject p;
                         p.insert(QStringLiteral("group"), gName);
-                        client_->call(QStringLiteral("restore_auto_selection"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+                        client_->call(this, QStringLiteral("restore_auto_selection"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
                             if (!ok) {
                                 trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
                             }
@@ -940,7 +942,7 @@ void TrayController::rebuildMenuContents() {
     connect(sysAct, &QAction::triggered, this, [this](bool checked) {
         QJsonObject p;
         p.insert(QStringLiteral("enabled"), checked);
-        client_->call(QStringLiteral("set_system_proxy"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        client_->call(this, QStringLiteral("set_system_proxy"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
             if (!ok) {
                 trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
             }
@@ -955,7 +957,7 @@ void TrayController::rebuildMenuContents() {
         QJsonObject p;
         p.insert(QStringLiteral("enabled"), checked);
         p.insert(QStringLiteral("allow_uac"), true);
-        client_->call(QStringLiteral("set_enhanced_mode"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        client_->call(this, QStringLiteral("set_enhanced_mode"), p, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
             if (!ok) {
                 trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
             }
@@ -965,7 +967,7 @@ void TrayController::rebuildMenuContents() {
     QAction* offAllAct = trayMenu_->addAction(L("关闭所有代理模式", "Turn Off All Proxy Modes"));
     offAllAct->setEnabled(connected_ && !aiLocked);
     connect(offAllAct, &QAction::triggered, this, [this]() {
-        client_->call(QStringLiteral("turn_off_all_proxies"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        client_->call(this, QStringLiteral("turn_off_all_proxies"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
             if (!ok) {
                 trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
             }
@@ -1003,13 +1005,13 @@ void TrayController::rebuildMenuContents() {
                 auto doSelect = [this, pName]() {
                     QJsonObject p;
                     p.insert(QStringLiteral("name"), pName);
-                    client_->call(QStringLiteral("select_profile"), p, [this, pName](bool ok, const QJsonValue&, const QString& err, const QString&) {
+                    client_->call(this, QStringLiteral("select_profile"), p, [this, pName](bool ok, const QJsonValue&, const QString& err, const QString&) {
                         handleConfigMutationResult(
                             L("切换配置", "Switch Profile"),
                             [this, pName]() {
                                 QJsonObject retryP;
                                 retryP.insert(QStringLiteral("name"), pName);
-                                client_->call(QStringLiteral("select_profile"), retryP);
+                                client_->call(this, QStringLiteral("select_profile"), retryP);
                             },
                             ok,
                             err);
@@ -1022,10 +1024,10 @@ void TrayController::rebuildMenuContents() {
     cfgMenu->addSeparator();
     cfgMenu->addAction(L("重载当前配置", "Reload Config"), this, [this]() {
         const QJsonObject p{{QStringLiteral("allow_uac"), true}};
-        client_->call(QStringLiteral("reload_config"), p, [this, p](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        client_->call(this, QStringLiteral("reload_config"), p, [this, p](bool ok, const QJsonValue&, const QString& err, const QString&) {
             handleConfigMutationResult(
                 L("重载当前配置", "Reload Config"),
-                [this, p]() { client_->call(QStringLiteral("reload_config"), p); },
+                [this, p]() { client_->call(this, QStringLiteral("reload_config"), p); },
                 ok,
                 err);
         });
@@ -1041,7 +1043,7 @@ void TrayController::rebuildMenuContents() {
     cfgMenu->addAction(L("更新 GEO 数据库 (MMDB / GeoSite)", "Update GEO Databases"), this, [this]() {
         trayIcon_->showMessage(QStringLiteral("ClashFX"),
                                L("正在后台下载更新 GEO 数据库…", "Updating GEO databases in background…"));
-        client_->call(QStringLiteral("update_geo_databases"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        client_->call(this, QStringLiteral("update_geo_databases"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
             trayIcon_->showMessage(
                 QStringLiteral("ClashFX"),
                 ok ? L("GEO 数据库更新完成并已热重载。", "GEO databases updated and hot-reloaded.")
@@ -1054,7 +1056,7 @@ void TrayController::rebuildMenuContents() {
     QAction* benchAllAct = trayMenu_->addAction(L("一键延迟测速", "Latency Speed Test"), this, [this]() {
         trayIcon_->showMessage(QStringLiteral("ClashFX"),
                                L("正在并发测试所有节点延迟…", "Testing latency across proxy nodes…"));
-        client_->call(QStringLiteral("benchmark_all"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+        client_->call(this, QStringLiteral("benchmark_all"), QJsonObject(), [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
             trayIcon_->showMessage(
                 QStringLiteral("ClashFX"),
                 ok ? L("全节点延迟测试已完成。", "Latency speed test finished.")
@@ -1165,12 +1167,12 @@ void TrayController::rebuildMenuContents() {
 }
 
 void TrayController::mutateSettingBool(const QString& key, bool value) {
-    if (!client_ || snapshot_.isEmpty()) return;
-    QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
+    if (!client_) return;
+    QJsonObject settings;
     settings.insert(key, value);
     QJsonObject params;
     params.insert(QStringLiteral("settings"), settings);
-    client_->call(QStringLiteral("update_settings"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+    client_->call(this, QStringLiteral("update_settings"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
         if (!ok) {
             trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
         }
@@ -1178,12 +1180,12 @@ void TrayController::mutateSettingBool(const QString& key, bool value) {
 }
 
 void TrayController::mutateSettingString(const QString& key, const QString& value) {
-    if (!client_ || snapshot_.isEmpty()) return;
-    QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
+    if (!client_) return;
+    QJsonObject settings;
     settings.insert(key, value);
     QJsonObject params;
     params.insert(QStringLiteral("settings"), settings);
-    client_->call(QStringLiteral("update_settings"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
+    client_->call(this, QStringLiteral("update_settings"), params, [this](bool ok, const QJsonValue&, const QString& err, const QString&) {
         if (!ok) {
             trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
         }
@@ -1194,7 +1196,7 @@ void TrayController::importSchemeUri(const QString& uri) {
     if (!client_ || uri.isEmpty()) return;
     QJsonObject params;
     params.insert(QStringLiteral("uri"), uri);
-    client_->call(QStringLiteral("import_url_scheme"), params, [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+    client_->call(this, QStringLiteral("import_url_scheme"), params, [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
         if (!ok) {
             trayIcon_->showMessage(QStringLiteral("ClashFX"),
                                    L("导入订阅链接失败: ", "Failed to import URI: ") + I18n::translateBackendText(err),
@@ -1204,14 +1206,14 @@ void TrayController::importSchemeUri(const QString& uri) {
         const QString name = data.toObject().value(QStringLiteral("name")).toString();
         trayIcon_->showMessage(QStringLiteral("ClashFX"),
                                L("已成功导入并激活配置: ", "Imported and activated profile: ") + name);
-        client_->call(QStringLiteral("get_state"));
+        client_->call(this, QStringLiteral("get_state"));
         openSubscriptionsDialog();
     });
 }
 
 void TrayController::copyDiagnosticInfo() {
     if (!client_) return;
-    client_->call(QStringLiteral("get_diagnostic_info"), QJsonObject(), [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+    client_->call(this, QStringLiteral("get_diagnostic_info"), QJsonObject(), [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
         if (!ok) {
             trayIcon_->showMessage(QStringLiteral("ClashFX"), I18n::translateBackendText(err), QSystemTrayIcon::Warning);
             return;
@@ -1224,8 +1226,9 @@ void TrayController::copyDiagnosticInfo() {
 }
 
 void TrayController::checkForUpdates() {
-    if (!client_) return;
-    client_->call(QStringLiteral("check_updates"), QJsonObject(), [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+    if (!client_ || smokeMode_) return;
+    client_->call(this, QStringLiteral("check_updates"), QJsonObject(), [this](bool ok, const QJsonValue& data, const QString& err, const QString&) {
+        if (smokeMode_ || daemonQuitSent_) return;
         if (!ok) {
             QMessageBox::warning(modalDialogParent(), L("检查更新", "Check for Updates"), I18n::translateBackendText(err));
             return;
@@ -1249,7 +1252,11 @@ void TrayController::checkForUpdates() {
             L("发现新版本 ", "New version available: ") + latest +
                 L("\n是否立即在浏览器打开下载页面？", "\nOpen download page in browser now?"));
         if (btn == QMessageBox::Yes && !url.isEmpty()) {
-            QDesktopServices::openUrl(QUrl(url));
+            const QUrl parsedUrl(url.trimmed());
+            const QString scheme = parsedUrl.scheme().toLower();
+            if (parsedUrl.isValid() && (scheme == QLatin1String("http") || scheme == QLatin1String("https"))) {
+                QDesktopServices::openUrl(parsedUrl);
+            }
         }
     });
 }
@@ -1336,20 +1343,23 @@ void TrayController::openSettingsDialog() {
 }
 
 void TrayController::requestInteractiveQuit() {
-    if (promptingQuit_) {
+    if (promptingQuit_ || daemonQuitSent_) {
         return;
     }
     const QJsonObject settings = snapshot_.value(QStringLiteral("settings")).toObject();
     const bool aiLocked = settings.value(QStringLiteral("claudeProxyLockEnabled")).toBool(false);
-    if (!aiLocked || !connected_ || !client_) {
+    if (!aiLocked || !connected_ || !client_ || smokeMode_) {
         quitAll(false, false);
         return;
     }
 
     promptingQuit_ = true;
-    client_->call(QStringLiteral("list_running_ai_clients"), QJsonObject(),
+    client_->call(this, QStringLiteral("list_running_ai_clients"), QJsonObject(),
                   [this](bool ok, const QJsonValue& data, const QString&, const QString&) {
-        promptingQuit_ = false;
+        if (daemonQuitSent_ || smokeMode_ || !connected_) {
+            promptingQuit_ = false;
+            return;
+        }
 
         QStringList names;
         if (ok && data.isObject()) {
@@ -1383,7 +1393,11 @@ void TrayController::requestInteractiveQuit() {
         box.setDefaultButton(closeAiBtn);
         box.setEscapeButton(cancelBtn);
         box.exec();
+        promptingQuit_ = false;
 
+        if (daemonQuitSent_) {
+            return;
+        }
         if (box.clickedButton() == closeAiBtn) {
             quitAll(false, true);
         } else if (box.clickedButton() == quitOnlyBtn) {

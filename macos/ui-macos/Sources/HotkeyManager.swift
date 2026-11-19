@@ -2,7 +2,7 @@ import Carbon
 import Foundation
 
 final class HotkeyManager {
-    private static var activeInstance: HotkeyManager?
+    private static weak var activeInstance: HotkeyManager?
 
     private var eventHandlerRef: EventHandlerRef?
     private var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]

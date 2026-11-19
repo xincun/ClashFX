@@ -138,8 +138,9 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
         let openChord = resolveOpenMainWindowChord(settings)
         let toggleChord = (hk["toggle_system_proxy"] as? String) ?? ""
         let modeChord = (hk["switch_outbound_mode"] as? String) ?? ""
+        var failedHotkeys: [String] = []
         if !smokeMode {
-            let failed = hotkeys.applyHotkeys(
+            failedHotkeys = hotkeys.applyHotkeys(
                 openMainWindow: openChord,
                 toggleSystemProxy: toggleChord,
                 switchOutboundMode: modeChord,
@@ -147,18 +148,18 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
                 onToggleSystemProxy: { [weak self] in self?.onToggleSystemProxyHotkey() },
                 onSwitchOutboundMode: { [weak self] in self?.onSwitchModeHotkey() }
             )
-            if !failed.isEmpty {
-                showAlert(
-                    title: "ClashFX",
-                    message: L("全局快捷键已被其他程序占用或格式无效: ", "Global hotkey unavailable or already in use: ")
-                        + failed.joined(separator: ", "),
-                    warning: true
-                )
-            }
         }
 
         consoleWindow.applySnapshot(connected: true, snapshot: snap)
         rebuildVisualsAndMenu()
+
+        if !smokeMode && !failedHotkeys.isEmpty {
+            let msg = L("全局快捷键已被其他程序占用或格式无效: ", "Global hotkey unavailable or already in use: ")
+                + failedHotkeys.joined(separator: ", ")
+            DispatchQueue.main.async { [weak self] in
+                self?.showAlert(title: "ClashFX", message: msg, warning: true)
+            }
+        }
 
         if !smokeMode {
             let coreRunning = (snap["core_running"] as? Bool) ?? false
@@ -890,7 +891,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
                 title: L("↻ 立即重启代理内核", "↻ Restart Proxy Core Now"),
                 enabled: true
             ) { [weak self] in
-                self?.client.call(method: "restart_core", params: ["allow_uac": true]) { ok, _, err, _ in
+                self?.client.call(method: "restart_core", params: ["allow_uac": true], timeoutSeconds: 120) { ok, _, err, _ in
                     if !ok {
                         self?.showAlert(title: "ClashFX", message: I18n.translateBackendText(err), warning: true)
                     }
@@ -983,7 +984,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
 
             let gSub = NSMenu()
             addItem(to: gSub, title: L("测速本组节点", "Benchmark Group"), enabled: connected && coreRunning) { [weak self] in
-                self?.client.call(method: "benchmark_group", params: ["group": gName], timeoutSeconds: 45)
+                self?.client.call(method: "benchmark_group", params: ["group": gName], timeoutSeconds: 120)
             }
             gSub.addItem(.separator())
 
@@ -1061,7 +1062,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
             }
         }
         addItem(to: trayMenu, title: L("增强模式 (TUN)", "Enhanced Mode (TUN)"), enabled: connected && !aiLocked, checked: enhanced) { [weak self] in
-            self?.client.call(method: "set_enhanced_mode", params: ["enabled": !enhanced, "allow_uac": true], timeoutSeconds: 45) { ok, _, err, _ in
+            self?.client.call(method: "set_enhanced_mode", params: ["enabled": !enhanced, "allow_uac": true], timeoutSeconds: 120) { ok, _, err, _ in
                 if !ok {
                     self?.showAlert(title: "ClashFX", message: I18n.translateBackendText(err), warning: true)
                 }
@@ -1129,7 +1130,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
             self?.openSubscriptionsDialog()
         }
         addItem(to: cfgSub, title: L("更新 GEO 数据库 (MMDB / GeoSite)", "Update GEO Databases")) { [weak self] in
-            self?.client.call(method: "update_geo_databases", timeoutSeconds: 60) { ok, _, err, _ in
+            self?.client.call(method: "update_geo_databases", timeoutSeconds: 120) { ok, _, err, _ in
                 self?.showAlert(
                     title: "ClashFX",
                     message: ok ? L("GEO 数据库更新完成并已热重载。", "GEO databases updated and hot-reloaded.")
@@ -1147,7 +1148,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
 
         // Speed test & Copy terminal command
         addItem(to: trayMenu, title: L("一键延迟测速", "Latency Speed Test"), enabled: connected && coreRunning) { [weak self] in
-            self?.client.call(method: "benchmark_all", timeoutSeconds: 60) { ok, _, err, _ in
+            self?.client.call(method: "benchmark_all", timeoutSeconds: 120) { ok, _, err, _ in
                 if !ok {
                     self?.showAlert(title: "ClashFX", message: I18n.translateBackendText(err), warning: true)
                 }
@@ -1303,9 +1304,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
     }
 
     private func mutateSetting(key: String, value: Any) {
-        guard var settings = snapshot["settings"] as? [String: Any] else { return }
-        settings[key] = value
-        client.call(method: "update_settings", params: ["settings": settings]) { [weak self] ok, _, err, _ in
+        client.call(method: "update_settings", params: ["settings": [key: value]], timeoutSeconds: 120) { [weak self] ok, _, err, _ in
             if !ok {
                 self?.showAlert(title: "ClashFX", message: I18n.translateBackendText(err), warning: true)
             }
@@ -1318,7 +1317,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
         ok: Bool,
         err: String
     ) {
-        if ok { return }
+        if ok || smokeMode { return }
         let localizedErr = I18n.translateBackendText(err)
         let settings = (snapshot["settings"] as? [String: Any]) ?? [:]
         let aiLocked = (settings["claudeProxyLockEnabled"] as? Bool) ?? false
@@ -1337,7 +1336,8 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
             if alert.runModal() == .alertFirstButtonReturn {
                 client.call(
                     method: "set_ai_lock",
-                    params: ["enabled": false, "target": "", "allow_uac": false]
+                    params: ["enabled": false, "target": "", "allow_uac": false],
+                    timeoutSeconds: 120
                 ) { [weak self] disOk, _, disErr, _ in
                     if !disOk {
                         self?.showAlert(title: actionTitle, message: I18n.translateBackendText(disErr), warning: true)
@@ -1393,6 +1393,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
                 return
             }
 
+            if smokeMode { return }
             let alert = NSAlert()
             alert.messageText = L("发现新版本", "Update Available")
             alert.informativeText = L("发现新版本 ", "New version available: ") + latest
@@ -1400,7 +1401,10 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
             alert.addButton(withTitle: L("打开下载页面", "Open Download Page"))
             alert.addButton(withTitle: L("取消", "Cancel"))
             NSApp.activate(ignoringOtherApps: true)
-            if alert.runModal() == .alertFirstButtonReturn, let url = URL(string: urlStr) {
+            if alert.runModal() == .alertFirstButtonReturn,
+               let url = URL(string: urlStr),
+               let scheme = url.scheme?.lowercased(),
+               scheme == "http" || scheme == "https" {
                 NSWorkspace.shared.open(url)
             }
         }
@@ -1418,6 +1422,7 @@ final class TrayController: NSObject, NSMenuDelegate, URLSessionDataDelegate {
     }
 
     private func showAlert(title: String, message: String, warning: Bool) {
+        guard !smokeMode else { return }
         let alert = NSAlert()
         alert.alertStyle = warning ? .warning : .informational
         alert.messageText = title

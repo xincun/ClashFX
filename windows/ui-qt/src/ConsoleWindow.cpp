@@ -68,10 +68,11 @@ int htCodeForEdge(const QString& edge) {
 
 } // namespace
 
-ConsoleWindow::ConsoleWindow(DaemonClient* client, QWidget* parent)
+ConsoleWindow::ConsoleWindow(DaemonClient* client, bool smokeMode, QWidget* parent)
     : QMainWindow(parent),
       client_(client),
-      netMgr_(new QNetworkAccessManager(this)) {
+      netMgr_(new QNetworkAccessManager(this)),
+      smokeMode_(smokeMode) {
     setObjectName(QStringLiteral("ClashConsoleWindow"));
     setWindowTitle(QStringLiteral("ClashFX"));
     setWindowIcon(TrayIconGenerator::appIcon());
@@ -137,6 +138,10 @@ ConsoleWindow::ConsoleWindow(DaemonClient* client, QWidget* parent)
     telemetryTimer_ = new QTimer(this);
     telemetryTimer_->setInterval(1500);
     connect(telemetryTimer_, &QTimer::timeout, this, &ConsoleWindow::pollTelemetrySnapshot);
+
+    trafficReconnectTimer_ = new QTimer(this);
+    trafficReconnectTimer_->setSingleShot(true);
+    connect(trafficReconnectTimer_, &QTimer::timeout, this, &ConsoleWindow::syncTelemetryState);
 
     restoreWindowGeometry();
     Win11Dwm::applyFramelessRoundedChrome(this, theme_ == QLatin1String("dark"));
@@ -312,6 +317,7 @@ void ConsoleWindow::pushInitPayload() {
         {QStringLiteral("subTab"), pendingSubTab_},
         {QStringLiteral("maximized"), isMaximized()},
         {QStringLiteral("fullscreen"), isFullScreen()},
+        {QStringLiteral("smokeMode"), smokeMode_ || smokeTestMs_ > 0},
     };
     if (!pendingDiagNode_.isEmpty()) {
         initMsg.insert(QStringLiteral("diagNode"), pendingDiagNode_);
@@ -373,11 +379,10 @@ void ConsoleWindow::onWebMessageReceived(const QJsonObject& msg) {
     }
 
     if (type == QLatin1String("telemetry_subscribe")) {
-        telemetryConnections_ = msg.value(QStringLiteral("include_connections")).toBool(false);
+        const bool enabled = msg.value(QStringLiteral("enabled")).toBool(false);
+        const bool includeConn = msg.value(QStringLiteral("include_connections")).toBool(false);
+        telemetryConnections_ = enabled && includeConn;
         syncTelemetryState();
-        if (msg.value(QStringLiteral("enabled")).toBool(true) && telemetryConnections_) {
-            pollTelemetrySnapshot();
-        }
         return;
     }
 
@@ -438,7 +443,7 @@ void ConsoleWindow::handleRpcMessage(const QJsonObject& msg) {
         return;
     }
 
-    client_->call(method, params, [this, id](bool ok, const QJsonValue& data, const QString& err, const QString& code) {
+    client_->call(this, method, params, [this, id](bool ok, const QJsonValue& data, const QString& err, const QString& code) {
         if (!uiReady_) return;
         webView_->postJsonMessage(QJsonObject{
             {QStringLiteral("type"), QStringLiteral("rpc_result")},
@@ -628,33 +633,6 @@ void ConsoleWindow::applyThemePreference(const QString& theme) {
 
 namespace {
 
-template <typename OnObj>
-void bindNdjsonStream(QObject* owner, QNetworkReply*& replySlot, QByteArray& buffer,
-                      QNetworkReply* reply, OnObj&& onObj) {
-    replySlot = reply;
-    QObject::connect(reply, &QNetworkReply::readyRead, owner, [reply, &replySlot, &buffer, onObj]() {
-        if (!reply || reply != replySlot) return;
-        buffer.append(reply->readAll());
-        while (true) {
-            const int nl = buffer.indexOf('\n');
-            if (nl < 0) break;
-            const QByteArray line = buffer.left(nl).trimmed();
-            buffer.remove(0, nl + 1);
-            if (line.isEmpty()) continue;
-            const QJsonDocument doc = QJsonDocument::fromJson(line);
-            if (doc.isObject()) {
-                onObj(doc.object());
-            }
-        }
-    });
-    QObject::connect(reply, &QNetworkReply::finished, owner, [&replySlot, reply]() {
-        if (replySlot == reply) {
-            replySlot = nullptr;
-        }
-        reply->deleteLater();
-    });
-}
-
 void abortNdjsonStream(QObject* owner, QNetworkReply*& replySlot, QByteArray& buffer) {
     if (replySlot) {
         replySlot->disconnect(owner);
@@ -710,21 +688,52 @@ void ConsoleWindow::startTrafficStream() {
         req.setRawHeader("Authorization", QByteArray("Bearer ") + secret.toUtf8());
     }
 
-    bindNdjsonStream(this, trafficReply_, trafficBuffer_, netMgr_->get(req),
-                     [this](const QJsonObject& obj) {
-                         lastUpRate_ = static_cast<qint64>(obj.value(QStringLiteral("up")).toDouble(0));
-                         lastDownRate_ = static_cast<qint64>(obj.value(QStringLiteral("down")).toDouble(0));
-                         if (uiReady_) {
-                             webView_->postJsonMessage(QJsonObject{
-                                 {QStringLiteral("type"), QStringLiteral("telemetry")},
-                                 {QStringLiteral("up"), lastUpRate_},
-                                 {QStringLiteral("down"), lastDownRate_},
-                             });
-                         }
-                     });
+    QNetworkReply* reply = netMgr_->get(req);
+    trafficReply_ = reply;
+    connect(reply, &QNetworkReply::readyRead, this, [this, reply]() {
+        if (!reply || reply != trafficReply_) return;
+        trafficBuffer_.append(reply->readAll());
+        while (true) {
+            const int nl = trafficBuffer_.indexOf('\n');
+            if (nl < 0) break;
+            const QByteArray line = trafficBuffer_.left(nl).trimmed();
+            trafficBuffer_.remove(0, nl + 1);
+            if (line.isEmpty()) continue;
+            const QJsonDocument doc = QJsonDocument::fromJson(line);
+            if (!doc.isObject()) continue;
+            const QJsonObject obj = doc.object();
+            lastUpRate_ = static_cast<qint64>(obj.value(QStringLiteral("up")).toDouble(0));
+            lastDownRate_ = static_cast<qint64>(obj.value(QStringLiteral("down")).toDouble(0));
+            if (uiReady_) {
+                webView_->postJsonMessage(QJsonObject{
+                    {QStringLiteral("type"), QStringLiteral("telemetry")},
+                    {QStringLiteral("up"), lastUpRate_},
+                    {QStringLiteral("down"), lastDownRate_},
+                });
+            }
+        }
+    });
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        if (trafficReply_ == reply) {
+            trafficReply_ = nullptr;
+            lastTrafficPort_ = 0;
+            lastTrafficSecret_.clear();
+            lastUpRate_ = 0;
+            lastDownRate_ = 0;
+            const bool coreRunning = snapshot_.value(QStringLiteral("core_running")).toBool(false);
+            const int curPort = snapshot_.value(QStringLiteral("runtime")).toObject().value(QStringLiteral("api_port")).toInt();
+            if (isVisible() && uiReady_ && connected_ && coreRunning && curPort > 0 && trafficReconnectTimer_) {
+                trafficReconnectTimer_->start(1500);
+            }
+        }
+        reply->deleteLater();
+    });
 }
 
 void ConsoleWindow::stopTrafficStream() {
+    if (trafficReconnectTimer_) {
+        trafficReconnectTimer_->stop();
+    }
     abortNdjsonStream(this, trafficReply_, trafficBuffer_);
     lastTrafficPort_ = 0;
     lastTrafficSecret_.clear();

@@ -80,13 +80,35 @@ final class DaemonClient {
         shouldReconnect = false
         running = false
         let fd = subscribeFd
-        subscribeFd = -1
-        stateLock.unlock()
-
         if fd >= 0 {
             Darwin.shutdown(fd, SHUT_RDWR)
-            Darwin.close(fd)
         }
+        stateLock.unlock()
+    }
+
+    static func ensurePrivateRuntimeDir() -> String? {
+        let runtimeDir = "/tmp/clashfx-\(getuid())"
+        var st = stat()
+        if Darwin.lstat(runtimeDir, &st) == 0 {
+            let isDir = (st.st_mode & S_IFMT) == S_IFDIR
+            guard isDir, st.st_uid == getuid() else {
+                return nil
+            }
+            _ = Darwin.chmod(runtimeDir, 0o700)
+            return runtimeDir
+        }
+        if Darwin.mkdir(runtimeDir, 0o700) != 0 && errno != EEXIST {
+            return nil
+        }
+        if Darwin.lstat(runtimeDir, &st) == 0 {
+            let isDir = (st.st_mode & S_IFMT) == S_IFDIR
+            guard isDir, st.st_uid == getuid() else {
+                return nil
+            }
+            _ = Darwin.chmod(runtimeDir, 0o700)
+            return runtimeDir
+        }
+        return nil
     }
 
     func call(
@@ -228,30 +250,35 @@ final class DaemonClient {
         proc.arguments = args
         proc.standardInput = FileHandle.nullDevice
 
-        let runtimeDir = "/tmp/clashfx-\(getuid())"
-        try? FileManager.default.createDirectory(
-            atPath: runtimeDir,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        let logPath = (runtimeDir as NSString).appendingPathComponent("daemon.log")
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath),
-           let size = attrs[.size] as? NSNumber,
-           size.int64Value > 2 * 1024 * 1024 {
-            try? Data().write(to: URL(fileURLWithPath: logPath), options: .atomic)
-        } else if !FileManager.default.fileExists(atPath: logPath) {
-            FileManager.default.createFile(
-                atPath: logPath,
-                contents: nil,
-                attributes: [.posixPermissions: 0o600]
-            )
+        if let runtimeDir = DaemonClient.ensurePrivateRuntimeDir() {
+            let logPath = (runtimeDir as NSString).appendingPathComponent("daemon.log")
+            var lst = stat()
+            let logSafe = (Darwin.lstat(logPath, &lst) != 0)
+                || ((lst.st_mode & S_IFMT) == S_IFREG && lst.st_uid == getuid())
+            if logSafe {
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath),
+                   let size = attrs[.size] as? NSNumber,
+                   size.int64Value > 2 * 1024 * 1024 {
+                    try? Data().write(to: URL(fileURLWithPath: logPath), options: .atomic)
+                } else if !FileManager.default.fileExists(atPath: logPath) {
+                    FileManager.default.createFile(
+                        atPath: logPath,
+                        contents: nil,
+                        attributes: [.posixPermissions: 0o600]
+                    )
+                }
+                let logHandle = FileHandle(forWritingAtPath: logPath)
+                _ = try? logHandle?.seekToEnd()
+                proc.standardOutput = logHandle ?? FileHandle.nullDevice
+                proc.standardError = logHandle ?? FileHandle.nullDevice
+                try? proc.run()
+                try? logHandle?.close()
+                return
+            }
         }
-        let logHandle = FileHandle(forWritingAtPath: logPath)
-        _ = try? logHandle?.seekToEnd()
-        proc.standardOutput = logHandle ?? FileHandle.nullDevice
-        proc.standardError = logHandle ?? FileHandle.nullDevice
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
         try? proc.run()
-        try? logHandle?.close()
     }
 
     private func writeAll(fd: Int32, data: Data) -> Bool {
@@ -299,7 +326,8 @@ final class DaemonClient {
             "method": method,
             "params": params,
         ]
-        guard var payload = try? JSONSerialization.data(withJSONObject: reqObj, options: []) else {
+        guard JSONSerialization.isValidJSONObject(reqObj),
+              var payload = try? JSONSerialization.data(withJSONObject: reqObj, options: []) else {
             return (false, nil, "Failed to serialize RPC request", "")
         }
         payload.append(0x0A)
