@@ -234,20 +234,28 @@ func (s *Store) activeConfigDirLocked() string {
 	return s.appDataDir
 }
 
-func (s *Store) Settings() AppSettings {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	clone := s.settings
-	clone.SuspendNetworks = append([]string(nil), s.settings.SuspendNetworks...)
-	clone.SavedSelections = make(map[string]map[string]string, len(s.settings.SavedSelections))
-	for prof, groups := range s.settings.SavedSelections {
+func cloneAppSettings(src AppSettings) AppSettings {
+	clone := src
+	clone.SuspendNetworks = append([]string(nil), src.SuspendNetworks...)
+	clone.SavedSelections = make(map[string]map[string]string, len(src.SavedSelections))
+	for prof, groups := range src.SavedSelections {
 		m := make(map[string]string, len(groups))
 		for g, t := range groups {
 			m[g] = t
 		}
 		clone.SavedSelections[prof] = m
 	}
+	if src.AILockSavedState != nil {
+		cp := *src.AILockSavedState
+		clone.AILockSavedState = &cp
+	}
 	return clone
+}
+
+func (s *Store) Settings() AppSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneAppSettings(s.settings)
 }
 
 func NormalizeLanguageCode(raw string) string {
@@ -314,30 +322,30 @@ func NormalizeAppSettings(s *AppSettings) {
 func (s *Store) UpdateSettings(mutator func(*AppSettings) error) (AppSettings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := s.settings
+	next := cloneAppSettings(s.settings)
 	if next.SavedSelections == nil {
 		next.SavedSelections = map[string]map[string]string{}
 	}
 	if err := mutator(&next); err != nil {
-		return s.settings, err
+		return cloneAppSettings(s.settings), err
 	}
 	NormalizeAppSettings(&next)
 	if strings.TrimSpace(next.CustomConfigDir) != "" {
 		cleanCustom := filepath.Clean(strings.TrimSpace(next.CustomConfigDir))
 		if !filepath.IsAbs(cleanCustom) {
-			return s.settings, fmt.Errorf("custom_config_dir must be an absolute path: %q", next.CustomConfigDir)
+			return cloneAppSettings(s.settings), fmt.Errorf("custom_config_dir must be an absolute path: %q", next.CustomConfigDir)
 		}
 		if err := os.MkdirAll(cleanCustom, 0700); err != nil {
-			return s.settings, fmt.Errorf("prepare custom_config_dir %s: %w", cleanCustom, err)
+			return cloneAppSettings(s.settings), fmt.Errorf("prepare custom_config_dir %s: %w", cleanCustom, err)
 		}
 		next.CustomConfigDir = cleanCustom
 	}
 	if err := writeJSONAtomic(s.settingsPathLocked(), next); err != nil {
-		return s.settings, err
+		return cloneAppSettings(s.settings), err
 	}
 	s.settings = next
 	_ = s.ensureDirResourcesLocked(s.activeConfigDirLocked())
-	return s.settings, nil
+	return cloneAppSettings(s.settings), nil
 }
 
 func (s *Store) RememberProxySelection(profileName, group, target string) error {
@@ -400,13 +408,57 @@ func (s *Store) RenameProfileReferences(oldName, newName string) error {
 	return err
 }
 
+// ValidateProfileName validates that a profile name is a single safe filename stem
+// that cannot traverse directories or reference internal hidden files.
+func ValidateProfileName(name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
+	trimmed = strings.TrimSuffix(trimmed, ".yaml")
+	trimmed = strings.TrimSpace(trimmed)
+	if trimmed == "" {
+		return "", fmt.Errorf("profile name is required")
+	}
+	if trimmed == "." || trimmed == ".." || strings.HasPrefix(trimmed, ".") {
+		return "", fmt.Errorf("invalid profile name %q", name)
+	}
+	if strings.ContainsAny(trimmed, "/\\:\x00\r\n") || strings.Contains(trimmed, "..") {
+		return "", fmt.Errorf("invalid profile name %q", name)
+	}
+	if filepath.Base(trimmed) != trimmed {
+		return "", fmt.Errorf("invalid profile name %q", name)
+	}
+	return trimmed, nil
+}
+
+// SafeProfilePath resolves name inside ActiveConfigDir after strict traversal validation.
+func (s *Store) SafeProfilePath(name string) (string, error) {
+	cleanName, err := ValidateProfileName(name)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Clean(s.ActiveConfigDir())
+	full := filepath.Join(dir, cleanName+".yaml")
+	if filepath.Dir(full) != dir {
+		return "", fmt.Errorf("profile path escapes config directory: %q", name)
+	}
+	return full, nil
+}
+
 func (s *Store) ProfilePath(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = "config"
 	}
-	name = strings.TrimSuffix(name, ".yaml")
-	return filepath.Join(s.ActiveConfigDir(), name+".yaml")
+	if safe, err := s.SafeProfilePath(name); err == nil {
+		return safe
+	}
+	// Fallback sanitization so ProfilePath can never escape ActiveConfigDir even if a
+	// legacy/unvalidated caller passes traversal characters.
+	base := filepath.Base(strings.ReplaceAll(strings.TrimSuffix(name, ".yaml"), `\`, "/"))
+	base = strings.TrimLeft(strings.TrimSpace(base), ".")
+	if base == "" || base == "." || base == ".." {
+		base = "config"
+	}
+	return filepath.Join(s.ActiveConfigDir(), base+".yaml")
 }
 
 func (s *Store) SelectedProfilePath() string {

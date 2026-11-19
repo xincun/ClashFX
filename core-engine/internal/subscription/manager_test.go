@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -206,5 +207,76 @@ func TestRefreshWithFallbackProxyToDirect(t *testing.T) {
 	}
 	if badHits.Load() != 1 {
 		t.Fatalf("expected deduplicated bad proxy hit count 1, got %d", badHits.Load())
+	}
+}
+
+func TestSubscriptionSecurityHardeningAndUnicodeUserinfo(t *testing.T) {
+	// 1. UTF-8 case-folding (Turkish İ -> i\u0307) must NEVER panic in ParseUserinfoBody.
+	turkishBody := []byte("proxies:\n  - {name: \"İİİİİİİİTotal: 100GB\", type: ss}\n  - {name: \"İİİİİİİİExpire: 2028-01-01\", type: ss}\n")
+	info := ParseUserinfoBody(turkishBody)
+	if info == nil || info.Total == nil || info.ExpireText == "" {
+		t.Fatalf("expected Turkish İ userinfo parsed cleanly without panic, got %+v", info)
+	}
+
+	// 2. Remove rejects path traversal and refuses to delete unmanaged local YAML files.
+	dir := t.TempDir()
+	store, err := profile.NewStore(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	localConfig := filepath.Join(store.ActiveConfigDir(), "config.yaml")
+	if err := os.WriteFile(localConfig, []byte("mixed-port: 7890\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := NewManager(store, fakeCoreHelper{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Remove("../../../outside", true); err == nil {
+		t.Fatal("expected Remove with traversal name to return error")
+	}
+	if err := mgr.Remove("config", true); err != nil {
+		t.Fatalf("unexpected error removing absent managed sub: %v", err)
+	}
+	if _, err := os.Stat(localConfig); err != nil {
+		t.Fatalf("expected unmanaged local config.yaml NOT to be deleted by Remove: %v", err)
+	}
+
+	// 3. Content-Disposition: filename="config.yaml" must not overwrite existing local config.yaml.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Disposition", `attachment; filename="config.yaml"`)
+		_, _ = w.Write([]byte("proxies:\n  - {name: HK, type: ss, server: 1.1.1.1, port: 443, cipher: aes-128-gcm, password: pass}\n"))
+	}))
+	defer srv.Close()
+	if _, err := mgr.AddOrUpdate("FreshSub", srv.URL, ""); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := mgr.Refresh(context.Background(), "FreshSub", 0)
+	if err != nil {
+		t.Fatalf("Refresh failed: %v", err)
+	}
+	if updated.Name != "FreshSub" {
+		t.Fatalf("expected FreshSub to keep its name instead of clobbering existing config.yaml, got %q", updated.Name)
+	}
+	rawLocal, _ := os.ReadFile(localConfig)
+	if string(rawLocal) != "mixed-port: 7890\n" {
+		t.Fatalf("existing config.yaml was overwritten: %q", string(rawLocal))
+	}
+
+	// 4. Share links colliding with reserved/group names (Proxy, Auto, DIRECT) are disambiguated.
+	links := strings.Join([]string{
+		"ss://YWVzLTEyOC1nY206cGFzcw==@1.1.1.1:443#Proxy",
+		"ss://YWVzLTEyOC1nY206cGFzcw==@1.1.1.2:443#Auto",
+		"ss://YWVzLTEyOC1nY206cGFzcw==@1.1.1.3:443#DIRECT",
+	}, "\n")
+	converted, err := ConvertShareLinksPayload([]byte(links))
+	if err != nil {
+		t.Fatalf("ConvertShareLinksPayload failed: %v", err)
+	}
+	text := string(converted)
+	if !strings.Contains(text, "Proxy (2)") || !strings.Contains(text, "Auto (2)") || !strings.Contains(text, "DIRECT (2)") {
+		t.Fatalf("expected reserved/group names disambiguated, got:\n%s", text)
 	}
 }

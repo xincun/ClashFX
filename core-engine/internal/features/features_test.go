@@ -270,3 +270,16 @@ func TestProfileMixinDefaultOnAndExplicitOffPersistence(t *testing.T) {
 		t.Fatalf("expected explicit-off mixin to stay off after round-trip, got %+v", offDoc)
 	}
 }
+
+func TestRedactLogLineUnicodeAndURLTokens(t *testing.T) {
+	// Turkish İ expands in strings.ToLower; must not panic.
+	got1 := redactLogLine("İİİİİİİİ Authorization: Bearer super-secret-token-123")
+	if strings.Contains(got1, "super-secret-token-123") || !strings.Contains(got1, "Bearer [REDACTED]") {
+		t.Fatalf("unexpected bearer redaction: %q", got1)
+	}
+	// Path-only subscription token without '?' and embedded credentials must both be redacted.
+	got2 := redactLogLine(`download subscription "x": Get "https://user:pass@sub.example.com/api/v1/subscribe/TOPSECRETTOKEN": timeout`)
+	if strings.Contains(got2, "TOPSECRETTOKEN") || strings.Contains(got2, "user:pass") || strings.Contains(got2, "sub.example.com") {
+		t.Fatalf("URL credentials or token leaked in diagnostic report: %q", got2)
+	}
+}

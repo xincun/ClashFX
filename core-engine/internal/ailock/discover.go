@@ -84,39 +84,64 @@ func DiscoverProtectedExecutablesWithInputs(
 		}
 	}
 
-	// 3. Bounded scan of known AI app install roots
-	scanned := 0
+	// 3. Bounded scan of known AI app install roots (per-root budget so large Electron IDEs
+	// like Antigravity never starve discovery of Claude / ChatGPT / Codex / ~/.local/bin).
+	seenRoots := make(map[string]bool, len(searchRoots))
 	for _, root := range searchRoots {
 		root = strings.TrimSpace(root)
 		if root == "" {
 			continue
 		}
-		info, err := os.Stat(root)
+		cleanRoot := filepath.Clean(root)
+		rootKey := cleanRoot
+		if goos == "windows" {
+			rootKey = strings.ToLower(cleanRoot)
+		}
+		if seenRoots[rootKey] {
+			continue
+		}
+		seenRoots[rootKey] = true
+
+		info, err := os.Stat(cleanRoot)
 		if err != nil || !info.IsDir() {
 			continue
 		}
-		rootDepth := pathDepth(root)
-		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+		rootDepth := pathDepth(cleanRoot)
+		scannedInRoot := 0
+		_ = filepath.WalkDir(cleanRoot, func(p string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return nil
 			}
-			if scanned >= maxDiscoveryFiles {
+			if scannedInRoot >= maxDiscoveryFiles {
 				return fs.SkipAll
 			}
 			if d.IsDir() {
-				if p != root && pathDepth(p)-rootDepth > maxDiscoveryDepth {
+				if p != cleanRoot && pathDepth(p)-rootDepth > maxDiscoveryDepth {
 					return filepath.SkipDir
 				}
 				lowerDir := strings.ToLower(d.Name())
-				if lowerDir == "node_modules" || lowerDir == ".git" || lowerDir == "cache" || lowerDir == "gpucache" || lowerDir == "code cache" {
+				if lowerDir == "node_modules" || lowerDir == ".git" || lowerDir == "cache" ||
+					lowerDir == "gpucache" || lowerDir == "code cache" || lowerDir == "locales" ||
+					lowerDir == "dawncache" || lowerDir == "shader_cache" || strings.HasSuffix(lowerDir, ".lproj") {
 					return filepath.SkipDir
 				}
 				return nil
 			}
-			scanned++
+			scannedInRoot++
 			name := d.Name()
-			if goos == "windows" && !strings.HasSuffix(strings.ToLower(name), ".exe") {
-				return nil
+			lowerName := strings.ToLower(name)
+			if goos == "windows" {
+				if !strings.HasSuffix(lowerName, ".exe") {
+					return nil
+				}
+			} else {
+				if strings.HasSuffix(lowerName, ".dylib") || strings.HasSuffix(lowerName, ".so") {
+					return nil
+				}
+				fi, fErr := d.Info()
+				if fErr != nil || !fi.Mode().IsRegular() || fi.Mode()&0111 == 0 {
+					return nil
+				}
 			}
 			entry := ProcessEntry{
 				PID:     1000,

@@ -13,12 +13,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/clashfx/core-engine/internal/profile"
+	"gopkg.in/yaml.v3"
 )
 
 const DefaultSubscriptionUserAgent = "clash.meta/v1.19.24"
@@ -85,7 +87,9 @@ func (b BinaryCoreHelper) ConvertShareLinks(raw []byte) ([]byte, error) {
 }
 
 func (b BinaryCoreHelper) ValidateConfig(homeDir, configPath string) error {
-	cmd := exec.Command(b.CoreBinaryPath, "-t", "-d", homeDir, "-f", configPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, b.CoreBinaryPath, "-t", "-d", homeDir, "-f", configPath)
 	configureChildProcess(cmd)
 	if len(b.SafePaths) > 0 {
 		cmd.Env = appendSafePathsEnv(os.Environ(), b.SafePaths...)
@@ -94,6 +98,9 @@ func (b BinaryCoreHelper) ValidateConfig(homeDir, configPath string) error {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("validate config timed out after 30s")
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = strings.TrimSpace(stdout.String())
@@ -104,18 +111,20 @@ func (b BinaryCoreHelper) ValidateConfig(homeDir, configPath string) error {
 }
 
 type Manager struct {
-	mu          sync.Mutex
-	store       *profile.Store
-	coreHelper  CoreHelper
-	subs        []ManagedSubscription
-	updatingSet map[string]bool
+	mu            sync.Mutex
+	store         *profile.Store
+	coreHelper    CoreHelper
+	subs          []ManagedSubscription
+	updatingSet   map[string]bool
+	reservedNames map[string]bool
 }
 
 func NewManager(store *profile.Store, helper CoreHelper) (*Manager, error) {
 	m := &Manager{
-		store:       store,
-		coreHelper:  helper,
-		updatingSet: map[string]bool{},
+		store:         store,
+		coreHelper:    helper,
+		updatingSet:   map[string]bool{},
+		reservedNames: map[string]bool{},
 	}
 	if err := m.loadLocked(); err != nil {
 		return nil, err
@@ -170,11 +179,13 @@ func (m *Manager) AddOrUpdate(name, rawURL, userAgent string) (ManagedSubscripti
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	prev := append([]ManagedSubscription(nil), m.subs...)
 	for i := range m.subs {
 		if m.subs[i].Name == name {
 			m.subs[i].URL = rawURL
 			m.subs[i].UserAgent = strings.TrimSpace(userAgent)
 			if err := m.saveLocked(); err != nil {
+				m.subs = prev
 				return ManagedSubscription{}, err
 			}
 			return m.subs[i], nil
@@ -187,30 +198,43 @@ func (m *Manager) AddOrUpdate(name, rawURL, userAgent string) (ManagedSubscripti
 	}
 	m.subs = append(m.subs, entry)
 	if err := m.saveLocked(); err != nil {
+		m.subs = prev
 		return ManagedSubscription{}, err
 	}
 	return entry, nil
 }
 
 func (m *Manager) Remove(name string, deleteFile bool) error {
+	cleanName, err := profile.ValidateProfileName(name)
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
 	idx := -1
 	for i, s := range m.subs {
-		if s.Name == name {
+		if s.Name == cleanName {
 			idx = i
 			break
 		}
 	}
+	removed := false
 	if idx >= 0 {
+		prev := append([]ManagedSubscription(nil), m.subs...)
 		m.subs = append(m.subs[:idx], m.subs[idx+1:]...)
 		if err := m.saveLocked(); err != nil {
+			m.subs = prev
 			m.mu.Unlock()
 			return err
 		}
+		removed = true
 	}
 	m.mu.Unlock()
-	if deleteFile {
-		_ = os.Remove(m.store.ProfilePath(name))
+	// Only remove the profile YAML if it actually belonged to a managed subscription
+	// and passed strict containment validation (never delete arbitrary files).
+	if deleteFile && removed {
+		if safePath, pErr := m.store.SafeProfilePath(cleanName); pErr == nil {
+			_ = os.Remove(safePath)
+		}
 	}
 	return nil
 }
@@ -320,6 +344,9 @@ func (m *Manager) refreshAttempt(ctx context.Context, subCopy ManagedSubscriptio
 	if err != nil {
 		return ManagedSubscription{}, err
 	}
+	if tr, ok := client.Transport.(*http.Transport); ok {
+		defer tr.CloseIdleConnections()
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subCopy.URL, nil)
 	if err != nil {
@@ -373,20 +400,47 @@ func (m *Manager) refreshAttempt(ctx context.Context, subCopy ManagedSubscriptio
 	}
 
 	finalName := subCopy.Name
+	reservedRename := ""
 	if suggested := suggestedProfileName(resp.Header.Get("Content-Disposition")); suggested != "" && subCopy.UpdatedAt == nil {
-		// On initial import, adopt server-suggested name if non-colliding.
-		if _, exists := m.FindByName(suggested); !exists {
-			finalName = suggested
+		if cleanSuggested, vErr := profile.ValidateProfileName(suggested); vErr == nil {
+			// Atomically reserve server-suggested name only if absent from m.subs,
+			// not concurrently reserved, and does not clobber an existing file on disk (e.g. config.yaml).
+			m.mu.Lock()
+			inSubs := false
+			for _, s := range m.subs {
+				if s.Name == cleanSuggested {
+					inSubs = true
+					break
+				}
+			}
+			alreadyReserved := m.reservedNames[cleanSuggested]
+			if !inSubs && !alreadyReserved {
+				if candPath, pErr := m.store.SafeProfilePath(cleanSuggested); pErr == nil {
+					if _, statErr := os.Stat(candPath); os.IsNotExist(statErr) {
+						m.reservedNames[cleanSuggested] = true
+						reservedRename = cleanSuggested
+						finalName = cleanSuggested
+					}
+				}
+			}
+			m.mu.Unlock()
 		}
 	}
+	if reservedRename != "" {
+		defer func() {
+			m.mu.Lock()
+			delete(m.reservedNames, reservedRename)
+			m.mu.Unlock()
+		}()
+	}
 
-	destPath := m.store.ProfilePath(finalName)
+	destPath, err := m.store.SafeProfilePath(finalName)
+	if err != nil {
+		return ManagedSubscription{}, err
+	}
 	m.store.MarkInternalWrite(destPath)
 	if err := profile.WriteFileAtomic(destPath, yamlBytes, 0600); err != nil {
 		return ManagedSubscription{}, err
-	}
-	if finalName != subCopy.Name {
-		_ = m.store.RenameProfileReferences(subCopy.Name, finalName)
 	}
 
 	now := time.Now().Unix()
@@ -395,19 +449,34 @@ func (m *Manager) refreshAttempt(ctx context.Context, subCopy ManagedSubscriptio
 	info := MergeUserInfo(headerInfo, bodyInfo)
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var updated ManagedSubscription
+	found := false
 	for i := range m.subs {
 		if m.subs[i].Name == subCopy.Name {
+			prev := m.subs[i]
 			m.subs[i].Name = finalName
 			m.subs[i].UpdatedAt = &now
 			if info != nil {
 				m.subs[i].UserInfo = info
 			}
-			_ = m.saveLocked()
-			return m.subs[i], nil
+			if saveErr := m.saveLocked(); saveErr != nil {
+				m.subs[i] = prev
+				m.mu.Unlock()
+				return ManagedSubscription{}, fmt.Errorf("persist subscription metadata: %w", saveErr)
+			}
+			updated = m.subs[i]
+			found = true
+			break
 		}
 	}
-	return subCopy, nil
+	m.mu.Unlock()
+	if !found {
+		return subCopy, nil
+	}
+	if finalName != subCopy.Name {
+		_ = m.store.RenameProfileReferences(subCopy.Name, finalName)
+	}
+	return updated, nil
 }
 
 func (m *Manager) UpdateExternalResource(ctx context.Context, rawURL, destFileName string, minBytes int) error {
@@ -428,6 +497,9 @@ func (m *Manager) DownloadExternalResourceViaProxy(ctx context.Context, rawURL, 
 		client, err := newSubscriptionHTTPClient(proxyPort, 90*time.Second)
 		if err != nil {
 			return nil, err
+		}
+		if tr, ok := client.Transport.(*http.Transport); ok {
+			defer tr.CloseIdleConnections()
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSpace(rawURL), nil)
 		if err != nil {
@@ -474,9 +546,17 @@ func (m *Manager) DownloadExternalResourceViaProxy(ctx context.Context, rawURL, 
 }
 
 func (m *Manager) normalizeSubscriptionContent(raw []byte) ([]byte, error) {
-	doc, err := profile.UnmarshalYAMLMap(raw)
+	sanitized := profile.SanitizeYAMLIndentation(raw)
+	doc, err := profile.UnmarshalYAMLMap(sanitized)
 	if err == nil && (doc["proxies"] != nil || doc["proxy-providers"] != nil || doc["proxy-groups"] != nil) {
-		return raw, nil
+		if profile.SanitizeUntrustedProviderPaths(doc) {
+			marshaled, mErr := yaml.Marshal(doc)
+			if mErr != nil {
+				return nil, fmt.Errorf("re-encode sanitized subscription YAML: %w", mErr)
+			}
+			return marshaled, nil
+		}
+		return sanitized, nil
 	}
 	// Check if raw is share links or base64-encoded share links
 	if looksLikeShareLinksOrBase64(raw) {
@@ -653,11 +733,14 @@ func matchByteValueAfter(line string, labels []string) (int64, bool) {
 	}
 	lowerLine := strings.ToLower(line)
 	for _, lbl := range labels {
-		idx := strings.Index(lowerLine, strings.ToLower(lbl))
+		lowerLbl := strings.ToLower(lbl)
+		idx := strings.Index(lowerLine, lowerLbl)
 		if idx < 0 {
 			continue
 		}
-		tail := strings.TrimLeft(line[idx+len(lbl):], " ：:=|/-\t")
+		// Always slice lowerLine (never original line) because UTF-8 case folding (e.g. İ -> i\u0307)
+		// can expand byte lengths and cause out-of-bounds panics if indexed into line.
+		tail := strings.TrimLeft(lowerLine[idx+len(lowerLbl):], " ：:=|/-\t")
 		numEnd := 0
 		hasDot := false
 		for numEnd < len(tail) {
@@ -689,20 +772,19 @@ func matchByteValueAfter(line string, labels []string) (int64, bool) {
 	return 0, false
 }
 
+var expireLabelPattern = regexp.MustCompile(`(?i)(套餐到期|到期时间|Expires|Expiry|Expire)`)
+
 func matchExpireLabel(line string) string {
-	lowerLine := strings.ToLower(line)
-	for _, lbl := range []string{"套餐到期", "到期时间", "Expires", "Expiry", "Expire"} {
-		idx := strings.Index(lowerLine, strings.ToLower(lbl))
-		if idx < 0 {
-			continue
+	loc := expireLabelPattern.FindStringIndex(line)
+	if loc == nil {
+		return ""
+	}
+	tail := strings.TrimSpace(strings.TrimLeft(line[loc[1]:], " ：:=|/-\t"))
+	if tail != "" {
+		if cut := strings.IndexAny(tail, ";|,"); cut > 0 {
+			tail = strings.TrimSpace(tail[:cut])
 		}
-		tail := strings.TrimSpace(strings.TrimLeft(line[idx+len(lbl):], " ：:=|/-\t"))
-		if tail != "" {
-			if cut := strings.IndexAny(tail, ";|,"); cut > 0 {
-				tail = strings.TrimSpace(tail[:cut])
-			}
-			return tail
-		}
+		return tail
 	}
 	return ""
 }
@@ -716,6 +798,9 @@ func newSubscriptionHTTPClient(directProxyPort int, timeout time.Duration) (*htt
 		}
 		// Never fall back to environment/OS proxy when forceDirect is requested.
 		tr.Proxy = http.ProxyURL(proxyURL)
+	} else {
+		// Direct fallback must not inherit a broken/stale HTTP_PROXY env var.
+		tr.Proxy = nil
 	}
 	return &http.Client{
 		Transport: tr,

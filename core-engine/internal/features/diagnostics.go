@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -353,13 +354,20 @@ func BuildRedactedDiagnosticReport(in DiagnosticBundleInput) string {
 	return strings.TrimSpace(b.String())
 }
 
+var (
+	redactBearerPattern = regexp.MustCompile(`(?i)\bbearer\s+\S+`)
+	redactURLPattern    = regexp.MustCompile(`(?i)\b(https?|socks5h?|wss?)://[^\s"'<>]+`)
+)
+
 func redactLogLine(line string) string {
-	// Strip query strings or Bearer tokens if any appear in logs
-	if idx := strings.Index(strings.ToLower(line), "bearer "); idx >= 0 {
-		return line[:idx] + "Bearer [REDACTED]"
-	}
-	if idx := strings.Index(line, "?"); idx >= 0 && strings.Contains(line, "http") {
-		return line[:idx] + "?[REDACTED]"
-	}
-	return line
+	// Operate directly on original UTF-8 text via regexp (never index line with strings.ToLower offsets)
+	// and strip both Bearer tokens and full URLs (credentials, path tokens, query strings).
+	out := redactBearerPattern.ReplaceAllString(line, "Bearer [REDACTED]")
+	out = redactURLPattern.ReplaceAllStringFunc(out, func(raw string) string {
+		if idx := strings.Index(raw, "://"); idx > 0 {
+			return raw[:idx+3] + "[REDACTED]"
+		}
+		return "[REDACTED-URL]"
+	})
+	return out
 }

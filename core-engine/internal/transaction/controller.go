@@ -204,6 +204,13 @@ func (c *Controller) LastGoodConfigPath() string {
 // Apply builds a candidate runtime config for the selected profile, validates it,
 // applies it to the core, and rolls back automatically if validation or apply fails.
 func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) (AppliedRuntimeState, error) {
+	return c.ApplyWithOptions(ctx, includeRecoverySelections, false)
+}
+
+// ApplyWithOptions is like Apply, with an optional forceRestartOverride used when
+// switching execution backends (localRunner <-> ClashFXService) without wiping prevState
+// owned ports before the new topology is validated and committed.
+func (c *Controller) ApplyWithOptions(ctx context.Context, includeRecoverySelections bool, forceRestartOverride bool) (AppliedRuntimeState, error) {
 	c.applyMu.Lock()
 	defer c.applyMu.Unlock()
 
@@ -248,6 +255,10 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 			return prevState, err
 		}
 	}
+
+	// Defense-in-depth: strip unsafe or ClashFX-reserved provider paths from untrusted profiles
+	// (including subscriptions imported prior to this guard) before launching privileged core.
+	profile.SanitizeUntrustedProviderPaths(root)
 
 	// 2. Ensure disk-backed editable built-in ruleset files exist BEFORE prepareRuntimeTopology
 	// so clashfx-private-direct.list drives dns.fake-ip-filter and dns.nameserver-policy dynamically.
@@ -313,8 +324,7 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 	// 5. Apply to core; if apply fails and a last-good snapshot exists, automatically roll back!
 	// Note: Mihomo's PUT /configs hot reload never recreates external-controller or updates its
 	// secret. Only use REST reload when the core already has a known controller state whose
-	// APIPort and APISecret are unchanged; otherwise force a clean restart so lastState stays
-	// 100% consistent with the live core listener.
+	// APIPort and APISecret are unchanged and the runner backend did not change.
 	controllerChanged := prevState.APIPort > 0 &&
 		(state.APIPort != prevState.APIPort || state.APISecret != prevState.APISecret)
 	dialAPIPort := state.APIPort
@@ -323,13 +333,31 @@ func (c *Controller) Apply(ctx context.Context, includeRecoverySelections bool) 
 		dialAPIPort = prevState.APIPort
 		dialSecret = prevState.APISecret
 	}
-	forceRestart := prevState.APIPort <= 0 || controllerChanged
+	forceRestart := forceRestartOverride || prevState.APIPort <= 0 || controllerChanged
 	if c.applier != nil {
 		if applyErr := c.applier.ApplyRuntimeConfig(ctx, settings, cfgDir, runtimePath, dialAPIPort, dialSecret, forceRestart); applyErr != nil {
 			if hadPreviousGood {
 				if goodBytes, rErr := os.ReadFile(lastGoodPath); rErr == nil {
 					_ = profile.WriteFileAtomic(runtimePath, goodBytes, 0600)
-					_ = c.applier.ApplyRuntimeConfig(ctx, settings, cfgDir, runtimePath, dialAPIPort, dialSecret, forceRestart)
+					// Roll back with a fresh bounded context and prevState's EnhancedMode so a
+					// cancelled UAC/timeout never re-prompts elevation or fails immediately on expired ctx.
+					rbSettings := settings
+					if prevState.APIPort > 0 || prevState.ProfileName != "" {
+						rbSettings.EnhancedMode = prevState.Enhanced
+					} else if goodRoot, gErr := profile.UnmarshalYAMLMap(goodBytes); gErr == nil {
+						if tunMap, ok := goodRoot["tun"].(map[string]any); ok && tunMap != nil {
+							rbSettings.EnhancedMode = boolFromYAML(tunMap["enable"])
+						} else {
+							rbSettings.EnhancedMode = false
+						}
+					}
+					rbCtx, rbCancel := context.WithTimeout(context.Background(), 15*time.Second)
+					rbErr := c.applier.ApplyRuntimeConfig(rbCtx, rbSettings, cfgDir, runtimePath, dialAPIPort, dialSecret, forceRestart)
+					rbCancel()
+					if rbErr == nil && prevState.APIPort == 0 {
+						c.SeedActiveStateFromDisk(runtimePath)
+						prevState = c.LastState()
+					}
 				}
 			}
 			return prevState, fmt.Errorf("apply runtime config failed (rolled back): %w", applyErr)
@@ -360,10 +388,16 @@ func (c *Controller) prepareRuntimeTopology(root map[string]any, settings profil
 		if state.SocksPort <= 0 {
 			state.SocksPort = state.MixedPort
 		}
-		state.APIPort = extractPortFromHostPort(fmt.Sprint(root["external-controller"]), settings.APIPort)
+		// Do not fabricate settings.APIPort when custom config omits external-controller.
+		state.APIPort = extractPortFromHostPort(fmt.Sprint(root["external-controller"]), 0)
 		state.requestedAPIPort = state.APIPort
 		if sec, ok := root["secret"].(string); ok {
 			state.APISecret = sec
+		}
+		if tunMap, ok := root["tun"].(map[string]any); ok && tunMap != nil {
+			state.Enhanced = boolFromYAML(tunMap["enable"])
+		} else {
+			state.Enhanced = false
 		}
 		if c.dashboardUI != "" && root["external-ui"] == nil {
 			root["external-ui"] = c.dashboardUI

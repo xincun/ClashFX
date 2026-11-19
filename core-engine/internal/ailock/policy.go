@@ -380,6 +380,7 @@ type depNode struct {
 
 type providerProxyRecord struct {
 	name        string
+	rawName     string
 	proxy       map[string]any
 	dialerProxy string
 	unresolved  bool
@@ -393,6 +394,8 @@ type providerResolution struct {
 type locatedProxy struct {
 	server       string
 	providerName string
+	rawName      string
+	dialerProxy  string
 	proxy        map[string]any
 }
 
@@ -901,6 +904,7 @@ func resolveProvider(snap ProviderSnapshot, def map[string]any) providerResoluti
 		mat["name"] = effectiveName
 		records = append(records, providerProxyRecord{
 			name:        effectiveName,
+			rawName:     rawName,
 			proxy:       mat,
 			dialerProxy: effectiveDialer,
 			unresolved:  !known || proxyHasInvalidDialer,
@@ -999,9 +1003,12 @@ func locateProxy(root map[string]any, target string, providers []ProviderSnapsho
 	for _, px := range extractMapList(root["proxies"]) {
 		if n, _ := px["name"].(string); n == target {
 			srv, _ := px["server"].(string)
+			dialer, _ := px["dialer-proxy"].(string)
 			return &locatedProxy{
-				server: normalizedServerHost(srv),
-				proxy:  deepCopyMap(px),
+				server:      normalizedServerHost(srv),
+				rawName:     n,
+				dialerProxy: strings.TrimSpace(dialer),
+				proxy:       deepCopyMap(px),
 			}
 		}
 	}
@@ -1018,6 +1025,8 @@ func locateProxy(root map[string]any, target string, providers []ProviderSnapsho
 				return &locatedProxy{
 					server:       normalizedServerHost(srv),
 					providerName: snap.Name,
+					rawName:      px.rawName,
+					dialerProxy:  strings.TrimSpace(px.dialerProxy),
 					proxy:        deepCopyMap(px.proxy),
 				}
 			}
@@ -1027,10 +1036,18 @@ func locateProxy(root map[string]any, target string, providers []ProviderSnapsho
 }
 
 func assignRelay(root map[string]any, target string, loc *locatedProxy, relay string) bool {
+	// Never clobber an explicit user-configured dialer-proxy chain on the locked node.
+	if loc != nil && loc.dialerProxy != "" {
+		return false
+	}
 	if setInlineDialer(root, target, relay) {
 		return true
 	}
-	if loc == nil || loc.providerName == "" || strings.Contains(target, "`") {
+	excludeKey := target
+	if loc != nil && strings.TrimSpace(loc.rawName) != "" {
+		excludeKey = loc.rawName
+	}
+	if loc == nil || loc.providerName == "" || strings.Contains(excludeKey, "`") {
 		return false
 	}
 	if srv, _ := loc.proxy["server"].(string); strings.TrimSpace(srv) == "" {
@@ -1050,7 +1067,7 @@ func assignRelay(root map[string]any, target string, loc *locatedProxy, relay st
 	}
 	out = append(out, copyPx)
 	root["proxies"] = out
-	return appendExactNameExclusion(target, loc.providerName, root)
+	return appendExactNameExclusion(excludeKey, loc.providerName, root)
 }
 
 func setInlineDialer(root map[string]any, target, relay string) bool {
@@ -1063,6 +1080,9 @@ func setInlineDialer(root map[string]any, target, relay string) bool {
 	for i, px := range proxies {
 		cp := deepCopyMap(px)
 		if n, _ := cp["name"].(string); n == target {
+			if existing, _ := cp["dialer-proxy"].(string); strings.TrimSpace(existing) != "" {
+				return false
+			}
 			cp["dialer-proxy"] = relay
 			updated = true
 		}

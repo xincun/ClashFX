@@ -31,6 +31,9 @@ type darwinServiceDNS struct {
 // legacy ClashFX Helper versions across all macOS network services (including
 // hidden Ethernet/Thunderbolt adapters in preferences.plist).
 func CleanLegacyTunDNS() ([]string, error) {
+	if strings.TrimSpace(os.Getenv("CLASHFX_DISABLE_OS_SYSPROXY")) == "1" {
+		return nil, nil
+	}
 	cmdDir := strings.TrimSpace(os.Getenv("CLASHFX_DARWIN_CMD_DIR"))
 	if flag.Lookup("test.v") != nil &&
 		cmdDir == "" &&

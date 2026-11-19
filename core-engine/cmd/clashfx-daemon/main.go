@@ -116,7 +116,18 @@ func runUninstallCleanup(endpoint, dataDir string) {
 		_, _ = conn.Write(req)
 		_, _ = bufio.NewReader(conn).ReadBytes('\n')
 		_ = conn.Close()
-		time.Sleep(300 * time.Millisecond)
+
+		// Wait for the running daemon to finish graceful teardown (AI Guard disarm,
+		// sysproxy restore, core stop) rather than racing with CleanupUninstallState.
+		deadline := time.Now().Add(8 * time.Second)
+		for time.Now().Before(deadline) {
+			probe, dialErr := daemon.DialIPC(endpoint)
+			if dialErr != nil {
+				break
+			}
+			_ = probe.Close()
+			time.Sleep(150 * time.Millisecond)
+		}
 	}
 	if err := daemon.CleanupUninstallState(dataDir); err != nil {
 		fmt.Fprintf(os.Stderr, "[clashfx-daemon] uninstall cleanup warning: %v\n", err)

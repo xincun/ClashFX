@@ -4,6 +4,7 @@ package sysproxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,7 +14,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
+
+const darwinSysProxyCmdTimeout = 4 * time.Second
 
 type darwinBackend struct {
 	cmdDir string
@@ -51,7 +55,9 @@ func (b *darwinBackend) resolveCmd(name, defaultAbs string) string {
 
 func (b *darwinBackend) runCmd(name, defaultAbs string, args ...string) (string, error) {
 	bin := b.resolveCmd(name, defaultAbs)
-	cmd := exec.Command(bin, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), darwinSysProxyCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -130,17 +136,20 @@ func parseActiveNetworkServices(orderOutput, defaultDev string) []darwinNetworkS
 
 	isVirtualDev := func(dev string) bool {
 		lower := strings.ToLower(strings.TrimSpace(dev))
-		return lower == "lo0" ||
+		return lower == "" ||
+			lower == "lo0" ||
 			strings.HasPrefix(lower, "utun") ||
 			strings.HasPrefix(lower, "awdl") ||
 			strings.HasPrefix(lower, "llw") ||
-			strings.HasPrefix(lower, "bridge")
+			strings.HasPrefix(lower, "bridge") ||
+			strings.HasPrefix(lower, "ipsec") ||
+			strings.HasPrefix(lower, "ppp")
 	}
 
 	var prioritized []darwinNetworkService
 	var fallback []darwinNetworkService
 	for _, svc := range all {
-		if svc.Device != "" && svc.Device == defaultDev {
+		if svc.Device != "" && !isVirtualDev(svc.Device) && svc.Device == defaultDev {
 			prioritized = append([]darwinNetworkService{svc}, prioritized...)
 			continue
 		}
@@ -156,18 +165,9 @@ func parseActiveNetworkServices(orderOutput, defaultDev string) []darwinNetworkS
 	return fallback
 }
 
-func (b *darwinBackend) ReadState() (OSProxyState, error) {
-	services, err := b.activeServices()
-	if err != nil {
-		return OSProxyState{}, err
-	}
-	if len(services) == 0 {
-		return OSProxyState{}, nil
-	}
-	primary := services[0].Name
-
+func (b *darwinBackend) readServiceState(svcName string) OSProxyState {
 	var st OSProxyState
-	if webOut, wErr := b.runCmd("networksetup", "/usr/sbin/networksetup", "-getwebproxy", primary); wErr == nil {
+	if webOut, wErr := b.runCmd("networksetup", "/usr/sbin/networksetup", "-getwebproxy", svcName); wErr == nil {
 		if enabled, server, ok := parseNetworksetupProxy(webOut); ok && enabled {
 			st.ProxyEnable = 1
 			st.HasProxyServer = true
@@ -175,7 +175,7 @@ func (b *darwinBackend) ReadState() (OSProxyState, error) {
 		}
 	}
 	if st.ProxyEnable == 0 {
-		if secOut, sErr := b.runCmd("networksetup", "/usr/sbin/networksetup", "-getsecurewebproxy", primary); sErr == nil {
+		if secOut, sErr := b.runCmd("networksetup", "/usr/sbin/networksetup", "-getsecurewebproxy", svcName); sErr == nil {
 			if enabled, server, ok := parseNetworksetupProxy(secOut); ok && enabled {
 				st.ProxyEnable = 1
 				st.HasProxyServer = true
@@ -184,7 +184,7 @@ func (b *darwinBackend) ReadState() (OSProxyState, error) {
 		}
 	}
 	if st.ProxyEnable == 0 {
-		if socksOut, kErr := b.runCmd("networksetup", "/usr/sbin/networksetup", "-getsocksfirewallproxy", primary); kErr == nil {
+		if socksOut, kErr := b.runCmd("networksetup", "/usr/sbin/networksetup", "-getsocksfirewallproxy", svcName); kErr == nil {
 			if enabled, server, ok := parseNetworksetupProxy(socksOut); ok && enabled {
 				st.ProxyEnable = 1
 				st.HasProxyServer = true
@@ -193,20 +193,44 @@ func (b *darwinBackend) ReadState() (OSProxyState, error) {
 		}
 	}
 
-	if bypassOut, bErr := b.runCmd("networksetup", "/usr/sbin/networksetup", "-getproxybypassdomains", primary); bErr == nil {
+	if bypassOut, bErr := b.runCmd("networksetup", "/usr/sbin/networksetup", "-getproxybypassdomains", svcName); bErr == nil {
 		if bypass := parseNetworksetupBypass(bypassOut); bypass != "" {
 			st.HasProxyOverride = true
 			st.ProxyOverride = bypass
 		}
 	}
 
-	if pacOut, pErr := b.runCmd("networksetup", "/usr/sbin/networksetup", "-getautoproxyurl", primary); pErr == nil {
+	if pacOut, pErr := b.runCmd("networksetup", "/usr/sbin/networksetup", "-getautoproxyurl", svcName); pErr == nil {
 		if pacURL, enabled := parseNetworksetupAutoProxy(pacOut); enabled && pacURL != "" {
 			st.HasAutoConfigURL = true
 			st.AutoConfigURL = pacURL
 		}
 	}
-	return st, nil
+	return st
+}
+
+func (b *darwinBackend) ReadState() (OSProxyState, error) {
+	services, err := b.activeServices()
+	if err != nil {
+		return OSProxyState{}, err
+	}
+	if len(services) == 0 {
+		return OSProxyState{}, nil
+	}
+	// Inspect services in priority order; if TUN hijacked the default route so services[0]
+	// is an unplugged adapter while Wi-Fi/Ethernet still has a proxy/PAC configured, return
+	// the first service with an active proxy or PAC rather than missing it.
+	first := b.readServiceState(services[0].Name)
+	if first.ProxyEnable == 1 || first.HasAutoConfigURL {
+		return first, nil
+	}
+	for _, svc := range services[1:] {
+		cand := b.readServiceState(svc.Name)
+		if cand.ProxyEnable == 1 || cand.HasAutoConfigURL {
+			return cand, nil
+		}
+	}
+	return first, nil
 }
 
 func (b *darwinBackend) WriteState(st OSProxyState) error {
@@ -228,26 +252,29 @@ func (b *darwinBackend) WriteState(st OSProxyState) error {
 	}
 
 	var firstErr error
-	recordErr := func(err error) {
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
+	succeededServices := 0
 
 	for _, svc := range services {
+		var svcErr error
+		recordSvcErr := func(e error) {
+			if e != nil && svcErr == nil {
+				svcErr = e
+			}
+		}
+
 		if st.ProxyEnable == 1 {
 			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setwebproxy", svc.Name, host, port)
-			recordErr(err)
+			recordSvcErr(err)
 			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setwebproxystate", svc.Name, "on")
-			recordErr(err)
+			recordSvcErr(err)
 			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setsecurewebproxy", svc.Name, host, port)
-			recordErr(err)
+			recordSvcErr(err)
 			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setsecurewebproxystate", svc.Name, "on")
-			recordErr(err)
+			recordSvcErr(err)
 			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setsocksfirewallproxy", svc.Name, host, port)
-			recordErr(err)
+			recordSvcErr(err)
 			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setsocksfirewallproxystate", svc.Name, "on")
-			recordErr(err)
+			recordSvcErr(err)
 
 			bypass := FormatDarwinBypass(st.ProxyOverride)
 			args := []string{"-setproxybypassdomains", svc.Name}
@@ -257,42 +284,53 @@ func (b *darwinBackend) WriteState(st OSProxyState) error {
 				args = append(args, bypass...)
 			}
 			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", args...)
-			recordErr(err)
+			recordSvcErr(err)
 
-			if !st.HasAutoConfigURL {
+			if st.HasAutoConfigURL && strings.TrimSpace(st.AutoConfigURL) != "" {
+				_, _ = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setautoproxyurl", svc.Name, strings.TrimSpace(st.AutoConfigURL))
+				_, _ = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setautoproxystate", svc.Name, "on")
+			} else {
 				_, _ = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setautoproxystate", svc.Name, "off")
 			}
-			continue
-		}
-
-		_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setwebproxystate", svc.Name, "off")
-		recordErr(err)
-		_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setsecurewebproxystate", svc.Name, "off")
-		recordErr(err)
-		_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setsocksfirewallproxystate", svc.Name, "off")
-		recordErr(err)
-
-		if st.HasAutoConfigURL && strings.TrimSpace(st.AutoConfigURL) != "" {
-			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setautoproxyurl", svc.Name, strings.TrimSpace(st.AutoConfigURL))
-			recordErr(err)
-			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setautoproxystate", svc.Name, "on")
-			recordErr(err)
 		} else {
-			_, _ = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setautoproxystate", svc.Name, "off")
-		}
+			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setwebproxystate", svc.Name, "off")
+			recordSvcErr(err)
+			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setsecurewebproxystate", svc.Name, "off")
+			recordSvcErr(err)
+			_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setsocksfirewallproxystate", svc.Name, "off")
+			recordSvcErr(err)
 
-		if st.HasProxyOverride {
-			bypass := FormatDarwinBypass(st.ProxyOverride)
-			args := []string{"-setproxybypassdomains", svc.Name}
-			if len(bypass) == 0 {
-				args = append(args, "Empty")
+			if st.HasAutoConfigURL && strings.TrimSpace(st.AutoConfigURL) != "" {
+				_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setautoproxyurl", svc.Name, strings.TrimSpace(st.AutoConfigURL))
+				recordSvcErr(err)
+				_, err = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setautoproxystate", svc.Name, "on")
+				recordSvcErr(err)
 			} else {
-				args = append(args, bypass...)
+				_, _ = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setautoproxystate", svc.Name, "off")
 			}
-			_, _ = b.runCmd("networksetup", "/usr/sbin/networksetup", args...)
-		} else {
-			_, _ = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setproxybypassdomains", svc.Name, "Empty")
+
+			if st.HasProxyOverride {
+				bypass := FormatDarwinBypass(st.ProxyOverride)
+				args := []string{"-setproxybypassdomains", svc.Name}
+				if len(bypass) == 0 {
+					args = append(args, "Empty")
+				} else {
+					args = append(args, bypass...)
+				}
+				_, _ = b.runCmd("networksetup", "/usr/sbin/networksetup", args...)
+			} else {
+				_, _ = b.runCmd("networksetup", "/usr/sbin/networksetup", "-setproxybypassdomains", svc.Name, "Empty")
+			}
 		}
+
+		if svcErr == nil {
+			succeededServices++
+		} else if firstErr == nil {
+			firstErr = svcErr
+		}
+	}
+	if succeededServices > 0 {
+		return nil
 	}
 	return firstErr
 }
@@ -315,10 +353,10 @@ func parseNetworksetupProxy(out string) (enabled bool, server string, ok bool) {
 			portStr = val
 		}
 	}
-	if host == "" || portStr == "" || portStr == "0" {
-		return enabled, "", enabled
+	if !enabled || host == "" || portStr == "" || portStr == "0" {
+		return false, "", false
 	}
-	return enabled, net.JoinHostPort(host, portStr), true
+	return true, net.JoinHostPort(host, portStr), true
 }
 
 func parseNetworksetupBypass(out string) string {

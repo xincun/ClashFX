@@ -193,7 +193,7 @@ func matchActiveNetworkProfilesByGatewayMAC(activeMACs [][]byte) []string {
 		if err != nil {
 			continue
 		}
-		subs, err := k.ReadSubKeyNames(256)
+		subs, err := k.ReadSubKeyNames(-1)
 		if err == nil {
 			for _, sub := range subs {
 				sk, oErr := registry.OpenKey(k, sub, registry.QUERY_VALUE)

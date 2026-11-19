@@ -78,6 +78,119 @@ func IsEditableBuiltinRuleset(providerName string) bool {
 	}
 }
 
+func isReservedOrUnsafeProviderPath(rawPath string) bool {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return false
+	}
+	if strings.ContainsAny(trimmed, "\x00\r\n") {
+		return true
+	}
+	// Reject absolute paths (POSIX, Windows drive, UNC) and parent traversals.
+	if filepath.IsAbs(trimmed) || strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, `\`) {
+		return true
+	}
+	if len(trimmed) >= 2 && ((trimmed[0] >= 'a' && trimmed[0] <= 'z') || (trimmed[0] >= 'A' && trimmed[0] <= 'Z')) && trimmed[1] == ':' {
+		return true
+	}
+	norm := strings.ReplaceAll(trimmed, `\`, "/")
+	clean := filepath.ToSlash(filepath.Clean(norm))
+	clean = strings.TrimPrefix(clean, "./")
+	if clean == "" || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.Contains(clean, "/../") {
+		return true
+	}
+	low := strings.ToLower(clean)
+	base := strings.ToLower(filepath.Base(clean))
+
+	// Never let any third-party provider overwrite ClashFX's own security rulesets,
+	// geo databases, mixin, state files, or root-level profiles.
+	if strings.HasPrefix(base, "clashfx-") && strings.HasSuffix(base, ".list") {
+		return true
+	}
+	switch base {
+	case "settings.json", "subscriptions.json", "node-services.json", "sysproxy-snapshot.json",
+		".profile_mixin.yaml", "profile mixin.yaml", ".clashfx_runtime.yaml", ".clashfx_last_good.yaml",
+		"country.mmdb", "geosite.dat", "geoip.dat", "asn.mmdb":
+		return true
+	}
+	// Root-level *.yaml / *.yml / *.json files in ActiveConfigDir are profiles or daemon state.
+	if !strings.Contains(low, "/") && (strings.HasSuffix(low, ".yaml") || strings.HasSuffix(low, ".yml") || strings.HasSuffix(low, ".json")) {
+		return true
+	}
+	return false
+}
+
+// SanitizeUntrustedProviderPaths strips unsafe or ClashFX-reserved `path:` directives
+// from untrusted rule-providers and proxy-providers so privileged mihomo_core cannot
+// overwrite ClashFX security rulesets (clashfx-ai-lock.list, clashfx-private-direct.list),
+// .profile_mixin.yaml, settings, or profiles when fetching remote providers.
+// Returns true if any provider entry was modified.
+func SanitizeUntrustedProviderPaths(root map[string]any) bool {
+	if root == nil {
+		return false
+	}
+	changed := false
+	for _, sectionKey := range []string{"rule-providers", "proxy-providers"} {
+		rawSec, exists := root[sectionKey]
+		if !exists || rawSec == nil {
+			continue
+		}
+		secMap, ok := rawSec.(map[string]any)
+		if !ok || secMap == nil {
+			if norm, nOK := NormalizeYAMLValue(rawSec).(map[string]any); nOK && norm != nil {
+				secMap = norm
+			} else {
+				continue
+			}
+		}
+		secModified := false
+		for provName, rawProv := range secMap {
+			if sectionKey == "rule-providers" && IsEditableBuiltinRuleset(provName) {
+				continue
+			}
+			provMap, pOK := rawProv.(map[string]any)
+			if !pOK || provMap == nil {
+				if norm, nOK := NormalizeYAMLValue(rawProv).(map[string]any); nOK && norm != nil {
+					provMap = norm
+				} else {
+					continue
+				}
+			}
+			rawPath, hasPath := provMap["path"]
+			if !hasPath || rawPath == nil {
+				continue
+			}
+			pathStr := fmt.Sprint(rawPath)
+			pType := strings.ToLower(strings.TrimSpace(fmt.Sprint(provMap["type"])))
+			_, hasURL := provMap["url"]
+			// Any remote/HTTP fetcher provider (which writes downloaded bytes to `path`)
+			// must never target reserved ClashFX paths or escape homeDir.
+			// File providers also must not escape homeDir.
+			if pType == "http" || hasURL {
+				if isReservedOrUnsafeProviderPath(pathStr) {
+					delete(provMap, "path")
+					secMap[provName] = provMap
+					secModified = true
+					changed = true
+				}
+			} else if isReservedOrUnsafeProviderPath(pathStr) {
+				// Even non-HTTP providers must never escape homeDir or point at ClashFX state files.
+				norm := strings.ReplaceAll(strings.TrimSpace(pathStr), `\`, "/")
+				if filepath.IsAbs(pathStr) || strings.HasPrefix(norm, "/") || strings.HasPrefix(norm, "..") || strings.Contains(norm, "/../") {
+					delete(provMap, "path")
+					secMap[provName] = provMap
+					secModified = true
+					changed = true
+				}
+			}
+		}
+		if secModified {
+			root[sectionKey] = secMap
+		}
+	}
+	return changed
+}
+
 // ResolveRulesetDirName returns "ruleset" when cfgDir/ruleset can be created and
 // written to by the current user, and falls back to "clashfx-rulesets" when the
 // legacy "ruleset" directory is root-owned or otherwise unwritable.

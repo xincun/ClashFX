@@ -107,7 +107,9 @@ type Coordinator struct {
 	speedSamples  map[string]NodeSpeedSample
 
 	checkCancel context.CancelFunc
+	checkRunID  uint64
 	speedCancel context.CancelFunc
+	speedRunID  uint64
 	stopLoopCh  chan struct{}
 }
 
@@ -289,6 +291,9 @@ func (c *Coordinator) CheckConnectivityNow(parentCtx context.Context) error {
 		c.lastProfile = pKey
 	}
 	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+	c.checkRunID++
+	myCheckID := c.checkRunID
 	c.checkCancel = cancel
 	c.isChecking = true
 	c.lastCheckAt = time.Now()
@@ -326,8 +331,10 @@ func (c *Coordinator) CheckConnectivityNow(parentCtx context.Context) error {
 
 	if ctx.Err() != nil {
 		c.mu.Lock()
-		c.isChecking = false
-		c.checkCancel = nil
+		if c.checkRunID == myCheckID {
+			c.isChecking = false
+			c.checkCancel = nil
+		}
 		c.mu.Unlock()
 		c.notify()
 		return ctx.Err()
@@ -340,6 +347,10 @@ func (c *Coordinator) CheckConnectivityNow(parentCtx context.Context) error {
 
 	var tripped []string
 	c.mu.Lock()
+	if c.checkRunID != myCheckID {
+		c.mu.Unlock()
+		return nil
+	}
 	c.isChecking = false
 	c.checkCancel = nil
 	for k := range c.failures {
@@ -484,8 +495,7 @@ func (c *Coordinator) RefreshSubscriptionDirectly(ctx context.Context, manual bo
 	c.mu.Unlock()
 	c.notify()
 
-	st.LastRefresh[pKey] = now
-	_ = c.store.Write(st)
+	_ = c.store.RecordLastRefresh(pKey, now)
 
 	err = c.refreshFn(ctx, api.ProfileName, directPort)
 
@@ -538,6 +548,8 @@ func (c *Coordinator) StartSpeedTest() error {
 		c.checkCancel = nil
 		c.isChecking = false
 	}
+	c.speedRunID++
+	myRunID := c.speedRunID
 	c.speedCancel = cancel
 	c.isSpeedTest = true
 	c.speedProfile = pKey
@@ -553,18 +565,23 @@ func (c *Coordinator) StartSpeedTest() error {
 	c.notify()
 
 	go func() {
+		defer cancel()
 		for _, target := range targets {
 			if ctx.Err() != nil {
 				break
 			}
 			c.mu.Lock()
+			if c.speedRunID != myRunID {
+				c.mu.Unlock()
+				return
+			}
 			c.speedSamples[target.Name] = NodeSpeedSample{Kind: string(SpeedMeasuring)}
 			c.mu.Unlock()
 			c.notify()
 
 			sample := measureNodeDownloadSpeed(ctx, target.Port, speedURL, maxBytes, maxDur, func(mbps float64) {
 				c.mu.Lock()
-				if c.isSpeedTest && ctx.Err() == nil {
+				if c.speedRunID == myRunID && c.isSpeedTest && ctx.Err() == nil {
 					c.speedSamples[target.Name] = NodeSpeedSample{Kind: string(SpeedMeasuring), MBps: mbps}
 				}
 				c.mu.Unlock()
@@ -572,6 +589,10 @@ func (c *Coordinator) StartSpeedTest() error {
 			})
 
 			c.mu.Lock()
+			if c.speedRunID != myRunID {
+				c.mu.Unlock()
+				return
+			}
 			if ctx.Err() != nil {
 				c.speedSamples[target.Name] = NodeSpeedSample{Kind: string(SpeedCancelled)}
 				c.mu.Unlock()
@@ -583,6 +604,10 @@ func (c *Coordinator) StartSpeedTest() error {
 		}
 
 		c.mu.Lock()
+		if c.speedRunID != myRunID {
+			c.mu.Unlock()
+			return
+		}
 		c.isSpeedTest = false
 		c.speedCancel = nil
 		if ctx.Err() != nil {

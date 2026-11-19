@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -137,9 +138,12 @@ type Engine struct {
 	coreHelper   subscription.BinaryCoreHelper
 
 	opMu              sync.Mutex
+	installMu         sync.Mutex
 	upgradeMu         sync.Mutex
 	allowPromptUAC    bool
 	statusMu          sync.RWMutex
+	shuttingDown      bool
+	maintenancePaused bool
 	coreViaService    bool
 	coreVersion       string
 	suspendedByNet    string
@@ -164,9 +168,22 @@ type Engine struct {
 	logsDir           string
 	daemonLog         *applog.RotatingFile
 
-	stopBgCh   chan struct{}
-	stopPower  func()
-	onPush     func()
+	shutdownOnce sync.Once
+	stopBgCh     chan struct{}
+	stopPower    func()
+	onPush       func()
+}
+
+func (e *Engine) isShuttingDown() bool {
+	e.statusMu.RLock()
+	defer e.statusMu.RUnlock()
+	return e.shuttingDown
+}
+
+func (e *Engine) setMaintenancePaused(v bool) {
+	e.statusMu.Lock()
+	e.maintenancePaused = v
+	e.statusMu.Unlock()
 }
 
 func NewEngine(cfg Config, onPush func()) (*Engine, error) {
@@ -304,9 +321,9 @@ func (e *Engine) Start(ctx context.Context) error {
 		}
 	}
 
-	// If EnhancedMode was persisted from last session, verify privileged service is installed;
-	// if uninstalled externally while offline (and AI Lock isn't forcing it), fall back cleanly to normal mode.
-	if settings.EnhancedMode && supportsPrivilegedService() && !IsPrivilegedServiceInstalled(service.ServiceName) && !settings.AILockEnabled {
+	// If EnhancedMode was persisted from last session, verify privileged service is registered on OS;
+	// use non-blocking registration check so slow OS boot never permanently wipes EnhancedMode.
+	if settings.EnhancedMode && supportsPrivilegedService() && !IsPrivilegedServiceRegistered(service.ServiceName) && !settings.AILockEnabled {
 		_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
 			s.EnhancedMode = false
 			return nil
@@ -372,51 +389,56 @@ func (e *Engine) ShutdownWithForceRestore(forceRestore bool) {
 }
 
 func (e *Engine) ShutdownWithOptions(opts ShutdownOptions) {
-	select {
-	case <-e.stopBgCh:
-		return
-	default:
+	e.shutdownOnce.Do(func() {
+		e.statusMu.Lock()
+		e.shuttingDown = true
+		e.desiredCoreActive = false
+		e.statusMu.Unlock()
 		close(e.stopBgCh)
-	}
 
-	e.logf("INFO", "shutting down clashfx-daemon (force_restore=%v, kill_ai_clients=%v)", opts.ForceRestoreProxy, opts.KillAIClients)
-	e.statusMu.Lock()
-	e.desiredCoreActive = false
-	e.statusMu.Unlock()
+		e.logf("INFO", "shutting down clashfx-daemon (force_restore=%v, kill_ai_clients=%v)", opts.ForceRestoreProxy, opts.KillAIClients)
 
-	if e.stopPower != nil {
-		e.stopPower()
-	}
-	e.nodeCoord.Stop()
+		if e.stopPower != nil {
+			e.stopPower()
+		}
+		e.nodeCoord.Stop()
 
-	cfgDir := e.store.ActiveConfigDir()
-	e.store.Close()
+		// Acquire opMu so any in-flight applyAndSync / syncFromLiveCore finishes BEFORE
+		// we disarm AI Guard, restore OS proxy, stop core, and close store/logs.
+		e.opMu.Lock()
+		defer e.opMu.Unlock()
 
-	// Terminate protected AI clients BEFORE disarming OS AI Guard, restoring OS proxy,
-	// or stopping TUN so they cannot leak onto a direct network connection during teardown.
-	if opts.KillAIClients {
-		killed, _ := ailock.TerminateRunningAIClients(cfgDir)
-		e.logf("INFO", "terminated %d protected AI client process(es) before teardown", killed)
-	}
+		cfgDir := e.store.ActiveConfigDir()
 
-	// Clean user quit explicitly disarms OS-level AI Guard so normal network access resumes.
-	e.disarmAIGuard()
+		// Terminate protected AI clients BEFORE disarming OS AI Guard, restoring OS proxy,
+		// or stopping TUN so they cannot leak onto a direct network connection during teardown.
+		if opts.KillAIClients {
+			killed, _ := ailock.TerminateRunningAIClients(cfgDir)
+			e.logf("INFO", "terminated %d protected AI client process(es) before teardown", killed)
+		}
 
-	if opts.ForceRestoreProxy {
-		_ = e.sysProxy.CleanupForUninstall()
-		_ = SetLaunchAtLogin(false, "")
-	} else {
-		_ = e.sysProxy.Shutdown(false)
-	}
+		// Clean user quit explicitly disarms OS-level AI Guard so normal network access resumes.
+		e.disarmAIGuard()
 
-	_ = e.localRunner.Stop()
-	viaSvc := e.isCoreViaService()
-	if viaSvc {
-		_, _ = callService(5*time.Second, service.Request{Action: "stop_core"})
-	}
-	if e.daemonLog != nil {
-		_ = e.daemonLog.Close()
-	}
+		if opts.ForceRestoreProxy {
+			_ = e.sysProxy.CleanupForUninstall()
+			_ = SetLaunchAtLogin(false, "")
+		} else {
+			_ = e.sysProxy.Shutdown(false)
+		}
+
+		_ = e.localRunner.Stop()
+		viaSvc := e.isCoreViaService()
+		if viaSvc || (opts.ForceRestoreProxy && supportsPrivilegedService() && IsPrivilegedServiceInstalled(service.ServiceName)) {
+			_, _ = callService(5*time.Second, service.Request{Action: "stop_core"})
+			e.setCoreViaService(false)
+		}
+
+		e.store.Close()
+		if e.daemonLog != nil {
+			_ = e.daemonLog.Close()
+		}
+	})
 }
 
 func (e *Engine) ListRunningAIClients() ailock.RunningAIClientsResult {
@@ -488,13 +510,33 @@ func (e *Engine) HandlePowerResume() {
 	e.handleWakeOrNetworkCheck()
 }
 
+func (e *Engine) ensurePrivilegedServiceInstalled(allowUAC bool) error {
+	if !supportsPrivilegedService() {
+		return nil
+	}
+	if IsPrivilegedServiceInstalled(service.ServiceName) {
+		return nil
+	}
+	if !allowUAC {
+		return ErrServiceInstallRequired
+	}
+	e.installMu.Lock()
+	defer e.installMu.Unlock()
+	if IsPrivilegedServiceInstalled(service.ServiceName) {
+		return nil
+	}
+	return ElevateAndInstallService(serviceExecutablePath(e.cfg.BinDir))
+}
+
 func (e *Engine) InstallPrivilegedService() error {
 	if !supportsPrivilegedService() {
 		return nil
 	}
-	e.opMu.Lock()
+	e.installMu.Lock()
 	svcExe := serviceExecutablePath(e.cfg.BinDir)
 	err := ElevateAndInstallService(svcExe)
+	e.installMu.Unlock()
+
 	e.statusMu.Lock()
 	if err != nil {
 		e.lastApplyErr = err.Error()
@@ -503,7 +545,6 @@ func (e *Engine) InstallPrivilegedService() error {
 	}
 	e.statusMu.Unlock()
 	enhanced := e.store.Settings().EnhancedMode
-	e.opMu.Unlock()
 
 	if err != nil {
 		e.notifyStateChanged()
@@ -523,7 +564,8 @@ func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSet
 	wantService := settings.EnhancedMode && supportsPrivilegedService()
 
 	if wantService {
-		_ = e.localRunner.Stop()
+		// Verify / install privileged service BEFORE stopping a healthy localRunner so
+		// cancelling UAC or hitting ErrServiceInstallRequired never kills active proxy service.
 		if !IsPrivilegedServiceInstalled(service.ServiceName) {
 			if !e.allowPromptUAC {
 				return ErrServiceInstallRequired
@@ -544,6 +586,7 @@ func (e *Engine) ApplyRuntimeConfig(ctx context.Context, settings profile.AppSet
 				e.logf("INFO", "restarting ClashFXService core instead of REST reload (external-controller or startup state changed)")
 			}
 		}
+		_ = e.localRunner.Stop()
 		resp, err := callService(15*time.Second, service.Request{
 			Action:     "start_core",
 			HomeDir:    homeDir,
@@ -618,14 +661,29 @@ func extractCIDRsFromRouteExcludes(raw string) []string {
 		return r == ',' || r == ';' || r == '\n' || r == '\r'
 	}) {
 		s := strings.TrimSpace(part)
-		if s != "" && strings.Contains(s, "/") {
-			out = append(out, s)
+		if s == "" {
+			continue
+		}
+		if pfx, err := netip.ParsePrefix(s); err == nil {
+			out = append(out, pfx.Masked().String())
+			continue
+		}
+		if addr, err := netip.ParseAddr(s); err == nil {
+			addr = addr.Unmap()
+			bits := 128
+			if addr.Is4() {
+				bits = 32
+			}
+			out = append(out, netip.PrefixFrom(addr, bits).String())
 		}
 	}
 	return out
 }
 
 func (e *Engine) syncAIGuard(force bool) {
+	if e.isShuttingDown() {
+		return
+	}
 	settings := e.store.Settings()
 	if !settings.AILockEnabled {
 		e.disarmAIGuard()
@@ -721,16 +779,16 @@ func (e *Engine) effectiveRuntimeSettings(s profile.AppSettings) profile.AppSett
 	return s
 }
 
-func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUAC bool) (transaction.AppliedRuntimeState, error) {
-	e.opMu.Lock()
+func (e *Engine) applyCoreLocked(ctx context.Context, includeRecovery bool, allowUAC bool) (transaction.AppliedRuntimeState, error) {
+	if e.isShuttingDown() {
+		return e.ctrl.LastState(), errors.New("daemon is shutting down")
+	}
 	e.allowPromptUAC = allowUAC
 	prevViaService := e.isCoreViaService()
 	effSettings := e.effectiveRuntimeSettings(e.store.Settings())
 	wantService := effSettings.EnhancedMode && supportsPrivilegedService()
-	if prevViaService != wantService {
-		e.ctrl.ResetActiveState()
-	}
-	state, err := e.ctrl.Apply(ctx, includeRecovery)
+	forceRestart := prevViaService != wantService
+	state, err := e.ctrl.ApplyWithOptions(ctx, includeRecovery, forceRestart)
 	e.allowPromptUAC = false
 	e.statusMu.Lock()
 	if err != nil {
@@ -739,8 +797,13 @@ func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUA
 		e.lastApplyErr = ""
 	}
 	e.statusMu.Unlock()
-	e.opMu.Unlock()
+	return state, err
+}
 
+func (e *Engine) postApplySync(ctx context.Context, includeRecovery bool, state transaction.AppliedRuntimeState, err error) (transaction.AppliedRuntimeState, error) {
+	if e.isShuttingDown() {
+		return state, err
+	}
 	if err != nil {
 		e.logf("ERROR", "applyAndSync failed: %v", err)
 		e.refreshLiveCoreMetadata(ctx)
@@ -765,6 +828,25 @@ func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUA
 	e.refreshLiveCoreMetadata(ctx)
 	e.notifyStateChanged()
 	return state, nil
+}
+
+func (e *Engine) applyAndSync(ctx context.Context, includeRecovery bool, allowUAC bool) (transaction.AppliedRuntimeState, error) {
+	if allowUAC {
+		eff := e.effectiveRuntimeSettings(e.store.Settings())
+		if eff.EnhancedMode && supportsPrivilegedService() {
+			if err := e.ensurePrivilegedServiceInstalled(true); err != nil {
+				e.statusMu.Lock()
+				e.lastApplyErr = err.Error()
+				e.statusMu.Unlock()
+				e.notifyStateChanged()
+				return e.ctrl.LastState(), err
+			}
+		}
+	}
+	e.opMu.Lock()
+	state, err := e.applyCoreLocked(ctx, includeRecovery, allowUAC)
+	e.opMu.Unlock()
+	return e.postApplySync(ctx, includeRecovery, state, err)
 }
 
 func (e *Engine) replaySavedSelections(ctx context.Context, apiPort int, secret string, profileName string) {
@@ -824,6 +906,9 @@ func (e *Engine) currentNetworkSignature(forceRefresh bool) features.ActiveNetwo
 }
 
 func (e *Engine) reconcileSystemProxy() {
+	if e.isShuttingDown() {
+		return
+	}
 	settings := e.store.Settings()
 	eff := e.effectiveRuntimeSettings(settings)
 	rt := e.ctrl.LastState()
@@ -871,6 +956,9 @@ func (e *Engine) handleWakeOrNetworkCheck() {
 }
 
 func (e *Engine) verifyCoreAfterWake() {
+	if e.isShuttingDown() {
+		return
+	}
 	settings := e.store.Settings()
 	if !e.IsCoreRunning() {
 		e.logf("WARN", "core not running after power resume; triggering applyAndSync recovery")
@@ -932,7 +1020,14 @@ func (e *Engine) backgroundMaintenanceLoop() {
 }
 
 func (e *Engine) syncFromLiveCore(ctx context.Context, tick uint64) {
+	if e.isShuttingDown() {
+		return
+	}
 	if !e.opMu.TryLock() {
+		return
+	}
+	if e.isShuttingDown() {
+		e.opMu.Unlock()
 		return
 	}
 
@@ -951,6 +1046,7 @@ func (e *Engine) syncFromLiveCore(ctx context.Context, tick uint64) {
 	prevRestarts := e.lastRestartCount
 	prevGuardMode := e.lastAIGuardMode
 	desiredActive := e.desiredCoreActive
+	paused := e.maintenancePaused
 	lastTry := e.lastRecoveryTryAt
 
 	stateTransition := (coreRunning != prevRunning) || (coreHealth != prevHealth) || (coreSt.RestartCount != prevRestarts) || (aiGuardMode != prevGuardMode)
@@ -981,8 +1077,9 @@ func (e *Engine) syncFromLiveCore(ctx context.Context, tick uint64) {
 		}
 		// If the core is expected to run and the privileged service itself is not already
 		// running its own backoff supervisor (e.g. SCM cold-restarted ClashFXService),
-		// proactively re-apply runtime config after a 5s cooldown.
+		// proactively re-apply runtime config after a 5s cooldown (skipped during upgrades/geo swaps).
 		if desiredActive &&
+			!paused &&
 			coreHealth != service.CoreHealthRestarting &&
 			coreHealth != service.CoreHealthCrashLoop &&
 			time.Since(lastTry) >= 5*time.Second {
@@ -1029,13 +1126,12 @@ func (e *Engine) syncFromLiveCore(ctx context.Context, tick uint64) {
 	}
 
 	// 2. Deep data-plane health check every 4 ticks (~12s): verify controller /version
-	// AND (on Windows Enhanced Mode) Wintun "ClashFX" adapter liveness to catch wedged cores.
+	// AND (on Windows Enhanced Mode when TUN is actually active) Wintun liveness to catch wedged cores.
 	triggerForcedRestart := false
 	if tick%4 == 0 {
 		verOK := fetchCoreVersionFromCore(ctx, rt.APIPort, rt.APISecret) != ""
 		tunOK := true
-		eff := e.effectiveRuntimeSettings(settings)
-		if eff.EnhancedMode && e.isCoreViaService() && runtime.GOOS == "windows" {
+		if rt.Enhanced && e.isCoreViaService() && runtime.GOOS == "windows" {
 			tunOK = coreSt.TunHealthy
 		}
 		e.statusMu.Lock()
@@ -1092,6 +1188,10 @@ func (e *Engine) syncFromLiveCore(ctx context.Context, tick uint64) {
 	}
 
 	groups := fetchProxyGroupsFromCore(ctx, rt.APIPort, rt.APISecret, rawRoot, e.store.RecoverySelectionsForProfile(settings.SelectedProfile))
+	// Guard against concurrent profile switches while fetching /proxies outside opMu.
+	if e.isShuttingDown() || e.store.Settings().SelectedProfile != settings.SelectedProfile {
+		return
+	}
 	if len(groups) > 0 {
 		for i := range groups {
 			g := &groups[i]
@@ -1105,6 +1205,9 @@ func (e *Engine) syncFromLiveCore(ctx context.Context, tick uint64) {
 		}
 	}
 	provInfo := fetchProviderSubscriptionInfo(ctx, rt.APIPort, rt.APISecret)
+	if e.isShuttingDown() || e.store.Settings().SelectedProfile != settings.SelectedProfile {
+		return
+	}
 
 	if len(groups) > 0 && (!reflect.DeepEqual(prevGroups, groups) || !reflect.DeepEqual(prevProvInfo, provInfo)) {
 		e.proxyGroupsMu.Lock()
@@ -1250,6 +1353,9 @@ func (e *Engine) readSelectedProfileBytes(prof string) ([]byte, error) {
 
 func (e *Engine) watchActiveConfigDir() {
 	_ = e.store.WatchActiveConfigDir(func(changedFile string) {
+		if e.isShuttingDown() {
+			return
+		}
 		base := filepath.Base(changedFile)
 		ext := filepath.Ext(base)
 		stem := strings.TrimSuffix(base, ext)
@@ -1306,7 +1412,7 @@ func (e *Engine) Snapshot() DaemonSnapshot {
 
 	coreSt := e.currentCoreStatus()
 	coreRunning := coreSt.Running
-	svcInstalled := (viaSvc && coreRunning) || IsPrivilegedServiceInstalled(service.ServiceName)
+	svcInstalled := (viaSvc && coreRunning) || IsPrivilegedServiceRegistered(service.ServiceName)
 	coreHealth := coreSt.Health
 	if coreHealth == "" {
 		if coreRunning {
@@ -1756,18 +1862,30 @@ func (e *Engine) SetOutboundMode(ctx context.Context, mode string) error {
 	if mode != "rule" && mode != "global" && mode != "direct" {
 		return fmt.Errorf("invalid outbound mode %q", mode)
 	}
+	e.opMu.Lock()
 	cur := e.store.Settings()
 	if cur.AILockEnabled && mode != "rule" {
+		e.opMu.Unlock()
 		return fmt.Errorf("AI Proxy Lock requires Rule mode; disable AI Proxy Lock first")
 	}
+	prevMode := cur.OutboundMode
 	if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
 		s.OutboundMode = mode
 		return nil
 	}); err != nil {
+		e.opMu.Unlock()
 		return err
 	}
-	if _, err := e.applyAndSync(ctx, false, false); err != nil {
-		return err
+	state, err := e.applyCoreLocked(ctx, false, false)
+	if err != nil {
+		_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
+			s.OutboundMode = prevMode
+			return nil
+		})
+	}
+	e.opMu.Unlock()
+	if _, postErr := e.postApplySync(ctx, false, state, err); postErr != nil {
+		return postErr
 	}
 	e.closeAllConnections(ctx)
 	return nil
@@ -1794,30 +1912,41 @@ func (e *Engine) SetEnhancedMode(ctx context.Context, enabled bool, allowUAC boo
 	if cur.AILockEnabled && !enabled {
 		return fmt.Errorf("AI Proxy Lock requires Enhanced Mode (TUN); disable AI Proxy Lock first")
 	}
-	if enabled && supportsPrivilegedService() && !IsPrivilegedServiceInstalled(service.ServiceName) {
-		if !allowUAC {
-			return ErrServiceInstallRequired
-		}
-		if err := ElevateAndInstallService(serviceExecutablePath(e.cfg.BinDir)); err != nil {
+	if enabled && supportsPrivilegedService() {
+		if err := e.ensurePrivilegedServiceInstalled(allowUAC); err != nil {
 			return err
 		}
+	}
+	e.opMu.Lock()
+	cur = e.store.Settings()
+	if cur.AILockEnabled && !enabled {
+		e.opMu.Unlock()
+		return fmt.Errorf("AI Proxy Lock requires Enhanced Mode (TUN); disable AI Proxy Lock first")
 	}
 	prev := cur.EnhancedMode
 	if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
 		s.EnhancedMode = enabled
 		return nil
 	}); err != nil {
+		e.opMu.Unlock()
 		return err
 	}
-	if _, err := e.applyAndSync(ctx, true, allowUAC); err != nil {
+	state, err := e.applyCoreLocked(ctx, true, allowUAC)
+	if err != nil {
 		// Roll back EnhancedMode setting if UAC cancelled or TUN failed!
 		_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
 			s.EnhancedMode = prev
 			return nil
 		})
-		_, _ = e.applyAndSync(ctx, true, false)
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		_, _ = e.applyCoreLocked(rbCtx, true, false)
+		rbCancel()
+		e.opMu.Unlock()
+		_, _ = e.postApplySync(ctx, true, state, err)
 		return err
 	}
+	e.opMu.Unlock()
+	_, _ = e.postApplySync(ctx, true, state, nil)
 	return nil
 }
 
@@ -2045,10 +2174,16 @@ func (e *Engine) DiagnoseNode(ctx context.Context, nodeName, providerName, bench
 }
 
 func (e *Engine) SetAILock(ctx context.Context, enabled bool, target string, allowUAC bool) error {
-	prev := e.store.Settings()
 	if enabled && !ailock.IsValidTarget(target) {
 		return fmt.Errorf("choose a valid concrete proxy node for AI Proxy Lock")
 	}
+	if enabled && allowUAC && supportsPrivilegedService() && !IsPrivilegedServiceInstalled(service.ServiceName) {
+		if err := e.ensurePrivilegedServiceInstalled(true); err != nil {
+			return err
+		}
+	}
+	e.opMu.Lock()
+	prev := e.store.Settings()
 	if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
 		if enabled {
 			if !prev.AILockEnabled {
@@ -2077,42 +2212,58 @@ func (e *Engine) SetAILock(ctx context.Context, enabled bool, target string, all
 		}
 		return nil
 	}); err != nil {
+		e.opMu.Unlock()
 		return err
 	}
 
-	if _, err := e.applyAndSync(ctx, false, allowUAC); err != nil {
+	state, err := e.applyCoreLocked(ctx, false, allowUAC)
+	if err != nil {
 		_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
 			*s = prev
 			return nil
 		})
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		_, _ = e.applyCoreLocked(rbCtx, false, false)
+		rbCancel()
+		e.opMu.Unlock()
 		e.syncAIGuard(true)
-		_, _ = e.applyAndSync(ctx, false, false)
+		_, _ = e.postApplySync(ctx, false, state, err)
 		return err
 	}
-	e.syncAIGuard(true)
+	e.opMu.Unlock()
+	_, _ = e.postApplySync(ctx, false, state, nil)
 	e.closeAllConnections(ctx)
 	return nil
 }
 
 func (e *Engine) SelectProfile(ctx context.Context, name string) error {
-	name = strings.TrimSuffix(strings.TrimSpace(name), ".yaml")
-	if name == "" {
-		return fmt.Errorf("profile name is required")
-	}
-	prev := e.store.Settings().SelectedProfile
-	if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
-		s.SelectedProfile = name
-		return nil
-	}); err != nil {
+	cleanName, err := profile.ValidateProfileName(name)
+	if err != nil {
 		return err
 	}
-	if _, err := e.applyAndSync(ctx, true, false); err != nil {
+	e.opMu.Lock()
+	prev := e.store.Settings().SelectedProfile
+	if _, err := e.store.UpdateSettings(func(s *profile.AppSettings) error {
+		s.SelectedProfile = cleanName
+		return nil
+	}); err != nil {
+		e.opMu.Unlock()
+		return err
+	}
+	state, applyErr := e.applyCoreLocked(ctx, true, false)
+	if applyErr != nil {
 		_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
 			s.SelectedProfile = prev
 			return nil
 		})
-		return err
+		e.opMu.Unlock()
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, _ = e.postApplySync(rbCtx, true, state, applyErr)
+		rbCancel()
+		return applyErr
 	}
+	e.opMu.Unlock()
+	_, _ = e.postApplySync(ctx, true, state, nil)
 	e.closeAllConnections(ctx)
 	return nil
 }
@@ -2232,13 +2383,22 @@ func (e *Engine) UpdateGeoDatabases(ctx context.Context) error {
 			return err
 		}
 		// On Windows, mihomo_core.exe holds open file handles on Country.mmdb / geosite.dat.
-		// Stop core briefly while replacing files atomically, then restart cleanly.
+		// Pause auto-recovery and hold opMu across stop + write retry so syncFromLiveCore
+		// cannot restart mihomo_core.exe while replacing the files.
+		e.setMaintenancePaused(true)
+		defer e.setMaintenancePaused(false)
+
+		e.opMu.Lock()
 		_ = e.localRunner.Stop()
 		if e.isCoreViaService() {
 			_, _ = callService(6*time.Second, service.Request{Action: "stop_core"})
 		}
-		if retryErr := writeBoth(); retryErr != nil {
-			_, _ = e.applyAndSync(ctx, true, false)
+		retryErr := writeBoth()
+		e.opMu.Unlock()
+		if retryErr != nil {
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			_, _ = e.applyAndSync(rbCtx, true, false)
+			rbCancel()
 			return retryErr
 		}
 	}
@@ -2308,10 +2468,61 @@ func coreOrProxySettingsChanged(a, b profile.AppSettings) bool {
 		!stringSlicesEqual(a.SuspendNetworks, b.SuspendNetworks)
 }
 
+// UpdateGeneralSettingsJSON applies a partial JSON settings payload atomically under opMu
+// on top of live store settings so concurrent RPC mutations never overwrite each other.
+func (e *Engine) UpdateGeneralSettingsJSON(ctx context.Context, rawSettings json.RawMessage) error {
+	trimmed := strings.TrimSpace(string(rawSettings))
+	if trimmed == "" || trimmed == "null" {
+		return errors.New("settings payload is required")
+	}
+	// Pre-parse once to detect if EnhancedMode is being turned ON and requires elevation outside opMu.
+	probe := e.store.Settings()
+	if err := json.Unmarshal(rawSettings, &probe); err != nil {
+		return fmt.Errorf("invalid settings payload: %w", err)
+	}
+	if probe.EnhancedMode && !e.store.Settings().EnhancedMode && supportsPrivilegedService() {
+		if err := e.ensurePrivilegedServiceInstalled(true); err != nil {
+			return err
+		}
+	}
+
+	return e.updateGeneralSettingsMutated(ctx, func(cur profile.AppSettings) (profile.AppSettings, error) {
+		next := cur
+		if err := json.Unmarshal(rawSettings, &next); err != nil {
+			return cur, fmt.Errorf("invalid settings payload: %w", err)
+		}
+		return next, nil
+	})
+}
+
 func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSettings) error {
+	if next.EnhancedMode && !e.store.Settings().EnhancedMode && supportsPrivilegedService() {
+		if err := e.ensurePrivilegedServiceInstalled(true); err != nil {
+			return err
+		}
+	}
+	return e.updateGeneralSettingsMutated(ctx, func(_ profile.AppSettings) (profile.AppSettings, error) {
+		return next, nil
+	})
+}
+
+func (e *Engine) updateGeneralSettingsMutated(ctx context.Context, buildNext func(cur profile.AppSettings) (profile.AppSettings, error)) error {
+	e.opMu.Lock()
 	cur := e.store.Settings()
+	next, err := buildNext(cur)
+	if err != nil {
+		e.opMu.Unlock()
+		return err
+	}
 	if strings.TrimSpace(next.SelectedProfile) == "" {
 		next.SelectedProfile = cur.SelectedProfile
+	} else {
+		cleanProf, vErr := profile.ValidateProfileName(next.SelectedProfile)
+		if vErr != nil {
+			e.opMu.Unlock()
+			return vErr
+		}
+		next.SelectedProfile = cleanProf
 	}
 	if cur.AILockEnabled {
 		next.AILockEnabled = cur.AILockEnabled
@@ -2321,9 +2532,11 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 	next.AILockSavedState = cur.AILockSavedState
 	next.SavedSelections = cur.SavedSelections
 
-	if next.LaunchAtLogin != cur.LaunchAtLogin {
+	launchChanged := next.LaunchAtLogin != cur.LaunchAtLogin
+	if launchChanged {
 		uiExe := uiLaunchExecutablePath(e.cfg.BinDir)
 		if err := SetLaunchAtLogin(next.LaunchAtLogin, uiExe); err != nil {
+			e.opMu.Unlock()
 			return fmt.Errorf("update Launch at Login: %w", err)
 		}
 	}
@@ -2332,10 +2545,15 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 		*s = next
 		return nil
 	}); err != nil {
+		if launchChanged {
+			_ = SetLaunchAtLogin(cur.LaunchAtLogin, uiLaunchExecutablePath(e.cfg.BinDir))
+		}
+		e.opMu.Unlock()
 		return err
 	}
 
 	if !coreOrProxySettingsChanged(cur, next) {
+		e.opMu.Unlock()
 		e.notifyStateChanged()
 		return nil
 	}
@@ -2344,8 +2562,36 @@ func (e *Engine) UpdateGeneralSettings(ctx context.Context, next profile.AppSett
 		e.watchActiveConfigDir()
 	}
 
-	_, err := e.applyAndSync(ctx, false, true)
-	return err
+	prevCoreRunning := e.IsCoreRunning()
+	state, applyErr := e.applyCoreLocked(ctx, false, true)
+	if applyErr != nil {
+		// Roll back settings.json if core was previously running or EnhancedMode was being
+		// enabled (e.g. occupied PortOverride or cancelled/failed elevation); when core is not
+		// running yet (e.g. cold setup), keep general preferences persisted instead of discarding them.
+		if prevCoreRunning || (next.EnhancedMode && !cur.EnhancedMode) || errors.Is(applyErr, ErrServiceInstallRequired) {
+			_, _ = e.store.UpdateSettings(func(s *profile.AppSettings) error {
+				*s = cur
+				return nil
+			})
+			if launchChanged {
+				_ = SetLaunchAtLogin(cur.LaunchAtLogin, uiLaunchExecutablePath(e.cfg.BinDir))
+			}
+			if next.CustomConfigDir != cur.CustomConfigDir {
+				e.watchActiveConfigDir()
+			}
+			if prevCoreRunning {
+				rbCtx, rbCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				_, _ = e.applyCoreLocked(rbCtx, false, false)
+				rbCancel()
+			}
+		}
+		e.opMu.Unlock()
+		_, _ = e.postApplySync(ctx, false, state, applyErr)
+		return applyErr
+	}
+	e.opMu.Unlock()
+	_, _ = e.postApplySync(ctx, false, state, nil)
+	return nil
 }
 
 func (e *Engine) currentProfileDefaultTarget() (string, bool) {
@@ -2781,7 +3027,9 @@ func (e *Engine) SaveRuleProvider(ctx context.Context, providerName, content str
 			if _, applyErr := e.ctrl.Apply(ctx, false); applyErr != nil {
 				if prevErr == nil {
 					_ = profile.WriteFileAtomic(absPath, prevBytes, 0600)
-					_, _ = e.ctrl.Apply(ctx, false)
+					rbCtx, rbCancel := context.WithTimeout(context.Background(), 15*time.Second)
+					_, _ = e.ctrl.Apply(rbCtx, false)
+					rbCancel()
 				}
 				return EffectiveRulesView{}, applyErr
 			}
@@ -2790,7 +3038,7 @@ func (e *Engine) SaveRuleProvider(ctx context.Context, providerName, content str
 		if err != nil {
 			return EffectiveRulesView{}, err
 		}
-		if e.store.Settings().AILockEnabled {
+		if e.store.Settings().AILockEnabled && !e.isShuttingDown() {
 			go e.syncAIGuard(true)
 		}
 		return view, nil
@@ -2800,7 +3048,9 @@ func (e *Engine) SaveRuleProvider(ctx context.Context, providerName, content str
 	if err != nil {
 		if prevErr == nil {
 			_ = profile.WriteFileAtomic(absPath, prevBytes, 0600)
-			_, _ = e.refreshLiveRuleProvider(ctx, rt, providerName)
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_, _ = e.refreshLiveRuleProvider(rbCtx, rt, providerName)
+			rbCancel()
 		}
 		return EffectiveRulesView{}, err
 	}
@@ -2813,12 +3063,14 @@ func (e *Engine) SaveRuleProvider(ctx context.Context, providerName, content str
 		if prov, ok := view.RuleProviders[providerName]; ok && prov.RuleCount != len(parsedRules) {
 			if prevErr == nil {
 				_ = profile.WriteFileAtomic(absPath, prevBytes, 0600)
-				_, _ = e.refreshLiveRuleProvider(ctx, rt, providerName)
+				rbCtx, rbCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, _ = e.refreshLiveRuleProvider(rbCtx, rt, providerName)
+				rbCancel()
 			}
 			return EffectiveRulesView{}, fmt.Errorf("内核规则集解析条数不一致（预期 %d 条，实际加载 %d 条），已自动回滚，请检查是否存在特殊语法错误", len(parsedRules), prov.RuleCount)
 		}
 	}
-	if providerName == profile.AILockRuleProviderName && e.store.Settings().AILockEnabled {
+	if providerName == profile.AILockRuleProviderName && e.store.Settings().AILockEnabled && !e.isShuttingDown() {
 		go e.syncAIGuard(true)
 	}
 	return view, nil
@@ -3173,12 +3425,21 @@ func (e *Engine) prepareWritableLocalCoreDir() error {
 		if runtime.GOOS == "darwin" && allowHostPrivilegedCoreLookup() {
 			seedDirs = append(seedDirs, service.DarwinPrivilegedBinDir)
 		}
+		var lastCopyErr error
+		seeded := false
 		for _, sd := range seedDirs {
 			srcPath := filepath.Join(sd, exeName)
 			if info, statErr := os.Stat(srcPath); statErr == nil && !info.IsDir() {
-				_ = copyExecutableFile(srcPath, dstPath)
+				if copyErr := copyExecutableFile(srcPath, dstPath); copyErr != nil {
+					lastCopyErr = copyErr
+					continue
+				}
+				seeded = true
 				break
 			}
+		}
+		if !seeded && lastCopyErr != nil {
+			return fmt.Errorf("seed local core binary into %s: %w", fallbackDir, lastCopyErr)
 		}
 	}
 
@@ -3218,6 +3479,9 @@ func (e *Engine) UpgradeCore(ctx context.Context) (service.CoreUpgradeInfo, erro
 	e.upgradeMu.Lock()
 	defer e.upgradeMu.Unlock()
 
+	e.setMaintenancePaused(true)
+	defer e.setMaintenancePaused(false)
+
 	ch := e.store.Settings().UpdateChannel
 	proxyPort := e.activeLocalProxyPort()
 	useSvc := supportsPrivilegedService() && (e.isCoreViaService() || IsPrivilegedServiceInstalled(service.ServiceName))
@@ -3225,36 +3489,49 @@ func (e *Engine) UpgradeCore(ctx context.Context) (service.CoreUpgradeInfo, erro
 	if useSvc {
 		wasLocalRunning := !e.isCoreViaService() && e.localRunner.Status().Running
 		stoppedLocalForSwap := false
-		if wasLocalRunning && runtime.GOOS == "windows" {
-			// On Windows, running local mihomo_core.exe in Program Files locks against rename.
+
+		// Keep localRunner alive during the initial service upgrade call so downloads behind
+		// a proxy can still use proxyPort; NTFS allows renaming an executing .exe -> .bak.
+		// Fall back to stopping localRunner only if backup/swap hits a Windows file lock.
+		callUpgrade := func(pPort int) (service.Response, error) {
+			callCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+			defer cancel()
+			return service.Call(callCtx, service.Request{
+				Action:    "upgrade_core",
+				Channel:   ch,
+				ProxyPort: pPort,
+			})
+		}
+
+		resp, err := callUpgrade(proxyPort)
+		if err == nil && !resp.OK && wasLocalRunning && runtime.GOOS == "windows" &&
+			(strings.Contains(resp.Message, "backup previous core binary") || strings.Contains(resp.Message, "install upgraded core binary")) {
 			e.opMu.Lock()
 			_ = e.localRunner.Stop()
 			e.ctrl.ResetActiveState()
 			e.opMu.Unlock()
 			stoppedLocalForSwap = true
+			resp, err = callUpgrade(0)
 		}
-
-		callCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-		resp, err := service.Call(callCtx, service.Request{
-			Action:    "upgrade_core",
-			Channel:   ch,
-			ProxyPort: proxyPort,
-		})
-		cancel()
 
 		var info service.CoreUpgradeInfo
 		if resp.Upgrade != nil {
 			info = *resp.Upgrade
 		}
+		recoverLocal := func() {
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			_, _ = e.applyAndSync(rbCtx, true, false)
+			rbCancel()
+		}
 		if err != nil {
 			if stoppedLocalForSwap {
-				_, _ = e.applyAndSync(ctx, true, false)
+				recoverLocal()
 			}
 			return info, err
 		}
 		if !resp.OK {
 			if stoppedLocalForSwap {
-				_, _ = e.applyAndSync(ctx, true, false)
+				recoverLocal()
 			}
 			return info, errors.New(resp.Message)
 		}
@@ -3268,18 +3545,24 @@ func (e *Engine) UpgradeCore(ctx context.Context) (service.CoreUpgradeInfo, erro
 
 		if info.Updated {
 			if e.isCoreViaService() {
-				_, _ = e.applyAndSync(ctx, true, false)
+				recoverLocal()
 			} else if wasLocalRunning {
 				e.opMu.Lock()
 				_ = e.localRunner.Stop()
 				e.ctrl.ResetActiveState()
 				e.opMu.Unlock()
-				_, _ = e.applyAndSync(ctx, true, false)
+				// Best-effort cleanup of .bak files released after localRunner stopped.
+				if matches, gErr := filepath.Glob(filepath.Join(e.localRunner.TrustedDir(), coreExecutableName()+".bak*")); gErr == nil {
+					for _, m := range matches {
+						_ = os.Remove(m)
+					}
+				}
+				recoverLocal()
 			} else {
 				e.notifyStateChanged()
 			}
 		} else if stoppedLocalForSwap {
-			_, _ = e.applyAndSync(ctx, true, false)
+			recoverLocal()
 		} else {
 			e.notifyStateChanged()
 		}
@@ -3291,6 +3574,7 @@ func (e *Engine) UpgradeCore(ctx context.Context) (service.CoreUpgradeInfo, erro
 	}
 	info, _, err := e.localRunner.UpgradeCore(ctx, ch, proxyPort)
 	if err != nil {
+		e.syncCoreBinarySelection()
 		return info, err
 	}
 	e.syncCoreBinarySelection()
@@ -3300,7 +3584,9 @@ func (e *Engine) UpgradeCore(ctx context.Context) (service.CoreUpgradeInfo, erro
 		e.statusMu.Unlock()
 	}
 	if info.Updated && e.IsCoreRunning() {
-		_, _ = e.applyAndSync(ctx, true, false)
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_, _ = e.applyAndSync(rbCtx, true, false)
+		rbCancel()
 	} else {
 		e.notifyStateChanged()
 	}

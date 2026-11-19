@@ -291,10 +291,7 @@ func (r *Registry) SetEnabled(profileKey string, changes map[string]bool) error 
 func (r *Registry) PrepareDirectPort(reserved map[int]bool, coreRunning bool, available func(int) bool) (int, error) {
 	if r.DirectPort != nil {
 		p := *r.DirectPort
-		if reserved[p] {
-			return 0, PortConflictError{Port: p}
-		}
-		if coreRunning || available(p) {
+		if !reserved[p] && (coreRunning || available(p)) {
 			return p, nil
 		}
 	}
@@ -573,6 +570,19 @@ func (s *Store) readLocked() (PersistedState, error) {
 func (s *Store) Write(st PersistedState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.writeLocked(st)
+}
+
+// RecordLastRefresh atomically updates only LastRefresh[profileKey] under s.mu
+// so concurrent Settings/Registry updates to node-services.json are never clobbered.
+func (s *Store) RecordLastRefresh(profileKey string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.readLocked()
+	if err != nil {
+		return err
+	}
+	st.LastRefresh[profileKey] = at
 	return s.writeLocked(st)
 }
 

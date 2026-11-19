@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/clashfx/core-engine/internal/service"
@@ -84,7 +85,9 @@ func DialIPC(endpoint string) (net.Conn, error) {
 	return net.DialTimeout("unix", resolveUnixSocketPath(endpoint), 5*time.Second)
 }
 
-func IsPrivilegedServiceInstalled(_ string) bool {
+// IsPrivilegedServiceRegistered reports whether the LaunchDaemon plist and
+// privileged binaries are installed on disk (non-blocking; does not dial IPC).
+func IsPrivilegedServiceRegistered(_ string) bool {
 	if strings.TrimSpace(os.Getenv("CLASHFX_DISABLE_PRIVILEGED_SERVICE")) == "1" {
 		return false
 	}
@@ -99,6 +102,18 @@ func IsPrivilegedServiceInstalled(_ string) bool {
 		if _, err := os.Stat(reqPath); err != nil {
 			return false
 		}
+	}
+	return true
+}
+
+func IsPrivilegedServiceInstalled(serviceName string) bool {
+	if !IsPrivilegedServiceRegistered(serviceName) {
+		return false
+	}
+	// If the service Unix socket already exists and is bound, consider it installed
+	// even if Runner.mu is transiently busy (>2s) during core startup or upgrade.
+	if info, err := os.Stat(service.ServiceSocketPath()); err == nil && info.Mode()&os.ModeSocket != 0 {
+		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -117,10 +132,15 @@ func ElevateAndInstallService(serviceExePath string) error {
 	shellCmd := fmt.Sprintf("%s install --source-dir %s", posixShellQuote(cleanedExe), posixShellQuote(srcDir))
 	appleScript := fmt.Sprintf("do shell script %q with administrator privileges", shellCmd)
 
-	cmd := exec.Command("/usr/bin/osascript", "-e", appleScript)
+	ctx, cancel := context.WithTimeout(context.Background(), 115*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/usr/bin/osascript", "-e", appleScript)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("administrator service installation timed out after 115s")
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg != "" {
 			return fmt.Errorf("administrator service installation failed: %w (%s)", err, msg)
@@ -187,6 +207,7 @@ func StartPowerResumeMonitor(onResume func()) func() {
 		return func() {}
 	}
 	stopCh := make(chan struct{})
+	var stopOnce sync.Once
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
@@ -203,12 +224,21 @@ func StartPowerResumeMonitor(onResume func()) func() {
 				lastTick = now
 				if wallElapsed-monoElapsed > 12*time.Second || monoElapsed > 15*time.Second {
 					onResume()
+					// Refresh baseline and drain any tick buffered during slow recovery so
+					// post-resume core restart never falsely re-triggers itself.
+					lastTick = time.Now()
+					select {
+					case <-ticker.C:
+					default:
+					}
 				}
 			}
 		}
 	}()
 	return func() {
-		close(stopCh)
+		stopOnce.Do(func() {
+			close(stopCh)
+		})
 	}
 }
 

@@ -138,6 +138,19 @@ func buildCurrentUserPipeSDDL() string {
 	return "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)"
 }
 
+// IsPrivilegedServiceRegistered reports whether the Windows SCM service exists
+// (non-blocking; does not dial IPC).
+func IsPrivilegedServiceRegistered(serviceName string) bool {
+	if strings.TrimSpace(os.Getenv("CLASHFX_DISABLE_PRIVILEGED_SERVICE")) == "1" {
+		return false
+	}
+	if flag.Lookup("test.v") != nil && strings.TrimSpace(os.Getenv("CLASHFX_TEST_REAL_SERVICE")) != "1" {
+		return false
+	}
+	registered, _ := queryServiceRegistrationAndRunning(serviceName)
+	return registered
+}
+
 func IsPrivilegedServiceInstalled(serviceName string) bool {
 	if strings.TrimSpace(os.Getenv("CLASHFX_DISABLE_PRIVILEGED_SERVICE")) == "1" {
 		return false
@@ -145,21 +158,14 @@ func IsPrivilegedServiceInstalled(serviceName string) bool {
 	if flag.Lookup("test.v") != nil && strings.TrimSpace(os.Getenv("CLASHFX_TEST_REAL_SERVICE")) != "1" {
 		return false
 	}
-	registered := false
-	m, err := mgr.Connect()
-	if err != nil {
-		// Connect with read-only SC_MANAGER_CONNECT via OpenSCManager if full access denied for Medium-IL!
-		registered = isServiceRegisteredReadOnly(serviceName)
-	} else {
-		s, openErr := m.OpenService(serviceName)
-		if openErr == nil {
-			_ = s.Close()
-			registered = true
-		}
-		_ = m.Disconnect()
-	}
+	registered, running := queryServiceRegistrationAndRunning(serviceName)
 	if !registered {
 		return false
+	}
+	// If SCM reports Running or StartPending, do not falsely treat a transient busy IPC
+	// (e.g. Runner.mu held during start_core/upgrade_core) as "service uninstalled".
+	if running {
+		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
@@ -167,22 +173,43 @@ func IsPrivilegedServiceInstalled(serviceName string) bool {
 	return callErr == nil && resp.OK
 }
 
-func isServiceRegisteredReadOnly(serviceName string) bool {
+func queryServiceRegistrationAndRunning(serviceName string) (registered bool, running bool) {
+	m, err := mgr.Connect()
+	if err == nil {
+		defer m.Disconnect()
+		s, openErr := m.OpenService(serviceName)
+		if openErr != nil {
+			return false, false
+		}
+		defer s.Close()
+		st, qErr := s.Query()
+		if qErr == nil && (uint32(st.State) == windows.SERVICE_RUNNING || uint32(st.State) == windows.SERVICE_START_PENDING) {
+			return true, true
+		}
+		return true, false
+	}
+	// Connect with read-only SC_MANAGER_CONNECT via OpenSCManager if full access denied for Medium-IL!
 	scm, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer windows.CloseServiceHandle(scm)
 	namePtr, err := windows.UTF16PtrFromString(serviceName)
 	if err != nil {
-		return false
+		return false, false
 	}
-	svc, err := windows.OpenService(scm, namePtr, windows.SERVICE_QUERY_STATUS)
+	svcHandle, err := windows.OpenService(scm, namePtr, windows.SERVICE_QUERY_STATUS)
 	if err != nil {
-		return false
+		return false, false
 	}
-	_ = windows.CloseServiceHandle(svc)
-	return true
+	defer windows.CloseServiceHandle(svcHandle)
+	var status windows.SERVICE_STATUS
+	if err := windows.QueryServiceStatus(svcHandle, &status); err == nil {
+		if status.CurrentState == windows.SERVICE_RUNNING || status.CurrentState == windows.SERVICE_START_PENDING {
+			return true, true
+		}
+	}
+	return true, false
 }
 
 // ElevateAndInstallService triggers a one-time UAC prompt via ShellExecuteExW("runas")

@@ -1731,3 +1731,37 @@ rules:
 		t.Fatalf("expected +.test restored in .runtime-config.yaml after reset:\n%s", string(rtAfterReset))
 	}
 }
+
+func TestMalformedRPCParamsRejectedAndBareIPRouteExcludes(t *testing.T) {
+	appData := t.TempDir()
+	srv, err := NewServer(filepath.Join(appData, "d.sock"), Config{AppDataDir: appData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+
+	// Wrong-typed boolean must return OK=false rather than silently turning AI Lock OFF.
+	resp := srv.dispatch(&clientConn{}, RPCRequest{
+		ID:     1,
+		Method: "set_ai_lock",
+		Params: json.RawMessage(`{"enabled":"true","target":"NodeA"}`),
+	})
+	if resp.OK {
+		t.Fatalf("expected malformed set_ai_lock params to be rejected, got %+v", resp)
+	}
+	resp2 := srv.dispatch(&clientConn{}, RPCRequest{
+		ID:     2,
+		Method: "set_system_proxy",
+		Params: json.RawMessage(`{"enabled":"yes"}`),
+	})
+	if resp2.OK {
+		t.Fatalf("expected malformed set_system_proxy params to be rejected, got %+v", resp2)
+	}
+
+	// Bare IPv4 & IPv6 addresses in TunRouteExcludes must convert to /32 and /128 for OS AI Guard.
+	cidrs := extractCIDRsFromRouteExcludes("10.1.2.3, 192.168.0.0/16; fd00::1\nnot-an-ip")
+	joined := strings.Join(cidrs, ",")
+	if joined != "10.1.2.3/32,192.168.0.0/16,fd00::1/128" {
+		t.Fatalf("unexpected extracted route-exclude CIDRs: %q", joined)
+	}
+}

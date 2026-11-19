@@ -34,7 +34,18 @@ func ConvertShareLinksPayload(raw []byte) ([]byte, error) {
 	}
 	filtered := make([]map[string]any, 0, len(proxies))
 	names := make([]string, 0, len(proxies))
-	seenNames := make(map[string]int, len(proxies))
+	// Pre-seed Mihomo built-ins and generated proxy-group names so node remarks
+	// colliding with "Proxy", "Auto", "DIRECT", "REJECT", etc. are disambiguated cleanly.
+	seenNames := map[string]int{
+		"Proxy":       1,
+		"Auto":        1,
+		"DIRECT":      1,
+		"REJECT":      1,
+		"REJECT-DROP": 1,
+		"COMPATIBLE":  1,
+		"PASS":        1,
+		"GLOBAL":      1,
+	}
 	policy := make(map[string]any)
 	for _, proxy := range proxies {
 		rawName, _ := proxy["name"].(string)

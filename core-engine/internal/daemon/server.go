@@ -7,12 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/clashfx/core-engine/internal/features"
 	"github.com/clashfx/core-engine/internal/nodeservices"
-	"github.com/clashfx/core-engine/internal/profile"
 )
 
 type RPCRequest struct {
@@ -60,24 +60,35 @@ type Server struct {
 	engine   *Engine
 	ln       net.Listener
 
+	rootCtx    context.Context
+	rootCancel context.CancelFunc
+
 	clientsMu sync.Mutex
 	clients   map[*clientConn]struct{}
+	stopped   bool
 
-	pushMu    sync.Mutex
-	pushTimer *time.Timer
+	pushMu      sync.Mutex
+	pushTimer   *time.Timer
+	pushStopped bool
+
+	rpcWG sync.WaitGroup
 
 	quitOnce sync.Once
 	quitCh   chan struct{}
 }
 
 func NewServer(endpoint string, cfg Config) (*Server, error) {
+	rootCtx, rootCancel := context.WithCancel(context.Background())
 	srv := &Server{
-		endpoint: endpoint,
-		clients:  map[*clientConn]struct{}{},
-		quitCh:   make(chan struct{}),
+		endpoint:   endpoint,
+		rootCtx:    rootCtx,
+		rootCancel: rootCancel,
+		clients:    map[*clientConn]struct{}{},
+		quitCh:     make(chan struct{}),
 	}
 	eng, err := NewEngine(cfg, srv.scheduleBroadcast)
 	if err != nil {
+		rootCancel()
 		return nil, err
 	}
 	srv.engine = eng
@@ -114,22 +125,39 @@ func (s *Server) Stop() {
 
 func (s *Server) StopWithOptions(opts ShutdownOptions) {
 	s.quitOnce.Do(func() {
+		if s.rootCancel != nil {
+			s.rootCancel()
+		}
+
 		s.pushMu.Lock()
+		s.pushStopped = true
 		if s.pushTimer != nil {
 			s.pushTimer.Stop()
 			s.pushTimer = nil
 		}
 		s.pushMu.Unlock()
 
+		s.clientsMu.Lock()
+		s.stopped = true
 		if s.ln != nil {
 			_ = s.ln.Close()
 		}
-		s.clientsMu.Lock()
 		for c := range s.clients {
 			_ = c.conn.Close()
 		}
 		s.clients = map[*clientConn]struct{}{}
 		s.clientsMu.Unlock()
+
+		// Wait briefly for in-flight RPC handlers to observe rootCtx cancellation before engine teardown.
+		rpcDone := make(chan struct{})
+		go func() {
+			s.rpcWG.Wait()
+			close(rpcDone)
+		}()
+		select {
+		case <-rpcDone:
+		case <-time.After(3 * time.Second):
+		}
 
 		s.engine.ShutdownWithOptions(opts)
 		close(s.quitCh)
@@ -139,19 +167,27 @@ func (s *Server) StopWithOptions(opts ShutdownOptions) {
 func (s *Server) scheduleBroadcast() {
 	s.pushMu.Lock()
 	defer s.pushMu.Unlock()
-	if s.pushTimer != nil {
+	if s.pushStopped || s.pushTimer != nil {
 		return
 	}
 	s.pushTimer = time.AfterFunc(80*time.Millisecond, func() {
 		s.pushMu.Lock()
+		stopped := s.pushStopped
 		s.pushTimer = nil
 		s.pushMu.Unlock()
+		if stopped {
+			return
+		}
 		s.broadcastNow()
 	})
 }
 
 func (s *Server) broadcastNow() {
 	s.clientsMu.Lock()
+	if s.stopped {
+		s.clientsMu.Unlock()
+		return
+	}
 	var subs []*clientConn
 	for c := range s.clients {
 		if c.subscribed {
@@ -181,6 +217,11 @@ func (s *Server) acceptLoop() {
 		}
 		cc := &clientConn{conn: conn}
 		s.clientsMu.Lock()
+		if s.stopped {
+			s.clientsMu.Unlock()
+			_ = conn.Close()
+			return
+		}
 		s.clients[cc] = struct{}{}
 		s.clientsMu.Unlock()
 		go s.serveClient(cc)
@@ -214,13 +255,21 @@ func (s *Server) serveClient(cc *clientConn) {
 			}
 			continue
 		}
+		var rootDone <-chan struct{}
+		if s.rootCtx != nil {
+			rootDone = s.rootCtx.Done()
+		}
 		select {
 		case sem <- struct{}{}:
+		case <-rootDone:
+			return
 		case <-s.quitCh:
 			return
 		}
 		wg.Add(1)
+		s.rpcWG.Add(1)
 		go func(r RPCRequest) {
+			defer s.rpcWG.Done()
 			defer wg.Done()
 			defer func() { <-sem }()
 			resp := s.dispatch(cc, r)
@@ -247,15 +296,34 @@ func rpcTimeoutForMethod(method string) time.Duration {
 		"set_enhanced_mode",
 		"set_ai_lock",
 		"reload_config",
-		"install_service":
+		"install_service",
+		"update_settings":
 		return 120 * time.Second
 	default:
 		return 35 * time.Second
 	}
 }
 
+func decodeRPCParams(raw json.RawMessage, dst any, optional bool) error {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		if optional {
+			return nil
+		}
+		return errors.New("missing RPC params")
+	}
+	if err := json.Unmarshal(raw, dst); err != nil {
+		return fmt.Errorf("invalid RPC params: %w", err)
+	}
+	return nil
+}
+
 func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeoutForMethod(req.Method))
+	baseCtx := s.rootCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, rpcTimeoutForMethod(req.Method))
 	defer cancel()
 
 	okResp := func(data any) RPCResponse {
@@ -283,7 +351,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		var p struct {
 			Mode string `json:"mode"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.SetOutboundMode(ctx, p.Mode); err != nil {
 			return errResp(err)
 		}
@@ -292,7 +362,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		var p struct {
 			Enabled bool `json:"enabled"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.SetSystemProxy(p.Enabled); err != nil {
 			return errResp(err)
 		}
@@ -302,7 +374,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			Enabled  bool `json:"enabled"`
 			AllowUAC bool `json:"allow_uac"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.SetEnhancedMode(ctx, p.Enabled, p.AllowUAC); err != nil {
 			return errResp(err)
 		}
@@ -317,7 +391,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			Group  string `json:"group"`
 			Target string `json:"target"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.SelectProxy(ctx, p.Group, p.Target); err != nil {
 			return errResp(err)
 		}
@@ -326,7 +402,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		var p struct {
 			Group string `json:"group"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.RestoreAutoSelection(ctx, p.Group); err != nil {
 			return errResp(err)
 		}
@@ -340,7 +418,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		var p struct {
 			Group string `json:"group"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.BenchmarkGroup(ctx, p.Group); err != nil {
 			return errResp(err)
 		}
@@ -351,7 +431,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			ProviderName string `json:"provider_name"`
 			BenchmarkURL string `json:"benchmark_url"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		rep, err := s.engine.DiagnoseNode(ctx, p.NodeName, p.ProviderName, p.BenchmarkURL)
 		if err != nil {
 			return errResp(err)
@@ -363,7 +445,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			Target   string `json:"target"`
 			AllowUAC bool   `json:"allow_uac"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.SetAILock(ctx, p.Enabled, p.Target, p.AllowUAC); err != nil {
 			return errResp(err)
 		}
@@ -372,7 +456,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		var p struct {
 			Name string `json:"name"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.SelectProfile(ctx, p.Name); err != nil {
 			return errResp(err)
 		}
@@ -381,7 +467,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		var p struct {
 			AllowUAC bool `json:"allow_uac"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, true); err != nil {
+			return errResp(err)
+		}
 		if _, err := s.engine.applyAndSync(ctx, true, p.AllowUAC); err != nil {
 			return errResp(err)
 		}
@@ -404,7 +492,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			UserAgent   string `json:"user_agent"`
 			SelectAfter bool   `json:"select_after"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		sub, err := s.engine.UpsertSubscription(ctx, p.Name, p.URL, p.UserAgent, p.SelectAfter)
 		if err != nil {
 			return errResp(err)
@@ -414,7 +504,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		var p struct {
 			Name string `json:"name"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		sub, err := s.engine.RefreshSubscription(ctx, p.Name)
 		if err != nil {
 			return errResp(err)
@@ -425,7 +517,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			Name       string `json:"name"`
 			DeleteFile bool   `json:"delete_file"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.RemoveSubscription(ctx, p.Name, p.DeleteFile); err != nil {
 			return errResp(err)
 		}
@@ -434,7 +528,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		var p struct {
 			URI string `json:"uri"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		sub, err := s.engine.ImportURLScheme(ctx, p.URI)
 		if err != nil {
 			return errResp(err)
@@ -451,7 +547,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			Ports    map[string]int         `json:"ports"`
 			Enabled  map[string]bool        `json:"enabled"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, false); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.UpdateNodeServices(ctx, p.Settings, p.Ports, p.Enabled); err != nil {
 			return errResp(err)
 		}
@@ -475,15 +573,13 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		s.engine.nodeCoord.CancelSpeedTest(false)
 		return okResp(s.engine.Snapshot())
 	case "update_settings":
-		p := struct {
-			Settings profile.AppSettings `json:"settings"`
-		}{
-			Settings: s.engine.store.Settings(),
+		var wrapper struct {
+			Settings json.RawMessage `json:"settings"`
 		}
-		if err := json.Unmarshal(req.Params, &p); err != nil {
+		if err := decodeRPCParams(req.Params, &wrapper, false); err != nil {
 			return errResp(err)
 		}
-		if err := s.engine.UpdateGeneralSettings(ctx, p.Settings); err != nil {
+		if err := s.engine.UpdateGeneralSettingsJSON(ctx, wrapper.Settings); err != nil {
 			return errResp(err)
 		}
 		return okResp(s.engine.Snapshot())
@@ -585,7 +681,9 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 		var p struct {
 			AllowUAC bool `json:"allow_uac"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, true); err != nil {
+			return errResp(err)
+		}
 		if err := s.engine.RestartCore(ctx, p.AllowUAC); err != nil {
 			return errResp(err)
 		}
@@ -603,8 +701,8 @@ func (s *Server) dispatch(cc *clientConn, req RPCRequest) RPCResponse {
 			ForceRestoreProxy bool `json:"force_restore_proxy"`
 			KillAIClients     bool `json:"kill_ai_clients"`
 		}
-		if len(req.Params) > 0 {
-			_ = json.Unmarshal(req.Params, &p)
+		if err := decodeRPCParams(req.Params, &p, true); err != nil {
+			return errResp(err)
 		}
 		opts := ShutdownOptions{
 			ForceRestoreProxy: p.ForceRestoreProxy,

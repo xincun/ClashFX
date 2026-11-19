@@ -3,32 +3,91 @@
 package features
 
 import (
+	"context"
 	"net"
 	"os/exec"
 	"strings"
+	"time"
 )
 
-func DetectActiveNetworkSignature() ActiveNetworkSignature {
-	var defaultIf string
-	var routeOut, orderOut, summaryOut, dnsOut string
+func runDarwinNetCmd(bin string, args ...string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	b, err := exec.CommandContext(ctx, bin, args...).Output()
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
 
-	if b, err := exec.Command("/sbin/route", "-n", "get", "default").Output(); err == nil {
-		routeOut = string(b)
-		defaultIf = parseRouteInterface(routeOut)
-	}
-	if b, err := exec.Command("/usr/sbin/networksetup", "-listnetworkserviceorder").Output(); err == nil {
-		orderOut = string(b)
-	}
-	if defaultIf != "" {
-		if b, err := exec.Command("/usr/sbin/ipconfig", "getsummary", defaultIf).Output(); err == nil {
-			summaryOut = string(b)
+func isDarwinVirtualIf(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	return lower == "" ||
+		lower == "lo0" ||
+		strings.HasPrefix(lower, "utun") ||
+		strings.HasPrefix(lower, "awdl") ||
+		strings.HasPrefix(lower, "llw") ||
+		strings.HasPrefix(lower, "bridge") ||
+		strings.HasPrefix(lower, "ipsec") ||
+		strings.HasPrefix(lower, "ppp")
+}
+
+func parseDarwinOrderDevices(orderOut string) []string {
+	var devs []string
+	var curSvc string
+	for _, rawLine := range strings.Split(orderOut, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "(*)") {
+			if strings.HasPrefix(line, "(*)") {
+				curSvc = ""
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "(") && !strings.HasPrefix(line, "(Hardware Port:") {
+			if closeIdx := strings.IndexByte(line, ')'); closeIdx > 0 {
+				curSvc = strings.TrimSpace(line[closeIdx+1:])
+			}
+			continue
+		}
+		if curSvc != "" && strings.HasPrefix(line, "(Hardware Port:") && strings.HasSuffix(line, ")") {
+			inner := line[1 : len(line)-1]
+			if idx := strings.LastIndex(inner, "Device:"); idx >= 0 {
+				dev := strings.TrimSpace(inner[idx+len("Device:"):])
+				if !isDarwinVirtualIf(dev) {
+					devs = append(devs, dev)
+				}
+			}
+			curSvc = ""
 		}
 	}
-	if b, err := exec.Command("/usr/sbin/scutil", "--dns").Output(); err == nil {
-		dnsOut = string(b)
-	}
+	return devs
+}
 
-	sig := parseDarwinNetworkOutputs(routeOut, orderOut, summaryOut, dnsOut)
+func DetectActiveNetworkSignature() ActiveNetworkSignature {
+	routeOut := runDarwinNetCmd("/sbin/route", "-n", "get", "default")
+	defaultIf := parseRouteInterface(routeOut)
+	orderOut := runDarwinNetCmd("/usr/sbin/networksetup", "-listnetworkserviceorder")
+
+	// When Enhanced Mode (TUN) is active, `route -n get default` points at utunN.
+	// Fall back to the highest-priority physical interface with an active ipconfig summary.
+	activeIf := defaultIf
+	var summaryOut string
+	if !isDarwinVirtualIf(activeIf) {
+		summaryOut = runDarwinNetCmd("/usr/sbin/ipconfig", "getsummary", activeIf)
+	} else {
+		activeIf = ""
+		for _, dev := range parseDarwinOrderDevices(orderOut) {
+			cand := runDarwinNetCmd("/usr/sbin/ipconfig", "getsummary", dev)
+			if strings.Contains(cand, "Router :") || strings.Contains(cand, "SSID :") || strings.Contains(cand, "IPv4") {
+				activeIf = dev
+				summaryOut = cand
+				break
+			}
+		}
+	}
+	dnsOut := runDarwinNetCmd("/usr/sbin/scutil", "--dns")
+
+	sig := parseDarwinNetworkOutputsWithActiveIf(routeOut, orderOut, activeIf, summaryOut, dnsOut)
 	seenIf := map[string]bool{}
 	for _, existing := range sig.Interfaces {
 		seenIf[strings.ToLower(existing)] = true
@@ -38,10 +97,10 @@ func DetectActiveNetworkSignature() ActiveNetworkSignature {
 			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 				continue
 			}
-			lower := strings.ToLower(iface.Name)
-			if strings.HasPrefix(lower, "utun") || strings.HasPrefix(lower, "awdl") || strings.HasPrefix(lower, "llw") || strings.HasPrefix(lower, "bridge") {
+			if isDarwinVirtualIf(iface.Name) {
 				continue
 			}
+			lower := strings.ToLower(iface.Name)
 			if !seenIf[lower] {
 				seenIf[lower] = true
 				sig.Interfaces = append(sig.Interfaces, iface.Name)
@@ -65,6 +124,10 @@ func parseRouteInterface(routeOut string) string {
 }
 
 func parseDarwinNetworkOutputs(routeOut, serviceOrderOut, summaryOut, scutilDNSOut string) ActiveNetworkSignature {
+	return parseDarwinNetworkOutputsWithActiveIf(routeOut, serviceOrderOut, "", summaryOut, scutilDNSOut)
+}
+
+func parseDarwinNetworkOutputsWithActiveIf(routeOut, serviceOrderOut, overrideIf, summaryOut, scutilDNSOut string) ActiveNetworkSignature {
 	var sig ActiveNetworkSignature
 	seenProfile := map[string]bool{}
 	seenIf := map[string]bool{}
@@ -84,7 +147,11 @@ func parseDarwinNetworkOutputs(routeOut, serviceOrderOut, summaryOut, scutilDNSO
 		*dst = append(*dst, t)
 	}
 
-	defaultIf := ""
+	defaultIf := strings.TrimSpace(overrideIf)
+	if !isDarwinVirtualIf(defaultIf) {
+		addToken(&sig.Interfaces, seenIf, defaultIf)
+	}
+	routeIf := ""
 	for _, rawLine := range strings.Split(routeOut, "\n") {
 		k, v, ok := strings.Cut(strings.TrimSpace(rawLine), ":")
 		if !ok {
@@ -94,10 +161,17 @@ func parseDarwinNetworkOutputs(routeOut, serviceOrderOut, summaryOut, scutilDNSO
 		val := strings.TrimSpace(v)
 		switch key {
 		case "interface":
-			defaultIf = val
-			addToken(&sig.Interfaces, seenIf, val)
+			routeIf = val
+			if !isDarwinVirtualIf(val) {
+				if defaultIf == "" {
+					defaultIf = val
+				}
+				addToken(&sig.Interfaces, seenIf, val)
+			}
 		case "gateway":
-			addToken(&sig.Gateways, seenGW, val)
+			if !isDarwinVirtualIf(routeIf) {
+				addToken(&sig.Gateways, seenGW, val)
+			}
 		}
 	}
 

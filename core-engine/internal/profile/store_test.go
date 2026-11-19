@@ -341,3 +341,101 @@ func TestOutOfTheBoxDefaultSettingsAndMixin(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateProfileNameProviderPathSanitizationAndDeepCopy(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	for _, bad := range []string{"", ".", "..", "../secret", "a/b", `a\b`, ".profile_mixin", "foo/../../bar"} {
+		if _, err := ValidateProfileName(bad); err == nil {
+			t.Fatalf("expected ValidateProfileName(%q) to fail", bad)
+		}
+	}
+	if got, err := ValidateProfileName("MySub.yaml"); err != nil || got != "MySub" {
+		t.Fatalf("expected MySub, got (%q, %v)", got, err)
+	}
+
+	// SanitizeUntrustedProviderPaths strips ClashFX security rulesets, mixin, and traversal paths.
+	root := map[string]any{
+		"rule-providers": map[string]any{
+			"stealth-priv": map[string]any{
+				"type": "http",
+				"url":  "https://evil.example/bypass.list",
+				"path": "./ruleset/clashfx-private-direct.list",
+			},
+			"stealth-ai": map[string]any{
+				"type": "http",
+				"url":  "https://evil.example/ai.list",
+				"path": "./clashfx-rulesets/clashfx-ai-lock.list",
+			},
+			"benign-http": map[string]any{
+				"type": "http",
+				"url":  "https://good.example/custom.list",
+				"path": "./providers/custom.list",
+			},
+			AILockRuleProviderName: map[string]any{
+				"type": "file",
+				"path": "./ruleset/clashfx-ai-lock.list",
+			},
+		},
+		"proxy-providers": map[string]any{
+			"poison-mixin": map[string]any{
+				"type": "http",
+				"url":  "https://evil.example/mixin.yaml",
+				"path": "./.profile_mixin.yaml",
+			},
+			"escape": map[string]any{
+				"type": "http",
+				"url":  "https://evil.example/p.yaml",
+				"path": "../outside.yaml",
+			},
+		},
+	}
+	if !SanitizeUntrustedProviderPaths(root) {
+		t.Fatal("expected SanitizeUntrustedProviderPaths to report modifications")
+	}
+	rp := root["rule-providers"].(map[string]any)
+	if _, has := rp["stealth-priv"].(map[string]any)["path"]; has {
+		t.Fatal("expected stealth-priv path targeting clashfx-private-direct.list to be stripped")
+	}
+	if _, has := rp["stealth-ai"].(map[string]any)["path"]; has {
+		t.Fatal("expected stealth-ai path targeting clashfx-ai-lock.list to be stripped")
+	}
+	if got := rp["benign-http"].(map[string]any)["path"]; got != "./providers/custom.list" {
+		t.Fatalf("expected benign-http path preserved, got %v", got)
+	}
+	if got := rp[AILockRuleProviderName].(map[string]any)["path"]; got != "./ruleset/clashfx-ai-lock.list" {
+		t.Fatalf("expected builtin AI lock provider preserved, got %v", got)
+	}
+	pp := root["proxy-providers"].(map[string]any)
+	if _, has := pp["poison-mixin"].(map[string]any)["path"]; has {
+		t.Fatal("expected poison-mixin path targeting .profile_mixin.yaml to be stripped")
+	}
+	if _, has := pp["escape"].(map[string]any)["path"]; has {
+		t.Fatal("expected escape traversal path to be stripped")
+	}
+
+	// UpdateSettings returns a deep copy and rolls back SavedSelections on mutator error.
+	updated, err := store.UpdateSettings(func(s *AppSettings) error {
+		s.SavedSelections["p1"] = map[string]string{"Proxy": "NodeA"}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated.SavedSelections["p1"]["Proxy"] = "MUTATED_BY_CALLER"
+	if got := store.Settings().SavedSelections["p1"]["Proxy"]; got != "NodeA" {
+		t.Fatalf("expected caller mutation not to affect store, got %q", got)
+	}
+	_, _ = store.UpdateSettings(func(s *AppSettings) error {
+		s.SavedSelections["p1"]["Proxy"] = "SHOULD_ROLLBACK"
+		return fmt.Errorf("simulated failure")
+	})
+	if got := store.Settings().SavedSelections["p1"]["Proxy"]; got != "NodeA" {
+		t.Fatalf("expected failed mutator to leave store untouched, got %q", got)
+	}
+}

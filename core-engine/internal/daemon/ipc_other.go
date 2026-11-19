@@ -33,6 +33,10 @@ func DialIPC(endpoint string) (net.Conn, error) {
 	return net.Dial("unix", endpoint)
 }
 
+func IsPrivilegedServiceRegistered(_ string) bool {
+	return false
+}
+
 func IsPrivilegedServiceInstalled(_ string) bool {
 	return false
 }

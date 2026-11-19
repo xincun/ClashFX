@@ -127,9 +127,12 @@ func fetchReleasesFeed(ctx context.Context, apiURL, currentVersion string, local
 		req.Header.Set("User-Agent", uaPrefix+currentVersion)
 
 		transport := http.DefaultTransport.(*http.Transport).Clone()
+		defer transport.CloseIdleConnections()
 		if proxyPort > 0 && proxyPort <= 65535 {
 			pURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
 			transport.Proxy = http.ProxyURL(pURL)
+		} else {
+			transport.Proxy = nil
 		}
 		client := &http.Client{
 			Transport: transport,
@@ -145,9 +148,18 @@ func fetchReleasesFeed(ctx context.Context, apiURL, currentVersion string, local
 	}
 
 	if localProxyPort > 0 {
-		if data, code, err := doOnce(localProxyPort, 10*time.Second); err == nil {
-			return data, code, nil
+		pData, pCode, pErr := doOnce(localProxyPort, 10*time.Second)
+		if pErr == nil && pCode >= 200 && pCode < 300 {
+			return pData, pCode, nil
 		}
+		dData, dCode, dErr := doOnce(0, 10*time.Second)
+		if dErr == nil && dCode >= 200 && dCode < 300 {
+			return dData, dCode, nil
+		}
+		if dErr != nil && pErr == nil {
+			return pData, pCode, nil
+		}
+		return dData, dCode, dErr
 	}
 	return doOnce(0, 10*time.Second)
 }
