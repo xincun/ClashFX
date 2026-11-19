@@ -218,7 +218,7 @@ export function renderSubscriptionsPage(root) {
       showToast(t('订阅已导入并设为当前配置', 'Subscription imported and activated'), 'ok');
     }
     await rpc('get_state', {}, { silent: true });
-    renderSubscriptionsPage(root);
+    if (store.page === 1) renderSubscriptionsPage(root);
   });
 
   root.querySelector('#sub-refresh-all')?.addEventListener('click', async () => {
@@ -245,7 +245,7 @@ export function renderSubscriptionsPage(root) {
       }
     } finally {
       subDraft.refreshAllBusy = false;
-      renderSubscriptionsPage(root);
+      if (store.page === 1) renderSubscriptionsPage(root);
     }
   });
 
@@ -266,7 +266,7 @@ export function renderSubscriptionsPage(root) {
       subDraft.refreshingName = '';
       if (res.ok) showToast(t(`订阅「${name}」已刷新`, `Updated "${name}"`), 'ok');
       await rpc('get_state', {}, { silent: true });
-      renderSubscriptionsPage(root);
+      if (store.page === 1) renderSubscriptionsPage(root);
     });
   });
 
@@ -392,10 +392,11 @@ async function triggerRulesDataLoad(root, { force = false } = {}) {
     needEffective ? rpc('get_effective_rules', {}, { silent: true }) : Promise.resolve(null),
   ]);
 
-  if (seq === rulesFetchSeq) {
-    rulesState.loadingMixin = false;
-    rulesState.loadingEffective = false;
+  if (seq !== rulesFetchSeq) {
+    return;
   }
+  rulesState.loadingMixin = false;
+  rulesState.loadingEffective = false;
 
   let updated = false;
   if (mixinRes?.ok && mixinRes.data && (!rulesState.mixinDirty || force)) {
@@ -407,7 +408,7 @@ async function triggerRulesDataLoad(root, { force = false } = {}) {
     updated = true;
   }
 
-  if (seq === rulesFetchSeq && store.page === 2) {
+  if (store.page === 2) {
     const activeEl = document.activeElement;
     const keepSearchFocus = activeEl && root?.contains(activeEl) && activeEl.id === 'eff-search';
     const selStart = keepSearchFocus ? activeEl.selectionStart : null;
@@ -458,6 +459,67 @@ function sourceBadge(source = '') {
   if (s === 'cn_apps') return `<span class="pill pill-blue">${t('CN 直连', 'CN Direct')}</span>`;
   if (s === 'mixin') return `<span class="pill pill-amber">${t('自定义分流', 'Custom Routing')}</span>`;
   return `<span class="pill">${t('订阅规则', 'Profile')}</span>`;
+}
+
+function buildEffRulesTableData(eff, activeProv) {
+  const allEffRules = Array.isArray(eff.rules) ? eff.rules : [];
+  if (rulesState.effSource === 'subscription') {
+    rulesState.effSource = 'profile';
+  }
+  const q = rulesState.effSearch.trim().toLowerCase();
+  const filtered = allEffRules.filter((r) => {
+    if (rulesState.effSource !== 'all' && String(r.source).toLowerCase() !== rulesState.effSource) return false;
+    if (!q) return true;
+    return `${r.type} ${r.payload} ${r.proxy} ${r.source}`.toLowerCase().includes(q);
+  });
+
+  const shown = filtered.slice(0, rulesState.effLimit);
+  const remaining = filtered.length - shown.length;
+  const moreRowHtml =
+    remaining > 0
+      ? `<tr><td colspan="6" style="text-align:center;padding:10px;">
+          <div class="row-flex" style="justify-content:center;">
+            <button type="button" class="btn btn-sm" id="eff-show-more">${t(`显示更多 (${shown.length} / ${filtered.length})`, `Show More (${shown.length} / ${filtered.length})`)}</button>
+            ${
+              filtered.length <= 3000
+                ? `<button type="button" class="btn btn-sm btn-ghost" id="eff-show-all">${t(`显示全部 (${filtered.length})`, `Show All (${filtered.length})`)}</button>`
+                : ''
+            }
+          </div>
+        </td></tr>`
+      : '';
+
+  const emptyEffText =
+    rulesState.loadingEffective && !rulesState.effective
+      ? t('正在加载生效规则…', 'Loading effective rules…')
+      : t('无匹配的生效规则', 'No matching runtime rules');
+
+  const rowsHtml = shown.length
+    ? shown
+        .map((r) => {
+          const isSetMatch =
+            r.type === 'RuleSet' &&
+            activeProv &&
+            String(r.payload || '').toLowerCase() === activeProv.name.toLowerCase();
+          return `
+          <tr class="${r.disabled ? 'row-disabled' : ''} ${isSetMatch ? 'row-selected' : ''}" data-eff-row-payload="${esc(r.payload || '')}" data-eff-row-type="${esc(r.type || '')}">
+            <td style="width:48px;text-align:center;">
+              <input type="checkbox" data-rule-enable="${r.index}" ${r.disabled ? '' : 'checked'} ${String(r.source || '').toLowerCase() === 'system' ? `disabled title="${esc(t('系统守护规则不可禁用', 'System guard rules cannot be disabled'))}"` : ''} />
+            </td>
+            <td style="width:104px;">${sourceBadge(r.source)}</td>
+            <td class="mono" style="width:118px;font-weight:600;">${esc(r.type)}</td>
+            <td class="mono selectable">${esc(r.payload || '—')}</td>
+            <td class="mono" style="max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent);">${esc(r.proxy)}</td>
+            <td class="mono" style="width:90px;text-align:right;color:var(--text-secondary);">${r.hit_count ?? 0} / ${r.miss_count ?? 0}</td>
+          </tr>`;
+        })
+        .join('') + moreRowHtml
+    : `<tr><td colspan="6" class="empty-state">${emptyEffText}</td></tr>`;
+
+  return {
+    rowsHtml,
+    countText: `${filtered.length} / ${allEffRules.length}`,
+  };
 }
 
 export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, preserveScroll = false } = {}) {
@@ -610,60 +672,8 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
       <textarea class="code-editor" id="mixin-yaml-editor" spellcheck="false">${esc(rulesState.yamlText)}</textarea>
     `;
   } else {
-    const allEffRules = Array.isArray(eff.rules) ? eff.rules : [];
-    if (rulesState.effSource === 'subscription') {
-      rulesState.effSource = 'profile';
-    }
-    const q = rulesState.effSearch.trim().toLowerCase();
-    const filtered = allEffRules.filter((r) => {
-      if (rulesState.effSource !== 'all' && String(r.source).toLowerCase() !== rulesState.effSource) return false;
-      if (!q) return true;
-      return `${r.type} ${r.payload} ${r.proxy} ${r.source}`.toLowerCase().includes(q);
-    });
-
-    const shown = filtered.slice(0, rulesState.effLimit);
-    const remaining = filtered.length - shown.length;
-    const moreRowHtml =
-      remaining > 0
-        ? `<tr><td colspan="6" style="text-align:center;padding:10px;">
-            <div class="row-flex" style="justify-content:center;">
-              <button type="button" class="btn btn-sm" id="eff-show-more">${t(`显示更多 (${shown.length} / ${filtered.length})`, `Show More (${shown.length} / ${filtered.length})`)}</button>
-              ${
-                filtered.length <= 3000
-                  ? `<button type="button" class="btn btn-sm btn-ghost" id="eff-show-all">${t(`显示全部 (${filtered.length})`, `Show All (${filtered.length})`)}</button>`
-                  : ''
-              }
-            </div>
-          </td></tr>`
-        : '';
-
-    const emptyEffText =
-      rulesState.loadingEffective && !rulesState.effective
-        ? t('正在加载生效规则…', 'Loading effective rules…')
-        : t('无匹配的生效规则', 'No matching runtime rules');
-
-    const effRowsHtml = shown.length
-      ? shown
-          .map((r) => {
-            const isSetMatch =
-              r.type === 'RuleSet' &&
-              activeProv &&
-              String(r.payload || '').toLowerCase() === activeProv.name.toLowerCase();
-            return `
-            <tr class="${r.disabled ? 'row-disabled' : ''} ${isSetMatch ? 'row-selected' : ''}" data-eff-row-payload="${esc(r.payload || '')}" data-eff-row-type="${esc(r.type || '')}">
-              <td style="width:48px;text-align:center;">
-                <input type="checkbox" data-rule-enable="${r.index}" ${r.disabled ? '' : 'checked'} ${String(r.source || '').toLowerCase() === 'system' ? `disabled title="${esc(t('系统守护规则不可禁用', 'System guard rules cannot be disabled'))}"` : ''} />
-              </td>
-              <td style="width:104px;">${sourceBadge(r.source)}</td>
-              <td class="mono" style="width:118px;font-weight:600;">${esc(r.type)}</td>
-              <td class="mono selectable">${esc(r.payload || '—')}</td>
-              <td class="mono" style="max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent);">${esc(r.proxy)}</td>
-              <td class="mono" style="width:90px;text-align:right;color:var(--text-secondary);">${r.hit_count ?? 0} / ${r.miss_count ?? 0}</td>
-            </tr>`;
-          })
-          .join('') + moreRowHtml
-      : `<tr><td colspan="6" class="empty-state">${emptyEffText}</td></tr>`;
-
+    const effTable = buildEffRulesTableData(eff, activeProv);
+    const provEditable = Boolean(activeProv && activeProv.editable);
     const provRuleCount = activeProv ? activeProv.rule_count || countListLines(rulesState.providerDraftText) : 0;
 
     bodyHtml = `
@@ -683,7 +693,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
               <option value="mixin" ${rulesState.effSource === 'mixin' ? 'selected' : ''}>${t('自定义分流', 'Custom Routing')}</option>
               <option value="profile" ${rulesState.effSource === 'profile' ? 'selected' : ''}>${t('订阅规则', 'Profile')}</option>
             </select>
-            <span class="pill">${filtered.length} / ${allEffRules.length}</span>
+            <span class="pill" id="eff-count-pill">${effTable.countText}</span>
           </div>
           <div class="table-wrap" style="flex:1;min-height:110px;">
             <table class="data-table">
@@ -697,7 +707,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
                   <th style="text-align:right;">${t('命中/未中', 'Hit/Miss')}</th>
                 </tr>
               </thead>
-              <tbody>${effRowsHtml}</tbody>
+              <tbody id="eff-rules-tbody">${effTable.rowsHtml}</tbody>
             </table>
           </div>
         </div>
@@ -721,12 +731,12 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
               activeProv
                 ? `<div class="row-flex">
                     <button type="button" class="btn btn-sm" id="prov-reset-btn" ${!activeProv.can_reset ? 'disabled' : ''}>${t('恢复内置默认', 'Reset Default')}</button>
-                    <button type="button" class="btn btn-sm btn-primary" id="prov-save-btn">${ICONS.check} ${t('保存并零断流热更新', 'Save & Hot-Reload')}</button>
+                    <button type="button" class="btn btn-sm btn-primary" id="prov-save-btn" ${!provEditable ? 'disabled' : ''}>${ICONS.check} ${t('保存并零断流热更新', 'Save & Hot-Reload')}</button>
                    </div>`
                 : ''
             }
           </div>
-          <textarea class="code-editor" id="prov-editor" spellcheck="false" ${!activeProv ? 'disabled' : ''} placeholder="${t('选择上方 RuleSet 规则集或从下拉框切换即可直接编辑，保存后零断流热更新。', 'Select a RuleSet row above or choose a .list provider to edit and hot-reload.')}">${esc(rulesState.providerDraftText)}</textarea>
+          <textarea class="code-editor" id="prov-editor" spellcheck="false" ${!activeProv ? 'disabled' : !provEditable ? 'readonly' : ''} placeholder="${t('选择上方 RuleSet 规则集或从下拉框切换即可直接编辑，保存后零断流热更新。', 'Select a RuleSet row above or choose a .list provider to edit and hot-reload.')}">${esc(rulesState.providerDraftText)}</textarea>
         </div>
       </div>
     `;
@@ -830,12 +840,12 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
         rulesState.effectiveKey = '';
         if (res.data) applyProfileMixinPayload(res.data, store.snapshot?.settings?.selected_profile || '');
         showToast(labelOk, 'ok');
-        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+        if (store.page === 2) renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
         triggerRulesDataLoad(root, { force: true });
       } else {
         rulesState.bypassCnWeb = prevCn;
         rulesState.bypassLan = prevLan;
-        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+        if (store.page === 2) renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
       }
     };
     root.querySelector('#mixin-cn-web')?.addEventListener('change', (e) => {
@@ -881,6 +891,18 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
         const field = el.getAttribute('data-rule-field');
         if (!rulesState.rules[idx]) return;
         rulesState.rules[idx][field] = el.value;
+        if (field === 'type') {
+          const payloadEl = root.querySelector(`[data-rule-field="payload"][data-idx="${idx}"]`);
+          const isMatch = el.value === 'MATCH';
+          if (isMatch) {
+            rulesState.rules[idx].payload = '';
+          }
+          if (payloadEl) {
+            payloadEl.disabled = isMatch;
+            payloadEl.placeholder = isMatch ? '(MATCH)' : '';
+            if (isMatch) payloadEl.value = '';
+          }
+        }
         rulesState.mixinDirty = true;
         syncDirtyBadge();
       });
@@ -919,7 +941,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
         rulesState.effectiveLoaded = false;
         rulesState.effectiveKey = '';
         if (res.data) applyProfileMixinPayload(res.data, store.snapshot?.settings?.selected_profile || '');
-        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+        if (store.page === 2) renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
         triggerRulesDataLoad(root, { force: true });
         showToast(t('分流规则已保存并应用', 'Routing rules saved and applied'), 'ok');
       }
@@ -944,63 +966,86 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
         rulesState.effectiveLoaded = false;
         rulesState.effectiveKey = '';
         if (res.data) applyProfileMixinPayload(res.data, store.snapshot?.settings?.selected_profile || '');
-        renderRulesPage(root, -1, { skipFetch: true });
+        if (store.page === 2) renderRulesPage(root, -1, { skipFetch: true });
         triggerRulesDataLoad(root, { force: true });
         showToast(t('YAML 覆写已保存并应用', 'YAML override saved and applied'), 'ok');
       }
     });
   } else {
-    const effSearchEl = root.querySelector('#eff-search');
-    effSearchEl?.addEventListener('input', (e) => {
-      rulesState.effSearch = e.target.value;
-      rulesState.effLimit = 250;
-      const caret = e.target.selectionStart;
-      renderRulesPage(root, -1, { skipFetch: true });
-      const next = root.querySelector('#eff-search');
-      if (next) {
-        next.focus();
-        next.setSelectionRange(caret, caret);
+    const provEditable = Boolean(activeProv && activeProv.editable);
+    const bindEffTbodyEvents = () => {
+      const tbody = root.querySelector('#eff-rules-tbody');
+      if (!tbody) return;
+      tbody.querySelector('#eff-show-more')?.addEventListener('click', () => {
+        rulesState.effLimit += 500;
+        refreshEffTableInPlace();
+      });
+      tbody.querySelector('#eff-show-all')?.addEventListener('click', () => {
+        const allCount = Array.isArray(eff.rules) ? eff.rules.length : 0;
+        rulesState.effLimit = Math.max(rulesState.effLimit, allCount);
+        refreshEffTableInPlace();
+      });
+      tbody.querySelectorAll('[data-rule-enable]').forEach((cb) => {
+        cb.addEventListener('click', (e) => e.stopPropagation());
+        cb.addEventListener('change', async (e) => {
+          const index = Number(cb.getAttribute('data-rule-enable'));
+          const res = await rpc('set_rule_disabled', { indices: [index], disabled: !e.target.checked });
+          if (res.ok) {
+            if (res.data) applyEffectiveRulesPayload(res.data);
+            if (store.page === 2) renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+            showToast(e.target.checked ? t('规则已启用', 'Rule enabled') : t('规则已禁用', 'Rule disabled'), 'ok');
+          } else {
+            e.target.checked = !e.target.checked;
+          }
+        });
+      });
+      tbody.querySelectorAll('[data-eff-row-type="RuleSet"]').forEach((tr) => {
+        tr.addEventListener('click', () => {
+          const payload = tr.getAttribute('data-eff-row-payload') || '';
+          const matched = providers.find((p) => p.name.toLowerCase() === payload.toLowerCase());
+          if (matched && matched.name !== rulesState.selectedProvider) {
+            rulesState.selectedProvider = matched.name;
+            rulesState.providerDraftText = matched.raw_text || '';
+            rulesState.providerDirty = false;
+            renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+          }
+        });
+      });
+    };
+    const refreshEffTableInPlace = () => {
+      const tbody = root.querySelector('#eff-rules-tbody');
+      const countPill = root.querySelector('#eff-count-pill');
+      const nextTable = buildEffRulesTableData(eff, activeProv);
+      if (tbody) {
+        tbody.innerHTML = nextTable.rowsHtml;
+        bindEffTbodyEvents();
       }
+      if (countPill) countPill.textContent = nextTable.countText;
+    };
+    bindEffTbodyEvents();
+
+    const effSearchEl = root.querySelector('#eff-search');
+    let effSearchComposing = false;
+    const applyEffSearch = (val) => {
+      rulesState.effSearch = val;
+      rulesState.effLimit = 250;
+      refreshEffTableInPlace();
+    };
+    effSearchEl?.addEventListener('compositionstart', () => {
+      effSearchComposing = true;
+    });
+    effSearchEl?.addEventListener('compositionend', (e) => {
+      effSearchComposing = false;
+      applyEffSearch(e.target.value);
+    });
+    effSearchEl?.addEventListener('input', (e) => {
+      if (e.isComposing || effSearchComposing) return;
+      applyEffSearch(e.target.value);
     });
     root.querySelector('#eff-source')?.addEventListener('change', (e) => {
       rulesState.effSource = e.target.value;
       rulesState.effLimit = 250;
-      renderRulesPage(root, -1, { skipFetch: true });
-    });
-    root.querySelector('#eff-show-more')?.addEventListener('click', () => {
-      rulesState.effLimit += 500;
-      renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
-    });
-    root.querySelector('#eff-show-all')?.addEventListener('click', () => {
-      const allCount = Array.isArray(eff.rules) ? eff.rules.length : 0;
-      rulesState.effLimit = Math.max(rulesState.effLimit, allCount);
-      renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
-    });
-    root.querySelectorAll('[data-rule-enable]').forEach((cb) => {
-      cb.addEventListener('click', (e) => e.stopPropagation());
-      cb.addEventListener('change', async (e) => {
-        const index = Number(cb.getAttribute('data-rule-enable'));
-        const res = await rpc('set_rule_disabled', { indices: [index], disabled: !e.target.checked });
-        if (res.ok) {
-          if (res.data) applyEffectiveRulesPayload(res.data);
-          renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
-          showToast(e.target.checked ? t('规则已启用', 'Rule enabled') : t('规则已禁用', 'Rule disabled'), 'ok');
-        } else {
-          e.target.checked = !e.target.checked;
-        }
-      });
-    });
-    root.querySelectorAll('[data-eff-row-type="RuleSet"]').forEach((tr) => {
-      tr.addEventListener('click', () => {
-        const payload = tr.getAttribute('data-eff-row-payload') || '';
-        const matched = providers.find((p) => p.name.toLowerCase() === payload.toLowerCase());
-        if (matched && matched.name !== rulesState.selectedProvider) {
-          rulesState.selectedProvider = matched.name;
-          rulesState.providerDraftText = matched.raw_text || '';
-          rulesState.providerDirty = false;
-          renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
-        }
-      });
+      refreshEffTableInPlace();
     });
     root.querySelector('#prov-select')?.addEventListener('change', (e) => {
       const nextName = e.target.value;
@@ -1011,6 +1056,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
       renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
     });
     root.querySelector('#prov-editor')?.addEventListener('input', (e) => {
+      if (!provEditable) return;
       rulesState.providerDraftText = e.target.value;
       rulesState.providerDirty = true;
       const dirtyBadge = root.querySelector('#rules-dirty-badge');
@@ -1021,7 +1067,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
       }
     });
     root.querySelector('#prov-reset-btn')?.addEventListener('click', async () => {
-      if (!activeProv) return;
+      if (!activeProv || !activeProv.can_reset) return;
       const yes = await showConfirm({
         title: t(`恢复默认规则集「${activeProv.name}」`, `Reset "${activeProv.name}"`),
         message: t('将覆盖当前编辑中的内容并立即热更新生效。确认恢复？', 'Reset to built-in rules and hot-reload immediately?'),
@@ -1032,12 +1078,12 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
       if (res.ok) {
         rulesState.providerDirty = false;
         if (res.data) applyEffectiveRulesPayload(res.data);
-        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+        if (store.page === 2) renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
         showToast(t('已恢复内置默认并热更新', 'Restored default and reloaded'), 'ok');
       }
     });
     root.querySelector('#prov-save-btn')?.addEventListener('click', async () => {
-      if (!activeProv) return;
+      if (!activeProv || !provEditable) return;
       const res = await rpc('save_rule_provider', {
         provider_name: activeProv.name,
         content: rulesState.providerDraftText,
@@ -1045,7 +1091,7 @@ export function renderRulesPage(root, initialSubTab = -1, { skipFetch = false, p
       if (res.ok) {
         rulesState.providerDirty = false;
         if (res.data) applyEffectiveRulesPayload(res.data);
-        renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
+        if (store.page === 2) renderRulesPage(root, -1, { skipFetch: true, preserveScroll: true });
         showToast(t(`规则集「${activeProv.name}」已保存并零断流热更新`, `Hot-reloaded "${activeProv.name}"`), 'ok');
       }
     });

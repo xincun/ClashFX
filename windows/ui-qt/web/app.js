@@ -16,6 +16,7 @@ import {
 import { renderRulesPage, renderSubscriptionsPage, setRulesSubTab } from './pages-core.js';
 import {
   applyAppUpdateCheck,
+  cancelHotkeyRecording,
   getAvailableAppUpdate,
   isDiagConnectionsActive,
   renderAiLockPage,
@@ -51,7 +52,10 @@ let sidebarDockBuilt = false;
 let dockProfileSig = '';
 let lastPageSig = '';
 let startupUpdateChecked = false;
+let startupUpdateTimer = null;
 let coreUpgradeInFlight = false;
+let dockSysBusy = false;
+let dockTunBusy = false;
 
 function ensureSidebarNavBuilt(navEl) {
   if (!navEl || sidebarNavBuilt) return;
@@ -102,18 +106,34 @@ function ensureSidebarDockBuilt(dockEl) {
     </div>
   `;
 
-  dockEl.querySelector('#dock-sys-btn')?.addEventListener('click', () => {
-    const cur = Boolean(store.snapshot?.settings?.system_proxy_enabled);
-    rpc('set_system_proxy', { enabled: !cur });
+  dockEl.querySelector('#dock-sys-btn')?.addEventListener('click', async () => {
+    if (dockSysBusy) return;
+    dockSysBusy = true;
+    try {
+      const cur = Boolean(store.snapshot?.settings?.system_proxy_enabled);
+      await rpc('set_system_proxy', { enabled: !cur });
+    } finally {
+      dockSysBusy = false;
+    }
   });
-  dockEl.querySelector('#dock-tun-btn')?.addEventListener('click', () => {
-    const cur = Boolean(store.snapshot?.settings?.enhanced_mode);
-    rpc('set_enhanced_mode', { enabled: !cur });
+  dockEl.querySelector('#dock-tun-btn')?.addEventListener('click', async () => {
+    if (dockTunBusy) return;
+    dockTunBusy = true;
+    try {
+      const cur = Boolean(store.snapshot?.settings?.enhanced_mode);
+      await rpc('set_enhanced_mode', { enabled: !cur });
+    } finally {
+      dockTunBusy = false;
+    }
   });
   dockEl.querySelector('#dock-profile-select')?.addEventListener('change', async (e) => {
     const name = e.target.value;
     const res = await rpc('select_profile', { name });
-    if (res.ok) showToast(t(`已切换配置: ${name}`, `Active profile: ${name}`), 'ok');
+    if (res.ok) {
+      showToast(t(`已切换配置: ${name}`, `Active profile: ${name}`), 'ok');
+    } else if (e.target) {
+      e.target.value = store.snapshot?.settings?.selected_profile || '';
+    }
   });
   dockEl.querySelector('#dock-refresh-sub')?.addEventListener('click', async () => {
     const snapNow = store.snapshot || {};
@@ -216,6 +236,7 @@ function isUserTypingInPage() {
 }
 
 function go(pageIdx, subTab = -1, diagNode = '') {
+  cancelHotkeyRecording();
   store.page = Math.max(0, Math.min(6, Number(pageIdx) || 0));
   if (store.page === 2 && subTab >= 0) setRulesSubTab(subTab);
   if (store.page === 5) setDiagSubTab(subTab >= 0 ? subTab : 0, diagNode);
@@ -628,8 +649,21 @@ function syncConsoleHost(forceReload = false) {
   const nextKey = `${runtime.api_port || 0}|${runtime.api_secret || ''}|${snap.dashboard_url}|${snap.core_version || ''}`;
   if (forceReload || loadedConsoleKey !== nextKey) {
     const langParam = store.language === 'en_US' ? 'en' : 'zh';
-    const sep = snap.dashboard_url.includes('?') ? '&' : '?';
-    const urlWithMeta = `${snap.dashboard_url}${sep}cfx_theme=${store.theme}&cfx_lang=${langParam}&cfx_ai=${aiOn ? '1' : '0'}${forceReload ? `&_t=${Date.now()}` : ''}`;
+    const rawUrl = String(snap.dashboard_url || '');
+    const hashIdx = rawUrl.indexOf('#');
+    const basePart = hashIdx >= 0 ? rawUrl.slice(0, hashIdx) : rawUrl;
+    const hashPart = hashIdx >= 0 ? rawUrl.slice(hashIdx) : '';
+    const baseSep = basePart.includes('?') ? '&' : '?';
+    const nextBase = forceReload || loadedConsoleKey !== '' ? `${basePart}${baseSep}_t=${Date.now()}` : basePart;
+    const metaQuery = `cfx_theme=${store.theme}&cfx_lang=${langParam}&cfx_ai=${aiOn ? '1' : '0'}`;
+    let urlWithMeta;
+    if (hashPart) {
+      const hashSep = hashPart.includes('?') ? '&' : '?';
+      urlWithMeta = `${nextBase}${hashPart}${hashSep}${metaQuery}`;
+    } else {
+      const sep = nextBase.includes('?') ? '&' : '?';
+      urlWithMeta = `${nextBase}${sep}${metaQuery}`;
+    }
     loadedConsoleKey = nextKey;
     if (consoleFrame) consoleFrame.src = urlWithMeta;
   } else {
@@ -841,12 +875,18 @@ function wireWindowControls() {
     },
     true
   );
+  window.addEventListener('blur', () => cancelHotkeyRecording());
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) cancelHotkeyRecording();
+  });
 }
 
 function scheduleStartupUpdateCheck() {
-  if (startupUpdateChecked || window.__CLASHFX_SMOKE__) return;
+  if (startupUpdateChecked || store.smokeMode || window.__CLASHFX_SMOKE__) return;
   startupUpdateChecked = true;
-  setTimeout(async () => {
+  startupUpdateTimer = setTimeout(async () => {
+    startupUpdateTimer = null;
+    if (store.smokeMode || window.__CLASHFX_SMOKE__) return;
     try {
       const res = await rpc('check_updates', {}, { silent: true });
       if (res.ok && res.data) {
@@ -876,7 +916,15 @@ function wireIconsAndBootstrap() {
   initBridgeListener();
 
   subscribe((eventType) => {
+    if (eventType === 'smoke_start') {
+      if (startupUpdateTimer) {
+        clearTimeout(startupUpdateTimer);
+        startupUpdateTimer = null;
+      }
+      return;
+    }
     if (eventType === 'init' || eventType === 'navigate') {
+      if (eventType === 'navigate') cancelHotkeyRecording();
       if (eventType === 'init') scheduleStartupUpdateCheck();
       if (store.page === 2 && store.subTab >= 0) setRulesSubTab(store.subTab);
       if (store.page === 5) setDiagSubTab(store.subTab >= 0 ? store.subTab : 0, store.diagNode);

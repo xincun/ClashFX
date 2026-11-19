@@ -76,6 +76,49 @@ export function isDiagConnectionsActive() {
   return store.page === 5 && diagState.subTab === 1 && !diagState.connPaused;
 }
 
+export function cancelHotkeyRecording() {
+  if (!settingsState.recordingKey) return;
+  const prevField = settingsState.recordingKey;
+  settingsState.recordingKey = '';
+  const inp = document.querySelector(`[data-hk-rec="${prevField}"]`);
+  if (inp) {
+    inp.classList.remove('recording');
+    const d = settingsState.draft || {};
+    const defaultOpenHk = store.platform === 'darwin' ? 'Fn+F12' : 'Ctrl+Shift+F12';
+    inp.value =
+      prevField === 'open_main_window'
+        ? d.hotkeys?.[prevField] ?? defaultOpenHk
+        : d.hotkeys?.[prevField] ?? '';
+  }
+  native('set_hotkey_recording', { active: false }).catch(() => {});
+}
+
+function buildPreferencesPayload(d) {
+  return {
+    tray_icon_preset: d.tray_icon_preset,
+    show_tray_speed: d.show_tray_speed !== false,
+    launch_at_login: Boolean(d.launch_at_login),
+    port_override: d.port_override,
+    api_port: d.api_port,
+    allow_lan: Boolean(d.allow_lan),
+    ipv6: Boolean(d.ipv6),
+    bypass_cn_apps: Boolean(d.bypass_cn_apps),
+    custom_config_as_is: Boolean(d.custom_config_as_is),
+    tun_stack: d.tun_stack,
+    tun_interface_name: d.tun_interface_name,
+    tun_mtu: d.tun_mtu,
+    tun_route_excludes: d.tun_route_excludes,
+    log_level: d.log_level,
+    benchmark_url: d.benchmark_url,
+    proxy_bypass_list: d.proxy_bypass_list,
+    hotkeys: d.hotkeys,
+    auto_update_subs: Boolean(d.auto_update_subs),
+    suspend_networks: Array.isArray(d.suspend_networks) ? d.suspend_networks : [],
+    custom_config_dir: d.custom_config_dir,
+    update_channel: d.update_channel,
+  };
+}
+
 function buildDelayLookup(snap) {
   const map = new Map();
   for (const g of snap.proxy_groups || []) {
@@ -95,7 +138,6 @@ export function renderAiLockPage(root, handlers) {
   const target = settings.claudeProxyLockTarget || snap.ai_lock_relay || '';
   const candidates = Array.isArray(snap.ai_lock_candidates) ? snap.ai_lock_candidates : [];
   const delayMap = buildDelayLookup(snap);
-  const q = aiState.search.trim().toLowerCase();
   const guard = snap.ai_guard || {};
   const guardMode = guard.mode || 'inactive';
   const guardBackendLabel =
@@ -123,55 +165,58 @@ export function renderAiLockPage(root, handlers) {
   const mixedPort = snap.runtime?.mixed_port || settings.port_override || 7890;
 
   const candidateOptions = Array.from(new Set([target, ...candidates.map((c) => c.name)].filter(Boolean)));
-  const filtered = candidates.filter(
-    (c) => !q || `${c.name} ${c.type} ${c.server} ${c.provider}`.toLowerCase().includes(q)
-  );
-
-  const candidateRows = filtered.length
-    ? filtered
-        .map((c) => {
-          const isSelected = c.name === target;
-          const ms = delayMap.get(c.name);
-          const msPill =
-            ms !== undefined
-              ? `<span class="delay-pill ${ms > 0 ? (ms < 160 ? 'fast' : 'med') : 'timeout'}">${ms > 0 ? `${ms} ms` : t('超时', 'Timeout')}</span>`
-              : `<span class="pill">--</span>`;
-          const statusBadge = isSelected
-            ? enabled
-              ? `<span class="pill pill-green">${t('当前已锁定', 'Locked')}</span>`
-              : `<span class="pill pill-blue">${t('已选目标', 'Selected')}</span>`
-            : '';
-          const pickBtnClass = isSelected && enabled ? 'btn-success' : 'btn-primary';
-          const pickLabel = isSelected
-            ? enabled
-              ? t('已锁定', 'Locked')
-              : t('锁定此节点', 'Lock Here')
-            : enabled
-            ? t('切换至此', 'Use Here')
-            : t('设为 AI 节点', 'Lock Node');
-          return `
-            <tr class="${isSelected ? 'row-selected' : ''}">
-              <td>
-                <div class="row-flex" style="gap:7px;">
-                  ${renderRegionBadge(c.name)}
-                  <strong style="font-size:12.5px;">${esc(c.name)}</strong>
-                  ${statusBadge}
-                </div>
-              </td>
-              <td><span class="pill">${esc(c.type || 'Proxy')}</span></td>
-              <td class="mono" style="color:var(--text-secondary);">${esc(c.server || '—')}</td>
-              <td class="metric-sub">${esc(c.provider || t('内置配置', 'Inline'))}</td>
-              <td>${msPill}</td>
-              <td style="text-align:right;white-space:nowrap;">
-                <button type="button" class="btn btn-xs ${pickBtnClass}" data-ai-pick="${esc(c.name)}">
-                  ${pickLabel}
-                </button>
-                <button type="button" class="btn btn-xs" data-ai-diag="${esc(c.name)}">${t('诊断', 'Diagnose')}</button>
-              </td>
-            </tr>`;
-        })
-        .join('')
-    : `<tr><td colspan="6" class="empty-state">${t('暂无可用 AI 中继候选节点（请确认当前配置包含外部独立节点）', 'No eligible AI relay candidates in current profile')}</td></tr>`;
+  const buildCandidateRowsHtml = () => {
+    const curQ = aiState.search.trim().toLowerCase();
+    const filtered = candidates.filter(
+      (c) => !curQ || `${c.name} ${c.type} ${c.server} ${c.provider}`.toLowerCase().includes(curQ)
+    );
+    return filtered.length
+      ? filtered
+          .map((c) => {
+            const isSelected = c.name === target;
+            const ms = delayMap.get(c.name);
+            const msPill =
+              ms !== undefined
+                ? `<span class="delay-pill ${ms > 0 ? (ms < 160 ? 'fast' : 'med') : 'timeout'}">${ms > 0 ? `${ms} ms` : t('超时', 'Timeout')}</span>`
+                : `<span class="pill">--</span>`;
+            const statusBadge = isSelected
+              ? enabled
+                ? `<span class="pill pill-green">${t('当前已锁定', 'Locked')}</span>`
+                : `<span class="pill pill-blue">${t('已选目标', 'Selected')}</span>`
+              : '';
+            const pickBtnClass = isSelected && enabled ? 'btn-success' : 'btn-primary';
+            const pickLabel = isSelected
+              ? enabled
+                ? t('已锁定', 'Locked')
+                : t('锁定此节点', 'Lock Here')
+              : enabled
+              ? t('切换至此', 'Use Here')
+              : t('设为 AI 节点', 'Lock Node');
+            return `
+              <tr class="${isSelected ? 'row-selected' : ''}">
+                <td>
+                  <div class="row-flex" style="gap:7px;">
+                    ${renderRegionBadge(c.name)}
+                    <strong style="font-size:12.5px;">${esc(c.name)}</strong>
+                    ${statusBadge}
+                  </div>
+                </td>
+                <td><span class="pill">${esc(c.type || 'Proxy')}</span></td>
+                <td class="mono" style="color:var(--text-secondary);">${esc(c.server || '—')}</td>
+                <td class="metric-sub">${esc(c.provider || t('内置配置', 'Inline'))}</td>
+                <td>${msPill}</td>
+                <td style="text-align:right;white-space:nowrap;">
+                  <button type="button" class="btn btn-xs ${pickBtnClass}" data-ai-pick="${esc(c.name)}">
+                    ${pickLabel}
+                  </button>
+                  <button type="button" class="btn btn-xs" data-ai-diag="${esc(c.name)}">${t('诊断', 'Diagnose')}</button>
+                </td>
+              </tr>`;
+          })
+          .join('')
+      : `<tr><td colspan="6" class="empty-state">${t('暂无可用 AI 中继候选节点（请确认当前配置包含外部独立节点）', 'No eligible AI relay candidates in current profile')}</td></tr>`;
+  };
+  const candidateRows = buildCandidateRowsHtml();
 
   root.innerHTML = `
     <div class="card">
@@ -254,20 +299,47 @@ export function renderAiLockPage(root, handlers) {
             <th style="text-align:right;">${t('操作', 'Actions')}</th>
           </tr>
         </thead>
-        <tbody>${candidateRows}</tbody>
+        <tbody id="ai-cand-tbody">${candidateRows}</tbody>
       </table>
     </div>
   `;
 
-  root.querySelector('#ai-cand-search')?.addEventListener('input', (e) => {
-    aiState.search = e.target.value;
-    const caret = e.target.selectionStart;
-    renderAiLockPage(root, handlers);
-    const next = root.querySelector('#ai-cand-search');
-    if (next) {
-      next.focus();
-      next.setSelectionRange(caret, caret);
+  const bindAiCandidateRows = () => {
+    const tbody = root.querySelector('#ai-cand-tbody');
+    if (!tbody) return;
+    tbody.querySelectorAll('[data-ai-pick]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const node = btn.getAttribute('data-ai-pick');
+        const res = await rpc('set_ai_lock', { enabled: true, target: node });
+        if (res.ok) showToast(t(`AI 锁定已开启 -> ${node}`, `AI Lock active -> ${node}`), 'ok');
+      });
+    });
+    tbody.querySelectorAll('[data-ai-diag]').forEach((btn) => {
+      btn.addEventListener('click', () => handlers.go(5, 0, btn.getAttribute('data-ai-diag')));
+    });
+  };
+  bindAiCandidateRows();
+
+  const aiSearchEl = root.querySelector('#ai-cand-search');
+  let aiSearchComposing = false;
+  const applyAiSearch = (val) => {
+    aiState.search = val;
+    const tbody = root.querySelector('#ai-cand-tbody');
+    if (tbody) {
+      tbody.innerHTML = buildCandidateRowsHtml();
+      bindAiCandidateRows();
     }
+  };
+  aiSearchEl?.addEventListener('compositionstart', () => {
+    aiSearchComposing = true;
+  });
+  aiSearchEl?.addEventListener('compositionend', (e) => {
+    aiSearchComposing = false;
+    applyAiSearch(e.target.value);
+  });
+  aiSearchEl?.addEventListener('input', (e) => {
+    if (e.isComposing || aiSearchComposing) return;
+    applyAiSearch(e.target.value);
   });
 
   root.querySelector('#ai-edit-private-direct')?.addEventListener('click', () => {
@@ -311,18 +383,6 @@ export function renderAiLockPage(root, handlers) {
     const nextTarget = e.target.value;
     const res = await rpc('set_ai_lock', { enabled: true, target: nextTarget });
     if (res.ok) showToast(t(`AI 锁定目标已切换为 ${nextTarget}`, `AI relay switched to ${nextTarget}`), 'ok');
-  });
-
-  root.querySelectorAll('[data-ai-pick]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const node = btn.getAttribute('data-ai-pick');
-      const res = await rpc('set_ai_lock', { enabled: true, target: node });
-      if (res.ok) showToast(t(`AI 锁定已开启 -> ${node}`, `AI Lock active -> ${node}`), 'ok');
-    });
-  });
-
-  root.querySelectorAll('[data-ai-diag]').forEach((btn) => {
-    btn.addEventListener('click', () => handlers.go(5, 0, btn.getAttribute('data-ai-diag')));
   });
 }
 
@@ -479,8 +539,13 @@ export function renderMultiNodePage(root, handlers) {
   `;
 
   root.querySelector('#ns-ports-enabled')?.addEventListener('change', async (e) => {
-    const res = await rpc('update_node_services', { settings: { ...nsSet, ports_enabled: e.target.checked } });
-    if (res.ok) showToast(e.target.checked ? t('多节点端口已启用', 'Multi-node ports enabled') : t('多节点端口已关闭', 'Multi-node ports paused'), 'ok');
+    const checked = e.target.checked;
+    const res = await rpc('update_node_services', { settings: { ...nsSet, ports_enabled: checked } });
+    if (res.ok) {
+      showToast(checked ? t('多节点端口已启用', 'Multi-node ports enabled') : t('多节点端口已关闭', 'Multi-node ports paused'), 'ok');
+    } else if (e.target) {
+      e.target.checked = !checked;
+    }
   });
 
   root.querySelector('#ns-refresh-direct')?.addEventListener('click', () => rpc('node_refresh_direct', {}));
@@ -508,7 +573,11 @@ export function renderMultiNodePage(root, handlers) {
   root.querySelectorAll('[data-ns-enable]').forEach((cb) => {
     cb.addEventListener('change', async (e) => {
       const name = cb.getAttribute('data-ns-enable');
-      await rpc('update_node_services', { enabled: { [name]: e.target.checked } });
+      const checked = e.target.checked;
+      const res = await rpc('update_node_services', { enabled: { [name]: checked } });
+      if (!res.ok && e.target) {
+        e.target.checked = !checked;
+      }
     });
   });
 
@@ -764,7 +833,7 @@ export function renderDiagnosticsPage(root) {
       if (res.ok && res.data) {
         diagState.probeReport = res.data;
       }
-      renderDiagnosticsPage(root);
+      if (store.page === 5 && diagState.subTab === 0) renderDiagnosticsPage(root);
     });
     root.querySelector('#diag-fetch-sys')?.addEventListener('click', () => {
       fetchDiagnosticBundle(root, { silent: false });
@@ -787,8 +856,12 @@ export function renderDiagnosticsPage(root) {
       renderDiagnosticsPage(root);
     });
     root.querySelector('#diag-conn-clear')?.addEventListener('click', async () => {
-      await mihomo('DELETE', '/connections');
-      showToast(t('已关闭全部活跃连接', 'Closed all active connections'), 'ok');
+      const res = await mihomo('DELETE', '/connections');
+      if (res.ok) {
+        showToast(t('已关闭全部活跃连接', 'Closed all active connections'), 'ok');
+      } else {
+        showToast(res.error || t('关闭连接失败', 'Failed to close connections'), 'err');
+      }
     });
   }
 }
@@ -903,8 +976,8 @@ export function renderSettingsPage(root) {
           <div class="form-label-col"><div class="form-label">${t('显示语言', 'Language')}</div></div>
           <div class="form-control">
             <select class="select" id="set-lang">
-              <option value="zh_CN" ${d.language !== 'en_US' ? 'selected' : ''}>简体中文</option>
-              <option value="en_US" ${d.language === 'en_US' ? 'selected' : ''}>English</option>
+              <option value="zh_CN" ${store.language !== 'en_US' ? 'selected' : ''}>简体中文</option>
+              <option value="en_US" ${store.language === 'en_US' ? 'selected' : ''}>English</option>
             </select>
           </div>
         </div>
@@ -1096,12 +1169,12 @@ export function renderSettingsPage(root) {
     }
   });
 
-  const applyImmediateOrMarkDirty = async (revertFn, okMsg) => {
+  const applyImmediateOrMarkDirty = async (patch, revertFn, okMsg) => {
     if (settingsState.dirty) {
       renderSettingsPage(root);
       return;
     }
-    const res = await rpc('update_settings', { settings: d });
+    const res = await rpc('update_settings', { settings: patch });
     if (res.ok) {
       settingsState.loadedHash = '';
       if (okMsg) showToast(okMsg, 'ok');
@@ -1109,13 +1182,14 @@ export function renderSettingsPage(root) {
     } else if (revertFn) {
       revertFn();
     }
-    renderSettingsPage(root);
+    if (store.page === 6) renderSettingsPage(root);
   };
 
   root.querySelector('#set-tray')?.addEventListener('change', async (e) => {
     const prev = d.tray_icon_preset;
     d.tray_icon_preset = e.target.value;
     await applyImmediateOrMarkDirty(
+      { tray_icon_preset: d.tray_icon_preset },
       () => { d.tray_icon_preset = prev; },
       t('托盘图标风格已更新', 'Tray icon style updated')
     );
@@ -1125,6 +1199,7 @@ export function renderSettingsPage(root) {
     const prev = d.show_tray_speed !== false;
     d.show_tray_speed = e.target.checked;
     await applyImmediateOrMarkDirty(
+      { show_tray_speed: d.show_tray_speed },
       () => { d.show_tray_speed = prev; },
       d.show_tray_speed
         ? t('已开启托盘代理速率显示', 'Proxy speed indicator enabled')
@@ -1136,6 +1211,7 @@ export function renderSettingsPage(root) {
     const prev = Boolean(d.launch_at_login);
     d.launch_at_login = e.target.checked;
     await applyImmediateOrMarkDirty(
+      { launch_at_login: d.launch_at_login },
       () => { d.launch_at_login = prev; },
       d.launch_at_login ? t('已开启开机自动启动', 'Launch at Login enabled') : t('已关闭开机自动启动', 'Launch at Login disabled')
     );
@@ -1227,9 +1303,9 @@ export function renderSettingsPage(root) {
 
   root.querySelectorAll('[data-hk-reset]').forEach((btn) => {
     btn.addEventListener('click', () => {
+      cancelHotkeyRecording();
       if (!d.hotkeys) d.hotkeys = {};
       d.hotkeys[btn.getAttribute('data-hk-reset')] = defaultOpenHk;
-      settingsState.recordingKey = '';
       settingsState.dirty = true;
       renderSettingsPage(root);
     });
@@ -1237,9 +1313,9 @@ export function renderSettingsPage(root) {
 
   root.querySelectorAll('[data-hk-clear]').forEach((btn) => {
     btn.addEventListener('click', () => {
+      cancelHotkeyRecording();
       if (!d.hotkeys) d.hotkeys = {};
       d.hotkeys[btn.getAttribute('data-hk-clear')] = '';
-      settingsState.recordingKey = '';
       settingsState.dirty = true;
       renderSettingsPage(root);
     });
@@ -1250,14 +1326,18 @@ export function renderSettingsPage(root) {
     markSettingsDirty();
   });
   root.querySelector('#set-pick-cfg')?.addEventListener('click', async () => {
-    const res = await native('pick_directory', {
-      title: t('选择配置目录', 'Select Config Directory'),
-      initial: d.custom_config_dir || snap.config_dir || '',
-    });
+    const res = await native(
+      'pick_directory',
+      {
+        title: t('选择配置目录', 'Select Config Directory'),
+        initial: d.custom_config_dir || snap.config_dir || '',
+      },
+      { timeoutMs: 0 }
+    );
     if (res.ok && res.data?.path) {
       d.custom_config_dir = res.data.path;
       settingsState.dirty = true;
-      renderSettingsPage(root);
+      if (store.page === 6) renderSettingsPage(root);
     }
   });
   root.querySelector('#set-open-cfg')?.addEventListener('click', () => {
@@ -1280,7 +1360,7 @@ export function renderSettingsPage(root) {
     const res = await rpc('update_geo_databases', {});
     settingsState.geoBusy = false;
     if (res.ok) showToast(t('GEO 数据库已更新', 'GEO databases updated'), 'ok');
-    renderSettingsPage(root);
+    if (store.page === 6) renderSettingsPage(root);
   });
 
   root.querySelector('#set-upgrade-core')?.addEventListener('click', async () => {
@@ -1308,7 +1388,7 @@ export function renderSettingsPage(root) {
     } finally {
       dismissBusy();
       settingsState.coreUpdBusy = false;
-      renderSettingsPage(root);
+      if (store.page === 6) renderSettingsPage(root);
     }
   });
 
@@ -1321,7 +1401,7 @@ export function renderSettingsPage(root) {
       showToast(t('系统特权服务安装成功', 'Privileged service installed'), 'ok');
       await rpc('get_state', {}, { silent: true });
     }
-    renderSettingsPage(root);
+    if (store.page === 6) renderSettingsPage(root);
   });
 
   root.querySelector('#set-check-upd')?.addEventListener('click', async () => {
@@ -1332,7 +1412,7 @@ export function renderSettingsPage(root) {
     if (res.ok && res.data) {
       applyAppUpdateCheck(res.data, snap.version);
     }
-    renderSettingsPage(root);
+    if (store.page === 6) renderSettingsPage(root);
   });
 
   root.querySelector('#set-open-upd')?.addEventListener('click', () => {
@@ -1340,19 +1420,20 @@ export function renderSettingsPage(root) {
   });
 
   root.querySelector('#set-discard')?.addEventListener('click', () => {
+    cancelHotkeyRecording();
     settingsState.dirty = false;
     settingsState.loadedHash = '';
     renderSettingsPage(root);
   });
 
   root.querySelector('#set-save')?.addEventListener('click', async () => {
-    const res = await rpc('update_settings', { settings: d });
+    const res = await rpc('update_settings', { settings: buildPreferencesPayload(d) });
     if (res.ok) {
       settingsState.dirty = false;
       settingsState.loadedHash = '';
       showToast(t('偏好设置已保存并生效', 'Preferences saved & applied'), 'ok');
       await rpc('get_state', {}, { silent: true });
-      renderSettingsPage(root);
+      if (store.page === 6) renderSettingsPage(root);
     }
   });
 }

@@ -36,6 +36,7 @@ export const store = {
   proxySearch: '',
   pendingNav: null,
   preferredRuleProvider: '',
+  smokeMode: false,
 };
 
 function syncDocumentPlatformFlags() {
@@ -167,17 +168,20 @@ export function mihomo(method, path, body = undefined) {
   });
 }
 
-export function native(action, payload = {}) {
+export function native(action, payload = {}, opts = {}) {
+  const timeoutMs = opts && typeof opts.timeoutMs === 'number' ? opts.timeoutMs : 15000;
   return new Promise((resolve) => {
     const id = nextId++;
     pendingNative.set(id, resolve);
     postNative({ type: 'native_action', id, action, ...payload });
-    setTimeout(() => {
-      if (pendingNative.has(id)) {
-        pendingNative.delete(id);
-        resolve({ ok: false, error: 'Timeout' });
-      }
-    }, 15000);
+    if (timeoutMs > 0) {
+      setTimeout(() => {
+        if (pendingNative.has(id)) {
+          pendingNative.delete(id);
+          resolve({ ok: false, error: 'Timeout' });
+        }
+      }, timeoutMs);
+    }
   });
 }
 
@@ -193,8 +197,7 @@ export async function toggleLanguage() {
   const next = store.language === 'en_US' ? 'zh_CN' : 'en_US';
   store.language = next;
   postNative({ type: 'set_language', language: next });
-  const settings = { ...(store.snapshot?.settings || {}), language: next };
-  rpc('update_settings', { settings }, { silent: true });
+  rpc('update_settings', { settings: { language: next } }, { silent: true });
   notify('language', next);
 }
 
@@ -290,12 +293,17 @@ export function showToast(message, tone = 'info', durationMs = 3400) {
   return dismiss;
 }
 
+let activeConfirmClose = null;
+
 export function showConfirm({ title, message, confirmText, cancelText, danger = false }) {
   return new Promise((resolve) => {
     const root = document.getElementById('modal-root');
     if (!root) {
       resolve(false);
       return;
+    }
+    if (activeConfirmClose) {
+      activeConfirmClose(false);
     }
     root.innerHTML = `
       <div class="modal-card" role="dialog" aria-modal="true">
@@ -308,12 +316,26 @@ export function showConfirm({ title, message, confirmText, cancelText, danger = 
       </div>`;
     root.classList.add('open');
     root.setAttribute('aria-hidden', 'false');
+    let settled = false;
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close(false);
+      }
+    };
     const close = (val) => {
+      if (settled) return;
+      settled = true;
+      if (activeConfirmClose === close) activeConfirmClose = null;
+      document.removeEventListener('keydown', onKeyDown, true);
+      root.onclick = null;
       root.classList.remove('open');
       root.setAttribute('aria-hidden', 'true');
       root.innerHTML = '';
       resolve(val);
     };
+    activeConfirmClose = close;
+    document.addEventListener('keydown', onKeyDown, true);
     root.querySelector('#modal-cancel')?.addEventListener('click', () => close(false));
     root.querySelector('#modal-ok')?.addEventListener('click', () => close(true));
     root.onclick = (e) => {
@@ -337,6 +359,7 @@ function dispatchIncoming(raw) {
       store.theme = msg.theme === 'light' ? 'light' : 'dark';
       store.maximized = Boolean(msg.maximized);
       store.fullscreen = Boolean(msg.fullscreen);
+      store.smokeMode = Boolean(msg.smokeMode);
       store.page = Number.isInteger(msg.page) ? msg.page : 0;
       store.subTab = Number.isInteger(msg.subTab) ? msg.subTab : -1;
       store.diagNode = msg.diagNode || '';
@@ -361,6 +384,8 @@ function dispatchIncoming(raw) {
       notify('navigate', msg);
       break;
     case 'run_smoke_test':
+      store.smokeMode = true;
+      notify('smoke_start', msg);
       void runDomSmokeTest(Number(msg.dwellMs) || 45);
       break;
     case 'language':
